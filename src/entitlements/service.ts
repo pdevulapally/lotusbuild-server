@@ -12,6 +12,7 @@ import {
   subscriptionStatuses,
 } from './schema.ts';
 import type { ConfigurationStore } from './store.ts';
+import type { SubscriptionCache } from './subscription-cache.ts';
 import { EntitlementConfigError, type EntitlementValue } from './values.ts';
 
 export const subscriptionsCollectionPath = 'subscriptions';
@@ -132,10 +133,37 @@ export interface UserEntitlements {
 export class EntitlementService {
   readonly #firestore: Firestore;
   readonly #configuration: ConfigurationStore;
+  readonly #cache: SubscriptionCache;
 
-  constructor(firestore: Firestore, configuration: ConfigurationStore) {
+  constructor(
+    firestore: Firestore,
+    configuration: ConfigurationStore,
+    cache: SubscriptionCache,
+  ) {
     this.#firestore = firestore;
     this.#configuration = configuration;
+    this.#cache = cache;
+  }
+
+  /**
+   * The subscription behind a uid, from Redis when it is there.
+   *
+   * Caching the *absence* of a subscription matters more than caching a present
+   * one: most users are on the default plan, and without it every one of their
+   * requests is a billed Firestore read for a document that does not exist.
+   */
+  async #subscriptionFor(uid: string): Promise<Subscription | null> {
+    const cached = await this.#cache.read(uid);
+    if (cached !== undefined) {
+      return cached.subscription;
+    }
+
+    const path = `${subscriptionsCollectionPath}/${uid}`;
+    const snapshot = await this.#firestore.doc(path).get();
+    const subscription = snapshot.exists ? parseSubscription(snapshot.data() ?? {}, path) : null;
+
+    await this.#cache.write(uid, subscription);
+    return subscription;
   }
 
   /**
@@ -159,7 +187,7 @@ export class EntitlementService {
     const { registry, plans } = await this.#configuration.get();
 
     const path = `${subscriptionsCollectionPath}/${uid}`;
-    const snapshot = await this.#firestore.doc(path).get();
+    const subscription = await this.#subscriptionFor(uid);
 
     const defaultPlan = plans.get(registry.defaultPlanKey);
     if (defaultPlan === undefined) {
@@ -168,11 +196,10 @@ export class EntitlementService {
       );
     }
 
-    if (!snapshot.exists) {
+    if (subscription === null) {
       return { plan: defaultPlan, status: undefined };
     }
 
-    const subscription = parseSubscription(snapshot.data() ?? {}, path);
     if (!this.#entitles(subscription, registry, now)) {
       return { plan: defaultPlan, status: subscription.status };
     }

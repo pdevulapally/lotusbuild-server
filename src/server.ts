@@ -1,5 +1,7 @@
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
+import rateLimit from '@fastify/rate-limit';
+import type { Redis } from 'ioredis';
 import type { Auth } from 'firebase-admin/auth';
 import Fastify, { type FastifyInstance } from 'fastify';
 
@@ -10,6 +12,8 @@ import { registerProjectRoutes } from './projects/routes.ts';
 import type { ProjectRepository } from './projects/repository.ts';
 import type { UserRepository } from './users/repository.ts';
 import { registerErrorHandler } from './http/errors.ts';
+import { registerRateLimiting } from './http/rate-limit.ts';
+import { redisKeyPrefixes } from './redis/client.ts';
 
 /**
  * Builds the application without listening, so tests can drive real routes via
@@ -18,13 +22,14 @@ import { registerErrorHandler } from './http/errors.ts';
  */
 export interface Dependencies {
   readonly firebaseAuth: Auth;
+  readonly redis: Redis;
   readonly entitlements: EntitlementService;
   readonly users: UserRepository;
   readonly projects: ProjectRepository;
 }
 
 export function buildServer(config: Config, dependencies: Dependencies): FastifyInstance {
-  const { firebaseAuth, entitlements, users, projects } = dependencies;
+  const { firebaseAuth, redis, entitlements, users, projects } = dependencies;
   const app = Fastify({
     logger: { level: config.LOG_LEVEL },
     // Trust the reverse proxy in front of us for client IP and protocol, which
@@ -37,6 +42,19 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
 
   registerErrorHandler(app);
   registerAuth(app, firebaseAuth);
+
+  void app.register(rateLimit, {
+    // Applied per route through enforceRateLimit, so that the counter can be
+    // keyed by an already-verified uid rather than by an IP.
+    global: false,
+    redis,
+    nameSpace: redisKeyPrefixes.rateLimit,
+    // A rate limiter that lets everything through when its store is unreachable
+    // is not a rate limiter. Redis is on this box; if it is gone, refusing loudly
+    // is the honest outcome rather than silently uncapping every plan.
+    skipOnError: false,
+  });
+  registerRateLimiting(app, entitlements);
 
   void app.register(helmet, {
     // Nothing here serves HTML, so a CSP governs no document. The headers that
@@ -57,7 +75,7 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
 
   app.get('/health', async () => ({ status: 'ok' }));
 
-  app.get('/me', { preHandler: app.requireAuth }, async (request) => {
+  app.get('/me', { preHandler: [app.requireAuth, app.enforceRateLimit('read')] }, async (request) => {
     const user = authenticatedUser(request);
     // Session start is where the account record is created, so every later route
     // can rely on it existing rather than each one creating it defensively.

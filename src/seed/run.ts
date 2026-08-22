@@ -3,7 +3,9 @@ import { parseArgs } from 'node:util';
 import { EnvironmentError, loadConfig } from '../config/index.ts';
 import { EntitlementService } from '../entitlements/service.ts';
 import { ConfigurationStore, plansCollectionPath, registryDocumentPath } from '../entitlements/store.ts';
+import { SubscriptionCache } from '../entitlements/subscription-cache.ts';
 import { initialiseFirebase } from '../firebase.ts';
+import { connectRedis } from '../redis/client.ts';
 import { planDocuments, registryDocument } from './config.ts';
 
 /**
@@ -53,6 +55,10 @@ async function main(): Promise<void> {
   // is not the same as writing valid configuration: this is what proves the
   // cross-references, the allowance invariant and every merge strategy hold.
   const store = new ConfigurationStore(firestore, 1000);
+  const redis = await connectRedis(config, (error) => {
+    process.stderr.write(`redis: ${error.message}
+`);
+  });
   const { registry, plans } = await store.get();
   process.stdout.write(
     `Validated: ${registry.capabilities.size} capabilities, ${registry.meters.size} meters, ` +
@@ -61,12 +67,18 @@ async function main(): Promise<void> {
 
   // Resolving for a user with no subscription exercises the default-plan path,
   // which is what every new signup gets.
-  const entitlements = new EntitlementService(firestore, store);
+  const entitlements = new EntitlementService(
+    firestore,
+    store,
+    new SubscriptionCache(redis, config.SUBSCRIPTION_CACHE_TTL_SECONDS),
+  );
   const resolved = await entitlements.forUser('seed-verification-no-such-user');
   process.stdout.write(
     `Default plan resolves to "${resolved.planKey}" with ` +
       `${resolved.capabilities.keys().length} capabilities and ${resolved.meterLimits.size} limits.\n`,
   );
+
+  await redis.quit();
 }
 
 main().catch((error: unknown) => {

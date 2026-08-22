@@ -46,7 +46,7 @@ export function registerProjectRoutes(app: FastifyInstance, projects: ProjectRep
   app.post<{ Body: CreateProjectBody }>(
     '/projects',
     {
-      preHandler: app.requireAuth,
+      preHandler: [app.requireAuth, app.enforceRateLimit('write')],
       schema: {
         body: {
           type: 'object',
@@ -83,7 +83,7 @@ export function registerProjectRoutes(app: FastifyInstance, projects: ProjectRep
   app.get<{ Querystring: { limit?: number } }>(
     '/projects',
     {
-      preHandler: app.requireAuth,
+      preHandler: [app.requireAuth, app.enforceRateLimit('read')],
       schema: {
         querystring: {
           type: 'object',
@@ -106,7 +106,7 @@ export function registerProjectRoutes(app: FastifyInstance, projects: ProjectRep
   app.get<{ Params: { projectId: string } }>(
     '/projects/:projectId',
     {
-      preHandler: app.requireAuth,
+      preHandler: [app.requireAuth, app.enforceRateLimit('read')],
       schema: {
         params: {
           type: 'object',

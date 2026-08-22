@@ -23,6 +23,13 @@ const spec = {
     'how long plan and capability configuration is held before re-reading Firestore',
     { min: 1, max: 3600 },
   ),
+  REDIS_URL: asUrl('Redis holding rate-limit counters and cached subscriptions', {
+    protocols: ['redis:', 'rediss:'],
+  }),
+  SUBSCRIPTION_CACHE_TTL_SECONDS: asInteger(
+    'how long a subscription lookup is cached before Firestore is read again',
+    { min: 1, max: 3600 },
+  ),
   CORS_ALLOWED_ORIGINS: asList(
     'browser origins permitted to call this API',
     asUrl('allowed origin', { protocols: ['https:', 'http:'] }),

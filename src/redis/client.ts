@@ -1,0 +1,68 @@
+import { Redis } from 'ioredis';
+
+import { EnvironmentError } from '../config/env.ts';
+import type { Config } from '../config/index.ts';
+
+/**
+ * Connects to Redis, proving it before the process is allowed to serve.
+ *
+ * Two defaults are deliberately overridden:
+ *
+ * `enableOfflineQueue: false` — ioredis normally buffers commands while
+ * disconnected and replays them on reconnect. That turns an outage into
+ * unbounded memory growth and a burst of stale writes, and hides the failure
+ * from the caller, who sees a slow request rather than an error.
+ *
+ * `maxRetriesPerRequest: 2` — a command against a dead server should fail in
+ * milliseconds. The default retries until the connection returns, so a request
+ * hangs for as long as the incident lasts.
+ */
+export async function connectRedis(
+  config: Config,
+  onError: (error: Error) => void,
+): Promise<Redis> {
+  const redis = new Redis(config.REDIS_URL.toString(), {
+    lazyConnect: true,
+    enableOfflineQueue: false,
+    maxRetriesPerRequest: 2,
+    connectTimeout: 5000,
+    // Named so `CLIENT LIST` on the server says which process holds a connection.
+    connectionName: 'lotusbuild-api',
+  });
+
+  // ioredis emits 'error' on every failed connection attempt, and an unheard
+  // 'error' event on an EventEmitter takes the process down. A reconnect blip
+  // must be reported, not fatal: commands fail on their own because the offline
+  // queue is disabled, so the caller already learns about it.
+  redis.on('error', onError);
+
+  try {
+    await redis.connect();
+  } catch (cause) {
+    throw new EnvironmentError([
+      `REDIS_URL points at ${config.REDIS_URL.host}, which did not accept a connection — ` +
+        `${cause instanceof Error ? cause.message : String(cause)}`,
+    ]);
+  }
+
+  const pong = await redis.ping();
+  if (pong !== 'PONG') {
+    throw new Error(`Redis at ${config.REDIS_URL.host} answered PING with "${pong}".`);
+  }
+
+  return redis;
+}
+
+/**
+ * Redis holds only state that is in flight or reconstructible — rate-limit
+ * counters, cached subscriptions, and later the live event stream. It is
+ * deliberately not the system of record, so losing it fails work in progress
+ * rather than losing anything a user owns.
+ *
+ * Keys are namespaced so a shared server, or a stray FLUSHDB scoped by prefix,
+ * cannot confuse one concern with another.
+ */
+export const redisKeyPrefixes = {
+  rateLimit: 'rl:',
+  subscription: 'sub:',
+} as const;
