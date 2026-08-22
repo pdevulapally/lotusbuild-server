@@ -1,0 +1,110 @@
+import type { Auth } from 'firebase-admin/auth';
+import type { FastifyInstance, FastifyReply, FastifyRequest, preHandlerHookHandler } from 'fastify';
+
+import { AppError } from '../http/errors.ts';
+
+export interface AuthenticatedUser {
+  readonly uid: string;
+  readonly email: string | undefined;
+  readonly emailVerified: boolean;
+  /** Seconds since the epoch, from the token. Used to reject stale sessions. */
+  readonly authTime: number;
+}
+
+declare module 'fastify' {
+  interface FastifyRequest {
+    auth?: AuthenticatedUser;
+  }
+  interface FastifyInstance {
+    requireAuth: preHandlerHookHandler;
+  }
+}
+
+/**
+ * Reads the identity a `requireAuth` route established. Handlers must not touch
+ * `request.auth` directly: an unauthenticated route would hand them `undefined`
+ * and the mistake would surface as a crash on a live request rather than here.
+ */
+export function authenticatedUser(request: FastifyRequest): AuthenticatedUser {
+  if (request.auth === undefined) {
+    throw new Error(
+      `Route ${request.method} ${request.routeOptions.url ?? request.url} read the authenticated ` +
+        'user without registering the requireAuth preHandler.',
+    );
+  }
+  return request.auth;
+}
+
+export function bearerToken(header: string | undefined): string {
+  if (header === undefined) {
+    throw new AppError({
+      code: 'auth/missing-token',
+      statusCode: 401,
+      message: 'This endpoint requires an Authorization header.',
+    });
+  }
+
+  // Exactly two parts: a scheme and a token. Splitting loosely would accept
+  // "Bearer a b" and pass "a" on as if the request were well formed.
+  const parts = header.split(' ');
+  const [scheme, token] = parts;
+  if (parts.length !== 2 || scheme === undefined || token === undefined || scheme.toLowerCase() !== 'bearer') {
+    throw new AppError({
+      code: 'auth/malformed-header',
+      statusCode: 401,
+      message: 'The Authorization header must be "Bearer <firebase-id-token>".',
+    });
+  }
+
+  return token;
+}
+
+/** Firebase error codes we can explain to the client without guessing. */
+const tokenFailureCodes: ReadonlyMap<string, string> = new Map([
+  ['auth/id-token-expired', 'auth/token-expired'],
+  ['auth/id-token-revoked', 'auth/token-revoked'],
+  ['auth/user-disabled', 'auth/user-disabled'],
+]);
+
+export function registerAuth(app: FastifyInstance, firebaseAuth: Auth): void {
+  const requireAuth: preHandlerHookHandler = async (
+    request: FastifyRequest,
+    _reply: FastifyReply,
+  ): Promise<void> => {
+    const token = bearerToken(request.headers.authorization);
+
+    let decoded;
+    try {
+      // `checkRevoked` is off: it costs a round trip to Google on every single
+      // request. Revocation is handled by the token's own one-hour lifetime.
+      decoded = await firebaseAuth.verifyIdToken(token);
+    } catch (cause) {
+      const firebaseCode =
+        typeof cause === 'object' && cause !== null && 'code' in cause
+          ? String((cause as { code: unknown }).code)
+          : undefined;
+
+      const code =
+        firebaseCode === undefined ? undefined : tokenFailureCodes.get(firebaseCode);
+
+      request.log.info({ firebaseCode }, 'id token rejected');
+
+      throw new AppError({
+        code: code ?? 'auth/token-invalid',
+        statusCode: 401,
+        message: 'The supplied Firebase ID token is not valid.',
+        cause,
+      });
+    }
+
+    request.auth = Object.freeze({
+      uid: decoded.uid,
+      email: decoded.email,
+      emailVerified: decoded.email_verified === true,
+      authTime: decoded.auth_time,
+    });
+  };
+
+  app.decorate('requireAuth', requireAuth);
+  app.decorateRequest('auth', undefined);
+}

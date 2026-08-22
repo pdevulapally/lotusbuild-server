@@ -11,10 +11,13 @@
     "dev": "node --watch --experimental-strip-types src/index.ts",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test src/**/*.test.ts"
+    "test": "node --experimental-strip-types --test"
   },
   "dependencies": {
-    "fastify": "^5.2.1"
+    "@fastify/cors": "^11.3.0",
+    "@fastify/helmet": "^13.1.1",
+    "fastify": "^5.2.1",
+    "firebase-admin": "^14.3.0"
   },
   "devDependencies": {
     "@types/node": "^22.13.1",

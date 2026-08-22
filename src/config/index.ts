@@ -15,6 +15,10 @@ const spec = {
   PUBLIC_API_URL: asUrl('externally reachable base URL of this API', {
     protocols: ['https:', 'http:'],
   }),
+  FIREBASE_PROJECT_ID: asString('Firebase project this API authenticates against'),
+  FIREBASE_SERVICE_ACCOUNT_FILE: asString(
+    'absolute path to the Firebase service account JSON (keep it mode 600, never in the image)',
+  ),
   CORS_ALLOWED_ORIGINS: asList(
     'browser origins permitted to call this API',
     asUrl('allowed origin', { protocols: ['https:', 'http:'] }),
