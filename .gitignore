@@ -1,6 +1,10 @@
 node_modules/
 dist/
+*.log
+
+# Credentials. Never committed, in any form.
 .env
 .env.*
-!.env.example
-*.log
+*firebase-adminsdk*.json
+*service-account*.json
+secrets/
