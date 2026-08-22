@@ -1,10 +1,11 @@
 import { readFileSync } from 'node:fs';
 
-import { cert, initializeApp } from 'firebase-admin/app';
+import { type App, cert, initializeApp } from 'firebase-admin/app';
 import { type Auth, getAuth } from 'firebase-admin/auth';
+import { type Firestore, getFirestore } from 'firebase-admin/firestore';
 
-import { EnvironmentError } from '../config/env.ts';
-import type { Config } from '../config/index.ts';
+import { EnvironmentError } from './config/env.ts';
+import type { Config } from './config/index.ts';
 
 /**
  * The service account lives in a file rather than an environment variable so the
@@ -30,16 +31,12 @@ function readServiceAccount(path: string, expectedProjectId: string): ServiceAcc
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch (cause) {
-    throw new EnvironmentError([
-      `FIREBASE_SERVICE_ACCOUNT_FILE at ${path} is not valid JSON.`,
-    ]);
+  } catch {
+    throw new EnvironmentError([`FIREBASE_SERVICE_ACCOUNT_FILE at ${path} is not valid JSON.`]);
   }
 
-  if (typeof parsed !== 'object' || parsed === null) {
-    throw new EnvironmentError([
-      `FIREBASE_SERVICE_ACCOUNT_FILE at ${path} is not a JSON object.`,
-    ]);
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new EnvironmentError([`FIREBASE_SERVICE_ACCOUNT_FILE at ${path} is not a JSON object.`]);
   }
 
   const record = parsed as Record<string, unknown>;
@@ -67,13 +64,19 @@ function readServiceAccount(path: string, expectedProjectId: string): ServiceAcc
   return account;
 }
 
+export interface FirebaseServices {
+  readonly app: App;
+  readonly auth: Auth;
+  readonly firestore: Firestore;
+}
+
 /**
- * Initialises the Admin SDK from explicit credentials. Application Default
- * Credentials are deliberately not used: they resolve from ambient state, so a
- * misconfigured host silently authenticates as something unexpected instead of
- * failing.
+ * Initialises the Admin SDK from explicit credentials, once, for the whole
+ * process. Application Default Credentials are deliberately not used: they
+ * resolve from ambient state, so a misconfigured host silently authenticates as
+ * something unexpected instead of failing.
  */
-export function initialiseFirebaseAuth(config: Config): Auth {
+export function initialiseFirebase(config: Config): FirebaseServices {
   const account = readServiceAccount(
     config.FIREBASE_SERVICE_ACCOUNT_FILE,
     config.FIREBASE_PROJECT_ID,
@@ -88,5 +91,11 @@ export function initialiseFirebaseAuth(config: Config): Auth {
     projectId: account.project_id,
   });
 
-  return getAuth(app);
+  const firestore = getFirestore(app);
+  // Undefined is how an optional field is absent in TypeScript; without this the
+  // driver throws on any object carrying one, which turns an ordinary optional
+  // into a write failure at the worst moment.
+  firestore.settings({ ignoreUndefinedProperties: true });
+
+  return { app, auth: getAuth(app), firestore };
 }

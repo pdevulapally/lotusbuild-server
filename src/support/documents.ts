@@ -1,0 +1,110 @@
+import { AppError } from '../http/errors.ts';
+
+/**
+ * Firestore hands back `DocumentData` — an untyped bag. Casting it to an
+ * interface is a lie the compiler cannot check, so every field a document
+ * contributes is read through these accessors instead. They fail with the
+ * document path and field name, which is the difference between "a plan is
+ * misconfigured" and reading the whole collection by hand to find which one.
+ */
+export class DocumentShapeError extends AppError {
+  constructor(message: string) {
+    super({ code: 'config/malformed-document', statusCode: 500, message });
+    this.name = 'DocumentShapeError';
+  }
+}
+
+export type Fields = Readonly<Record<string, unknown>>;
+
+function raw(fields: Fields, name: string, where: string): unknown {
+  const value = fields[name];
+  if (value === undefined || value === null) {
+    throw new DocumentShapeError(`${where}: field "${name}" is missing.`);
+  }
+  return value;
+}
+
+export function stringField(fields: Fields, name: string, where: string): string {
+  const value = raw(fields, name, where);
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new DocumentShapeError(`${where}: field "${name}" must be a non-empty string.`);
+  }
+  return value;
+}
+
+export function booleanField(fields: Fields, name: string, where: string): boolean {
+  const value = raw(fields, name, where);
+  if (typeof value !== 'boolean') {
+    throw new DocumentShapeError(`${where}: field "${name}" must be a boolean.`);
+  }
+  return value;
+}
+
+/**
+ * Integers only. Firestore stores every number as a double, so a limit written
+ * as 1e21 or 0.5 would otherwise sail through and corrupt an allowance
+ * comparison much later.
+ */
+export function integerField(
+  fields: Fields,
+  name: string,
+  where: string,
+  { min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER }: { min?: number; max?: number } = {},
+): number {
+  const value = raw(fields, name, where);
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    throw new DocumentShapeError(`${where}: field "${name}" must be a safe integer.`);
+  }
+  if (value < min || value > max) {
+    throw new DocumentShapeError(`${where}: field "${name}" must be between ${min} and ${max}.`);
+  }
+  return value;
+}
+
+export function enumField<const T extends readonly [string, ...string[]]>(
+  fields: Fields,
+  name: string,
+  where: string,
+  allowed: T,
+): T[number] {
+  const value = stringField(fields, name, where);
+  if (!allowed.includes(value)) {
+    throw new DocumentShapeError(
+      `${where}: field "${name}" must be one of ${allowed.join(', ')}, got "${value}".`,
+    );
+  }
+  return value as T[number];
+}
+
+export function objectArrayField(fields: Fields, name: string, where: string): readonly Fields[] {
+  const value = raw(fields, name, where);
+  if (!Array.isArray(value)) {
+    throw new DocumentShapeError(`${where}: field "${name}" must be an array.`);
+  }
+  return value.map((entry, index) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw new DocumentShapeError(`${where}: ${name}[${index}] must be an object.`);
+    }
+    return entry as Fields;
+  });
+}
+
+/**
+ * Indexes parsed entries by key, refusing duplicates. A repeated key in a
+ * configuration array otherwise resolves to whichever entry happened to be last.
+ */
+export function indexByKey<T>(
+  entries: readonly T[],
+  keyOf: (entry: T) => string,
+  where: string,
+): ReadonlyMap<string, T> {
+  const byKey = new Map<string, T>();
+  for (const entry of entries) {
+    const key = keyOf(entry);
+    if (byKey.has(key)) {
+      throw new DocumentShapeError(`${where}: "${key}" appears more than once.`);
+    }
+    byKey.set(key, entry);
+  }
+  return byKey;
+}

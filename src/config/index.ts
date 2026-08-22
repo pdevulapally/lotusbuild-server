@@ -1,4 +1,4 @@
-import { asEnum, asList, asPort, asString, asUrl, loadEnv } from './env.ts';
+import { asEnum, asInteger, asList, asPort, asString, asUrl, loadEnv } from './env.ts';
 
 export { EnvironmentError } from './env.ts';
 
@@ -18,6 +18,10 @@ const spec = {
   FIREBASE_PROJECT_ID: asString('Firebase project this API authenticates against'),
   FIREBASE_SERVICE_ACCOUNT_FILE: asString(
     'absolute path to the Firebase service account JSON (keep it mode 600, never in the image)',
+  ),
+  CONFIG_CACHE_TTL_SECONDS: asInteger(
+    'how long plan and capability configuration is held before re-reading Firestore',
+    { min: 1, max: 3600 },
   ),
   CORS_ALLOWED_ORIGINS: asList(
     'browser origins permitted to call this API',

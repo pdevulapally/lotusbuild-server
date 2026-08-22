@@ -1,13 +1,25 @@
-import { initialiseFirebaseAuth } from './auth/firebase.ts';
 import { EnvironmentError, loadConfig } from './config/index.ts';
+import { EntitlementService } from './entitlements/service.ts';
+import { ConfigurationStore } from './entitlements/store.ts';
+import { initialiseFirebase } from './firebase.ts';
 import { buildServer } from './server.ts';
 
 async function main(): Promise<void> {
   const config = loadConfig();
   // Credentials are proven before the port opens: a process that cannot verify
   // a token must never accept a request it would have to reject.
-  const firebaseAuth = initialiseFirebaseAuth(config);
-  const app = buildServer(config, firebaseAuth);
+  const firebase = initialiseFirebase(config);
+
+  const configuration = new ConfigurationStore(
+    firebase.firestore,
+    config.CONFIG_CACHE_TTL_SECONDS * 1000,
+  );
+  // Reading configuration now turns a malformed plan or a broken sandbox
+  // allowance into a refusal to start, rather than into the first user's 500.
+  await configuration.get();
+
+  const entitlements = new EntitlementService(firebase.firestore, configuration);
+  const app = buildServer(config, firebase.auth, entitlements);
 
   const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
     app.log.info({ signal }, 'shutting down');

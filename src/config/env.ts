@@ -86,6 +86,20 @@ export const asString =
     },
   });
 
+export const asInteger = (
+  description: string,
+  { min, max }: { min: number; max: number },
+): EnvVarSpec<number> => ({
+  description: `${description} (integer ${min}-${max})`,
+  parse: (raw) => {
+    const value = Number(raw.trim());
+    if (!Number.isSafeInteger(value) || value < min || value > max) {
+      throw new Error(`expected an integer between ${min} and ${max}, got "${raw}"`);
+    }
+    return value;
+  },
+});
+
 export const asPort = (description: string): EnvVarSpec<number> => ({
   description,
   parse: (raw) => {
