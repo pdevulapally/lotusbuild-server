@@ -2,6 +2,8 @@ import { EnvironmentError, loadConfig } from './config/index.ts';
 import { EntitlementService } from './entitlements/service.ts';
 import { ConfigurationStore } from './entitlements/store.ts';
 import { initialiseFirebase } from './firebase.ts';
+import { ProjectRepository } from './projects/repository.ts';
+import { UserRepository } from './users/repository.ts';
 import { buildServer } from './server.ts';
 
 async function main(): Promise<void> {
@@ -19,7 +21,13 @@ async function main(): Promise<void> {
   await configuration.get();
 
   const entitlements = new EntitlementService(firebase.firestore, configuration);
-  const app = buildServer(config, firebase.auth, entitlements);
+  const users = new UserRepository(firebase.firestore);
+  const app = buildServer(config, {
+    firebaseAuth: firebase.auth,
+    entitlements,
+    users,
+    projects: new ProjectRepository(firebase.firestore, users, entitlements),
+  });
 
   const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
     app.log.info({ signal }, 'shutting down');

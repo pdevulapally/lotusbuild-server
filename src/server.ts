@@ -6,6 +6,9 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { authenticatedUser, registerAuth } from './auth/plugin.ts';
 import type { Config } from './config/index.ts';
 import type { EntitlementService } from './entitlements/service.ts';
+import { registerProjectRoutes } from './projects/routes.ts';
+import type { ProjectRepository } from './projects/repository.ts';
+import type { UserRepository } from './users/repository.ts';
 import { registerErrorHandler } from './http/errors.ts';
 
 /**
@@ -13,11 +16,15 @@ import { registerErrorHandler } from './http/errors.ts';
  * `app.inject()` instead of booting a process. A code path only reachable by
  * starting the server is a code path nothing tests.
  */
-export function buildServer(
-  config: Config,
-  firebaseAuth: Auth,
-  entitlements: EntitlementService,
-): FastifyInstance {
+export interface Dependencies {
+  readonly firebaseAuth: Auth;
+  readonly entitlements: EntitlementService;
+  readonly users: UserRepository;
+  readonly projects: ProjectRepository;
+}
+
+export function buildServer(config: Config, dependencies: Dependencies): FastifyInstance {
+  const { firebaseAuth, entitlements, users, projects } = dependencies;
   const app = Fastify({
     logger: { level: config.LOG_LEVEL },
     // Trust the reverse proxy in front of us for client IP and protocol, which
@@ -52,14 +59,20 @@ export function buildServer(
 
   app.get('/me', { preHandler: app.requireAuth }, async (request) => {
     const user = authenticatedUser(request);
+    // Session start is where the account record is created, so every later route
+    // can rely on it existing rather than each one creating it defensively.
+    const stored = await users.ensure(user);
     const resolved = await entitlements.forUser(user.uid);
 
     // Every field is named explicitly rather than spread from an internal
     // object, so nothing added to those types later leaks into the response.
     return {
-      uid: user.uid,
-      email: user.email,
+      uid: stored.uid,
+      email: stored.email,
       emailVerified: user.emailVerified,
+      displayName: stored.displayName,
+      photoUrl: stored.photoUrl,
+      projectCount: stored.projectCount,
       plan: { key: resolved.planKey, name: resolved.planName },
       subscriptionStatus: resolved.subscriptionStatus,
       capabilities: resolved.capabilities.entries(),
@@ -71,6 +84,8 @@ export function buildServer(
       })),
     };
   });
+
+  registerProjectRoutes(app, projects);
 
   return app;
 }

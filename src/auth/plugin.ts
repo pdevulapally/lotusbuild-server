@@ -7,6 +7,8 @@ export interface AuthenticatedUser {
   readonly uid: string;
   readonly email: string | undefined;
   readonly emailVerified: boolean;
+  readonly displayName: string | undefined;
+  readonly photoUrl: string | undefined;
   /** Seconds since the epoch, from the token. Used to reject stale sessions. */
   readonly authTime: number;
 }
@@ -59,6 +61,10 @@ export function bearerToken(header: string | undefined): string {
   return token;
 }
 
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
 /** Firebase error codes we can explain to the client without guessing. */
 const tokenFailureCodes: ReadonlyMap<string, string> = new Map([
   ['auth/id-token-expired', 'auth/token-expired'],
@@ -101,6 +107,10 @@ export function registerAuth(app: FastifyInstance, firebaseAuth: Auth): void {
       uid: decoded.uid,
       email: decoded.email,
       emailVerified: decoded.email_verified === true,
+      // "name" is not a declared claim on DecodedIdToken, only reachable through
+      // its index signature, so its type is checked rather than trusted.
+      displayName: nonEmptyString(decoded['name']),
+      photoUrl: nonEmptyString(decoded.picture),
       authTime: decoded.auth_time,
     });
   };
