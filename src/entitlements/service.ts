@@ -1,6 +1,12 @@
-import type { Firestore, Timestamp } from 'firebase-admin/firestore';
+import type { Firestore } from 'firebase-admin/firestore';
 
-import { DocumentShapeError, type Fields, enumField, stringField } from '../support/documents.ts';
+import {
+  DocumentShapeError,
+  type Fields,
+  enumField,
+  stringField,
+  timestampField,
+} from '../support/documents.ts';
 import { type EntitlementContribution, resolveCapability } from './merge.ts';
 import {
   type MeterLimit,
@@ -24,22 +30,6 @@ export interface Subscription {
   readonly status: SubscriptionStatus;
   readonly currentPeriodStart: Date;
   readonly currentPeriodEnd: Date;
-}
-
-function timestampField(fields: Fields, name: string, where: string): Date {
-  const value = fields[name];
-  if (
-    typeof value !== 'object' ||
-    value === null ||
-    typeof (value as Timestamp).toDate !== 'function'
-  ) {
-    throw new DocumentShapeError(`${where}: field "${name}" must be a Firestore timestamp.`);
-  }
-  const date = (value as Timestamp).toDate();
-  if (Number.isNaN(date.getTime())) {
-    throw new DocumentShapeError(`${where}: field "${name}" is not a valid instant.`);
-  }
-  return date;
 }
 
 function parseSubscription(fields: Fields, where: string): Subscription {

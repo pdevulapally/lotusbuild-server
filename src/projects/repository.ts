@@ -1,9 +1,15 @@
-import { FieldValue, type Firestore, Timestamp } from 'firebase-admin/firestore';
+import { FieldValue, type Firestore } from 'firebase-admin/firestore';
 
 import type { EntitlementService } from '../entitlements/service.ts';
-import type { Platform } from '../entitlements/schema.ts';
+import { type Platform, platforms } from '../entitlements/schema.ts';
 import { AppError } from '../http/errors.ts';
-import { type Fields, enumField, stringField } from '../support/documents.ts';
+import {
+  type Fields,
+  enumField,
+  optionalStringField,
+  stringField,
+  timestampField,
+} from '../support/documents.ts';
 import type { UserRepository } from '../users/repository.ts';
 
 export const projectsCollectionPath = 'projects';
@@ -31,23 +37,14 @@ export interface NewProject {
 }
 
 function parseProject(id: string, fields: Fields, where: string): Project {
-  const createdAt = fields['createdAt'];
-  if (!(createdAt instanceof Timestamp)) {
-    throw new AppError({
-      code: 'config/malformed-document',
-      statusCode: 500,
-      message: `${where}: createdAt is not a Firestore timestamp.`,
-    });
-  }
-  const description = fields['description'];
   return {
     id,
     ownerUid: stringField(fields, 'ownerUid', where),
     name: stringField(fields, 'name', where),
-    description: typeof description === 'string' && description !== '' ? description : undefined,
-    platform: enumField(fields, 'platform', where, ['web', 'mobile']),
+    description: optionalStringField(fields, 'description'),
+    platform: enumField(fields, 'platform', where, platforms),
     status: enumField(fields, 'status', where, projectStatuses),
-    createdAt: createdAt.toDate(),
+    createdAt: timestampField(fields, 'createdAt', where),
   };
 }
 

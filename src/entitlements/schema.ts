@@ -61,6 +61,12 @@ export interface Registry {
   readonly defaultPlanKey: string;
   /** Which meter records sandbox wall-clock time, for the allowance invariant. */
   readonly sandboxTimeMeterKey: string;
+  /**
+   * Which meter one started build is charged against. Named here rather than
+   * written into the code that starts builds, for the same reason as the one
+   * above: renaming a meter is a configuration edit, not a deploy.
+   */
+  readonly buildMeterKey: string;
   /** Statuses that actually grant a paid plan. Data, so billing rules are not code. */
   readonly entitlingSubscriptionStatuses: readonly SubscriptionStatus[];
   readonly capabilities: ReadonlyMap<string, CapabilityDefinition>;
@@ -178,6 +184,7 @@ export function parseRegistry(fields: Fields, where: string): Registry {
 
   const defaultPlanKey = stringField(fields, 'defaultPlanKey', where);
   const sandboxTimeMeterKey = stringField(fields, 'sandboxTimeMeterKey', where);
+  const buildMeterKey = stringField(fields, 'buildMeterKey', where);
 
   const entitling = fields['entitlingSubscriptionStatuses'];
   if (!Array.isArray(entitling) || entitling.length === 0) {
@@ -200,9 +207,25 @@ export function parseRegistry(fields: Fields, where: string): Registry {
     );
   }
 
+  const buildMeter = meters.get(buildMeterKey);
+  if (buildMeter === undefined) {
+    throw new DocumentShapeError(
+      `${where}: buildMeterKey "${buildMeterKey}" is not a declared meter.`,
+    );
+  }
+  if (buildMeter.kind !== 'COUNTER') {
+    // A started build is spent, not held. Pointing this at a gauge would charge
+    // a slot that nothing ever gives back.
+    throw new DocumentShapeError(
+      `${where}: buildMeterKey "${buildMeterKey}" is a ${buildMeter.kind}, but a started build ` +
+        'is consumed rather than held, so it must be a COUNTER.',
+    );
+  }
+
   return {
     defaultPlanKey,
     sandboxTimeMeterKey,
+    buildMeterKey,
     entitlingSubscriptionStatuses: Object.freeze(entitlingSubscriptionStatuses),
     capabilities,
     meters,

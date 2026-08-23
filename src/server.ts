@@ -10,15 +10,18 @@ import type { Config } from './config/index.ts';
 import type { EntitlementService } from './entitlements/service.ts';
 import { registerProjectRoutes } from './projects/routes.ts';
 import type { ProjectRepository } from './projects/repository.ts';
+import type { SessionEvents } from './sessions/events.ts';
+import type { SessionRepository } from './sessions/repository.ts';
+import { registerSessionRoutes } from './sessions/routes.ts';
 import type { UserRepository } from './users/repository.ts';
 import { registerErrorHandler } from './http/errors.ts';
 import { registerRateLimiting } from './http/rate-limit.ts';
 import { redisKeyPrefixes } from './redis/client.ts';
 
 /**
- * Builds the application without listening, so tests can drive real routes via
- * `app.inject()` instead of booting a process. A code path only reachable by
- * starting the server is a code path nothing tests.
+ * Everything the routes need, passed in rather than constructed here, so that
+ * building the app never opens a connection and `src/index.ts` stays the one
+ * place that decides what talks to what.
  */
 export interface Dependencies {
   readonly firebaseAuth: Auth;
@@ -26,10 +29,13 @@ export interface Dependencies {
   readonly entitlements: EntitlementService;
   readonly users: UserRepository;
   readonly projects: ProjectRepository;
+  readonly sessions: SessionRepository;
+  readonly sessionEvents: SessionEvents;
 }
 
 export function buildServer(config: Config, dependencies: Dependencies): FastifyInstance {
-  const { firebaseAuth, redis, entitlements, users, projects } = dependencies;
+  const { firebaseAuth, redis, entitlements, users, projects, sessions, sessionEvents } =
+    dependencies;
   const app = Fastify({
     logger: { level: config.LOG_LEVEL },
     // Trust the reverse proxy in front of us for client IP and protocol, which
@@ -104,6 +110,10 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
   });
 
   registerProjectRoutes(app, projects);
+  registerSessionRoutes(app, sessions, sessionEvents, {
+    heartbeatSeconds: config.SSE_HEARTBEAT_SECONDS,
+    maxConnections: config.SSE_MAX_CONNECTIONS,
+  });
 
   return app;
 }

@@ -2,7 +2,12 @@ import { FieldValue, type Firestore, type Transaction } from 'firebase-admin/fir
 
 import type { AuthenticatedUser } from '../auth/plugin.ts';
 import { AppError } from '../http/errors.ts';
-import { type Fields, integerField, stringField } from '../support/documents.ts';
+import {
+  type Fields,
+  integerField,
+  optionalStringField,
+  stringField,
+} from '../support/documents.ts';
 
 export const usersCollectionPath = 'users';
 
@@ -19,17 +24,12 @@ export interface UserRecord {
   readonly projectCount: number;
 }
 
-function optionalString(fields: Fields, name: string): string | undefined {
-  const value = fields[name];
-  return typeof value === 'string' && value.trim() !== '' ? value : undefined;
-}
-
 export function parseUser(fields: Fields, where: string): UserRecord {
   return {
     uid: stringField(fields, 'uid', where),
     email: stringField(fields, 'email', where),
-    displayName: optionalString(fields, 'displayName'),
-    photoUrl: optionalString(fields, 'photoUrl'),
+    displayName: optionalStringField(fields, 'displayName'),
+    photoUrl: optionalStringField(fields, 'photoUrl'),
     projectCount: integerField(fields, 'projectCount', where, { min: 0 }),
   };
 }

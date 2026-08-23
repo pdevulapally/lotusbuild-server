@@ -1,3 +1,5 @@
+import { Timestamp } from 'firebase-admin/firestore';
+
 import { AppError } from '../http/errors.ts';
 
 /**
@@ -59,6 +61,37 @@ export function integerField(
     throw new DocumentShapeError(`${where}: field "${name}" must be between ${min} and ${max}.`);
   }
   return value;
+}
+
+export function timestampField(fields: Fields, name: string, where: string): Date {
+  const value = raw(fields, name, where);
+  if (!(value instanceof Timestamp)) {
+    throw new DocumentShapeError(`${where}: field "${name}" must be a Firestore timestamp.`);
+  }
+  const date = value.toDate();
+  if (Number.isNaN(date.getTime())) {
+    throw new DocumentShapeError(`${where}: field "${name}" is not a valid instant.`);
+  }
+  return date;
+}
+
+/**
+ * For fields whose absence is meaningful rather than broken — a heartbeat on a
+ * session nobody has claimed, an end date on something still open. A present
+ * but malformed value is still an error: only "not there" is acceptable.
+ */
+export function optionalTimestampField(
+  fields: Fields,
+  name: string,
+  where: string,
+): Date | undefined {
+  const value = fields[name];
+  return value === undefined || value === null ? undefined : timestampField(fields, name, where);
+}
+
+export function optionalStringField(fields: Fields, name: string): string | undefined {
+  const value = fields[name];
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined;
 }
 
 export function enumField<const T extends readonly [string, ...string[]]>(

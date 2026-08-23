@@ -65,4 +65,6 @@ export async function connectRedis(
 export const redisKeyPrefixes = {
   rateLimit: 'rl:',
   subscription: 'sub:',
+  /** Doubles as the pub/sub channel name; channels are not part of the keyspace. */
+  sessionEvents: 'ev:',
 } as const;

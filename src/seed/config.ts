@@ -14,6 +14,7 @@
 export const registryDocument = {
   defaultPlanKey: 'free',
   sandboxTimeMeterKey: 'sandbox.seconds',
+  buildMeterKey: 'builds.started',
   entitlingSubscriptionStatuses: ['TRIALING', 'ACTIVE'],
   entitlementSources: [
     { key: "plan", precedence: 0 },
