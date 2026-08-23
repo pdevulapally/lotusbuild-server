@@ -67,6 +67,9 @@ export interface Registry {
    * above: renaming a meter is a configuration edit, not a deploy.
    */
   readonly buildMeterKey: string;
+  /** Which meters model usage is charged to. Same reason: renaming is config. */
+  readonly inputTokenMeterKey: string;
+  readonly outputTokenMeterKey: string;
   /** Statuses that actually grant a paid plan. Data, so billing rules are not code. */
   readonly entitlingSubscriptionStatuses: readonly SubscriptionStatus[];
   readonly capabilities: ReadonlyMap<string, CapabilityDefinition>;
@@ -185,6 +188,8 @@ export function parseRegistry(fields: Fields, where: string): Registry {
   const defaultPlanKey = stringField(fields, 'defaultPlanKey', where);
   const sandboxTimeMeterKey = stringField(fields, 'sandboxTimeMeterKey', where);
   const buildMeterKey = stringField(fields, 'buildMeterKey', where);
+  const inputTokenMeterKey = stringField(fields, 'inputTokenMeterKey', where);
+  const outputTokenMeterKey = stringField(fields, 'outputTokenMeterKey', where);
 
   const entitling = fields['entitlingSubscriptionStatuses'];
   if (!Array.isArray(entitling) || entitling.length === 0) {
@@ -207,25 +212,32 @@ export function parseRegistry(fields: Fields, where: string): Registry {
     );
   }
 
-  const buildMeter = meters.get(buildMeterKey);
-  if (buildMeter === undefined) {
-    throw new DocumentShapeError(
-      `${where}: buildMeterKey "${buildMeterKey}" is not a declared meter.`,
-    );
-  }
-  if (buildMeter.kind !== 'COUNTER') {
-    // A started build is spent, not held. Pointing this at a gauge would charge
-    // a slot that nothing ever gives back.
-    throw new DocumentShapeError(
-      `${where}: buildMeterKey "${buildMeterKey}" is a ${buildMeter.kind}, but a started build ` +
-        'is consumed rather than held, so it must be a COUNTER.',
-    );
+  // Everything these three point at is spent outright rather than held, so each
+  // must be a counter. Pointing one at a gauge would charge a slot that nothing
+  // ever gives back.
+  for (const [field, key] of [
+    ['buildMeterKey', buildMeterKey],
+    ['inputTokenMeterKey', inputTokenMeterKey],
+    ['outputTokenMeterKey', outputTokenMeterKey],
+  ] as const) {
+    const meter = meters.get(key);
+    if (meter === undefined) {
+      throw new DocumentShapeError(`${where}: ${field} "${key}" is not a declared meter.`);
+    }
+    if (meter.kind !== 'COUNTER') {
+      throw new DocumentShapeError(
+        `${where}: ${field} "${key}" is a ${meter.kind}, but what it measures is consumed ` +
+          'rather than held, so it must be a COUNTER.',
+      );
+    }
   }
 
   return {
     defaultPlanKey,
     sandboxTimeMeterKey,
     buildMeterKey,
+    inputTokenMeterKey,
+    outputTokenMeterKey,
     entitlingSubscriptionStatuses: Object.freeze(entitlingSubscriptionStatuses),
     capabilities,
     meters,

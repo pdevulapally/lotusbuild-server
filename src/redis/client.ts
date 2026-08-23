@@ -1,7 +1,7 @@
 import { Redis } from 'ioredis';
 
 import { EnvironmentError } from '../config/env.ts';
-import type { Config } from '../config/index.ts';
+import type { SharedConfig } from '../config/index.ts';
 
 /**
  * Connects to Redis, proving it before the process is allowed to serve.
@@ -18,16 +18,19 @@ import type { Config } from '../config/index.ts';
  * hangs for as long as the incident lasts.
  */
 export async function connectRedis(
-  config: Config,
+  config: SharedConfig,
   onError: (error: Error) => void,
+  // Named so `CLIENT LIST` on the server says which process holds a connection.
+  // Passed in rather than fixed here: the API and the runner both call this, and
+  // a shared literal would have them both claim to be the API.
+  connectionName: string,
 ): Promise<Redis> {
   const redis = new Redis(config.REDIS_URL.toString(), {
     lazyConnect: true,
     enableOfflineQueue: false,
     maxRetriesPerRequest: 2,
     connectTimeout: 5000,
-    // Named so `CLIENT LIST` on the server says which process holds a connection.
-    connectionName: 'lotusbuild-api',
+    connectionName,
   });
 
   // ioredis emits 'error' on every failed connection attempt, and an unheard

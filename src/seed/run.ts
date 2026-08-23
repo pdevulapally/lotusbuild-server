@@ -55,10 +55,14 @@ async function main(): Promise<void> {
   // is not the same as writing valid configuration: this is what proves the
   // cross-references, the allowance invariant and every merge strategy hold.
   const store = new ConfigurationStore(firestore, 1000);
-  const redis = await connectRedis(config, (error) => {
-    process.stderr.write(`redis: ${error.message}
+  const redis = await connectRedis(
+    config,
+    (error) => {
+      process.stderr.write(`redis: ${error.message}
 `);
-  });
+    },
+    'lotusbuild-seed',
+  );
   const { registry, plans } = await store.get();
   process.stdout.write(
     `Validated: ${registry.capabilities.size} capabilities, ${registry.meters.size} meters, ` +

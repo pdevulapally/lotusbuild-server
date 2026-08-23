@@ -18,6 +18,7 @@ import {
   integerField,
   optionalStringField,
   optionalTimestampField,
+  stringArrayField,
   stringField,
   timestampField,
 } from '../support/documents.ts';
@@ -53,6 +54,12 @@ export interface BuildSession {
   readonly claimedBy: string | undefined;
   readonly heartbeatAt: Date | undefined;
   readonly error: string | undefined;
+  /**
+   * Meter holds the claiming runner took out. Recorded on the session so that
+   * whoever inherits an expired lease can give them back: a hold nobody returns
+   * is a concurrency slot the user never gets to use again.
+   */
+  readonly reservationIds: readonly string[];
   readonly messageCount: number;
   readonly createdAt: Date;
 }
@@ -91,6 +98,7 @@ function parseSession(id: string, fields: Fields, where: string): BuildSession {
     claimedBy: optionalStringField(fields, 'claimedBy'),
     heartbeatAt: optionalTimestampField(fields, 'heartbeatAt', where),
     error: optionalStringField(fields, 'error'),
+    reservationIds: stringArrayField(fields, 'reservationIds', where),
     messageCount: integerField(fields, 'messageCount', where, { min: 1 }),
     createdAt: timestampField(fields, 'createdAt', where),
   };
@@ -245,6 +253,7 @@ export class SessionRepository {
       claimedBy: undefined,
       heartbeatAt: undefined,
       error: undefined,
+      reservationIds: [],
       messageCount: 1,
       createdAt: now,
     };
@@ -412,6 +421,7 @@ export class SessionRepository {
         return undefined;
       }
 
+      // Returned as it was found, holds included: the caller inherits the mess.
       const session = parseSession(snapshot.id, fields, ref.path);
       transaction.update(ref, {
         status: 'RUNNING',
@@ -447,10 +457,62 @@ export class SessionRepository {
     });
   }
 
-  /** Records the sandbox a runner started, so it can be reclaimed or shown. */
-  async attachSandbox(sessionId: string, runnerId: string, sandboxId: string): Promise<void> {
+  /**
+   * Records what the runner is now holding, so a successor can clean it up.
+   *
+   * Written before the sandbox is used rather than after, because the window
+   * that matters is the one where a runner dies mid-build: an unrecorded
+   * sandbox keeps running and an unrecorded hold is never given back.
+   */
+  async attachSandbox(
+    sessionId: string,
+    runnerId: string,
+    held: { readonly sandboxId: string; readonly reservationIds: readonly string[] },
+  ): Promise<void> {
     await this.#withLease(sessionId, runnerId, (transaction, ref) => {
-      transaction.update(ref, { sandboxId, updatedAt: FieldValue.serverTimestamp() });
+      transaction.update(ref, {
+        sandboxId: held.sandboxId,
+        reservationIds: [...held.reservationIds],
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    });
+  }
+
+  /**
+   * Adds what the agent said to the transcript, under the runner's lease.
+   *
+   * Separate from `appendPrompt` because the rules are opposite: a user may only
+   * speak when the session is idle, and a runner may only speak while it holds
+   * it. Sharing one method would mean a check that means different things to
+   * different callers.
+   */
+  async appendAssistantMessage(
+    sessionId: string,
+    runnerId: string,
+    content: string,
+  ): Promise<void> {
+    const ref = this.#ref(sessionId);
+    await this.#firestore.runTransaction(async (transaction) => {
+      const session = await this.#requireLease(transaction, ref, runnerId);
+      transaction.create(
+        ref.collection(messagesCollectionName).doc(messageId(session.messageCount)),
+        { role: 'assistant', content, createdAt: FieldValue.serverTimestamp() },
+      );
+      transaction.update(ref, {
+        messageCount: FieldValue.increment(1),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    });
+  }
+
+  /** Forgets the sandbox and holds once they have actually been given back. */
+  async detachSandbox(sessionId: string, runnerId: string): Promise<void> {
+    await this.#withLease(sessionId, runnerId, (transaction, ref) => {
+      transaction.update(ref, {
+        sandboxId: FieldValue.delete(),
+        reservationIds: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
     });
   }
 
@@ -471,6 +533,36 @@ export class SessionRepository {
     });
   }
 
+  /**
+   * Proves the runner still holds the session, inside the transaction that is
+   * about to act on it. Checking outside would leave a window in which the lease
+   * expires between the check and the write.
+   */
+  async #requireLease(
+    transaction: Transaction,
+    ref: DocumentReference,
+    runnerId: string,
+  ): Promise<BuildSession> {
+    const snapshot = await transaction.get(ref);
+    if (!snapshot.exists) {
+      throw new AppError({
+        code: 'session/not-found',
+        statusCode: 404,
+        message: 'No such session.',
+      });
+    }
+    const session = parseSession(snapshot.id, snapshot.data() ?? {}, ref.path);
+    if (session.status !== 'RUNNING' || session.claimedBy !== runnerId) {
+      throw new AppError({
+        code: 'session/lease-lost',
+        statusCode: 409,
+        message: `This session is ${session.status} and is not held by ${runnerId}.`,
+        details: { status: session.status, claimedBy: session.claimedBy },
+      });
+    }
+    return session;
+  }
+
   async #withLease(
     sessionId: string,
     runnerId: string,
@@ -478,23 +570,7 @@ export class SessionRepository {
   ): Promise<void> {
     const ref = this.#ref(sessionId);
     await this.#firestore.runTransaction(async (transaction) => {
-      const snapshot = await transaction.get(ref);
-      if (!snapshot.exists) {
-        throw new AppError({
-          code: 'session/not-found',
-          statusCode: 404,
-          message: 'No such session.',
-        });
-      }
-      const session = parseSession(snapshot.id, snapshot.data() ?? {}, ref.path);
-      if (session.status !== 'RUNNING' || session.claimedBy !== runnerId) {
-        throw new AppError({
-          code: 'session/lease-lost',
-          statusCode: 409,
-          message: `This session is ${session.status} and is not held by ${runnerId}.`,
-          details: { status: session.status, claimedBy: session.claimedBy },
-        });
-      }
+      await this.#requireLease(transaction, ref, runnerId);
       write(transaction, ref);
     });
   }

@@ -94,6 +94,27 @@ export function optionalStringField(fields: Fields, name: string): string | unde
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
 }
 
+/**
+ * A list of strings, absent meaning empty. Used for the ids a runner is holding:
+ * "nothing recorded" and "holding nothing" are the same state, and a caller that
+ * had to tell them apart would be reasoning about a distinction with no meaning.
+ */
+export function stringArrayField(fields: Fields, name: string, where: string): readonly string[] {
+  const value = fields[name];
+  if (value === undefined || value === null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new DocumentShapeError(`${where}: field "${name}" must be an array of strings.`);
+  }
+  return value.map((entry, index) => {
+    if (typeof entry !== 'string' || entry.trim() === '') {
+      throw new DocumentShapeError(`${where}: ${name}[${index}] must be a non-empty string.`);
+    }
+    return entry;
+  });
+}
+
 export function enumField<const T extends readonly [string, ...string[]]>(
   fields: Fields,
   name: string,

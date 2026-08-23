@@ -25,10 +25,14 @@ async function main(): Promise<void> {
   const firebase = initialiseFirebase(config);
   // Redis is proven before the port opens too: rate limiting fails closed, so a
   // process that cannot reach it would refuse every request it accepted.
-  const redis = await connectRedis(config, (error) => {
-    process.stderr.write(`redis: ${error.message}
+  const redis = await connectRedis(
+    config,
+    (error) => {
+      process.stderr.write(`redis: ${error.message}
 `);
-  });
+    },
+    'lotusbuild-api',
+  );
 
   const configuration = new ConfigurationStore(
     firebase.firestore,

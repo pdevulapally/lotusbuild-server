@@ -5,7 +5,7 @@ import { type Auth, getAuth } from 'firebase-admin/auth';
 import { type Firestore, getFirestore } from 'firebase-admin/firestore';
 
 import { EnvironmentError } from './config/env.ts';
-import type { Config } from './config/index.ts';
+import type { SharedConfig } from './config/index.ts';
 
 /**
  * The service account lives in a file rather than an environment variable so the
@@ -76,7 +76,7 @@ export interface FirebaseServices {
  * resolve from ambient state, so a misconfigured host silently authenticates as
  * something unexpected instead of failing.
  */
-export function initialiseFirebase(config: Config): FirebaseServices {
+export function initialiseFirebase(config: SharedConfig): FirebaseServices {
   const account = readServiceAccount(
     config.FIREBASE_SERVICE_ACCOUNT_FILE,
     config.FIREBASE_PROJECT_ID,
