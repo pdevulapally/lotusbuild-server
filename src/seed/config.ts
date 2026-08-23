@@ -17,6 +17,7 @@ export const registryDocument = {
   buildMeterKey: 'builds.started',
   inputTokenMeterKey: 'ai.tokens.input',
   outputTokenMeterKey: 'ai.tokens.output',
+  storageMeterKey: 'storage.bytes',
   entitlingSubscriptionStatuses: ['TRIALING', 'ACTIVE'],
   entitlementSources: [
     { key: "plan", precedence: 0 },

@@ -70,6 +70,8 @@ export interface Registry {
   /** Which meters model usage is charged to. Same reason: renaming is config. */
   readonly inputTokenMeterKey: string;
   readonly outputTokenMeterKey: string;
+  /** Which meter records how much a user has stored. Occupied, so a gauge. */
+  readonly storageMeterKey: string;
   /** Statuses that actually grant a paid plan. Data, so billing rules are not code. */
   readonly entitlingSubscriptionStatuses: readonly SubscriptionStatus[];
   readonly capabilities: ReadonlyMap<string, CapabilityDefinition>;
@@ -190,6 +192,7 @@ export function parseRegistry(fields: Fields, where: string): Registry {
   const buildMeterKey = stringField(fields, 'buildMeterKey', where);
   const inputTokenMeterKey = stringField(fields, 'inputTokenMeterKey', where);
   const outputTokenMeterKey = stringField(fields, 'outputTokenMeterKey', where);
+  const storageMeterKey = stringField(fields, 'storageMeterKey', where);
 
   const entitling = fields['entitlingSubscriptionStatuses'];
   if (!Array.isArray(entitling) || entitling.length === 0) {
@@ -232,12 +235,28 @@ export function parseRegistry(fields: Fields, where: string): Registry {
     }
   }
 
+  const storageMeter = meters.get(storageMeterKey);
+  if (storageMeter === undefined) {
+    throw new DocumentShapeError(
+      `${where}: storageMeterKey "${storageMeterKey}" is not a declared meter.`,
+    );
+  }
+  if (storageMeter.kind !== 'GAUGE') {
+    // Storage is occupied and given back, not spent. A counter would only ever
+    // climb, so deleting a project would never return the space.
+    throw new DocumentShapeError(
+      `${where}: storageMeterKey "${storageMeterKey}" is a ${storageMeter.kind}, but stored ` +
+        'bytes are occupied rather than consumed, so it must be a GAUGE.',
+    );
+  }
+
   return {
     defaultPlanKey,
     sandboxTimeMeterKey,
     buildMeterKey,
     inputTokenMeterKey,
     outputTokenMeterKey,
+    storageMeterKey,
     entitlingSubscriptionStatuses: Object.freeze(entitlingSubscriptionStatuses),
     capabilities,
     meters,

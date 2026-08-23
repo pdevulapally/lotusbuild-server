@@ -1,10 +1,11 @@
 import type Anthropic from '@anthropic-ai/sdk';
 
-import type { EntitlementService } from '../entitlements/service.ts';
+import type { EntitlementService, UserEntitlements } from '../entitlements/service.ts';
 import type { ConfigurationStore } from '../entitlements/store.ts';
 import { AppError } from '../http/errors.ts';
 import type { MeteringService } from '../metering/service.ts';
-import type { ProjectRepository } from '../projects/repository.ts';
+import type { ProjectPersistence } from '../projects/persistence.ts';
+import type { Project, ProjectRepository } from '../projects/repository.ts';
 import type { AcquiredSandbox, SandboxService } from '../sandboxes/service.ts';
 import type { SessionEvents } from '../sessions/events.ts';
 import type { BuildSession, SessionRepository } from '../sessions/repository.ts';
@@ -25,6 +26,7 @@ export interface RunnerDependencies {
   readonly configuration: ConfigurationStore;
   readonly metering: MeteringService;
   readonly sandboxes: SandboxService;
+  readonly persistence: ProjectPersistence;
   readonly events: SessionEvents;
   readonly limits: AgentLimits;
   readonly heartbeatSeconds: number;
@@ -82,12 +84,23 @@ export class SessionRunner {
     };
 
     let acquired: AcquiredSandbox | undefined;
+    // Held outside the try so the failure path can still save the work: an agent
+    // that got halfway before dying has built something the user would rather
+    // keep than lose.
+    let project: Project | undefined;
+    let entitlements: UserEntitlements | undefined;
+    let persists = false;
+
     try {
+      project = await this.#deps.projects.readOwned(session.ownerUid, session.projectId);
+      entitlements = await this.#deps.entitlements.forUser(session.ownerUid);
+      persists = entitlements.capabilities.boolean('git.persistence');
+      const { registry } = await this.#deps.configuration.get();
+
       // Whatever the previous holder of this session left behind. Done before
       // anything is reserved, so its concurrency slot is free again in time for
       // this attempt to take one.
       if (session.sandboxId !== undefined || session.reservationIds.length > 0) {
-        const project = await this.#deps.projects.readOwned(session.ownerUid, session.projectId);
         await sandboxes.recover({
           uid: session.ownerUid,
           platform: project.platform,
@@ -100,10 +113,6 @@ export class SessionRunner {
         });
         await sessions.detachSandbox(session.id, runnerId);
       }
-
-      const project = await this.#deps.projects.readOwned(session.ownerUid, session.projectId);
-      const entitlements = await this.#deps.entitlements.forUser(session.ownerUid);
-      const { registry } = await this.#deps.configuration.get();
 
       await publish('session.running', { runnerId, model: session.model, effort: session.effort });
 
@@ -125,6 +134,17 @@ export class SessionRunner {
         template: acquired.provider.template,
         platform: acquired.provider.platform,
       });
+
+      // Only a plan that pays for it gets its work back. For everyone else the
+      // sandbox is genuinely disposable, which is the difference being sold.
+      if (persists) {
+        const outcome = await this.#deps.persistence.restore(
+          acquired.running,
+          acquired.provider,
+          project,
+        );
+        await publish('project.restored', { outcome });
+      }
 
       const messages = await sessions.listMessages(
         session.ownerUid,
@@ -173,6 +193,7 @@ export class SessionRunner {
       }
       await publish('agent.finished', { steps: run.steps, stopReason: run.stopReason });
 
+      await this.#save(session, project, entitlements, acquired, persists, publish);
       await this.#letGo(session, acquired);
       acquired = undefined;
 
@@ -184,6 +205,10 @@ export class SessionRunner {
       log.error({ sessionId: session.id, err: error }, 'session failed');
 
       if (acquired !== undefined) {
+        // Saved before the machine is discarded, even now: a build that failed
+        // at step nine still wrote eight steps of a project the user is paying
+        // to keep.
+        await this.#save(session, project, entitlements, acquired, persists, publish);
         await this.#letGo(session, acquired);
       }
       await publish('session.failed', { error: reason });
@@ -197,6 +222,45 @@ export class SessionRunner {
       }
     } finally {
       clearInterval(heartbeat);
+    }
+  }
+
+  /**
+   * Commits and stores the project, if the plan includes it.
+   *
+   * A failure here is reported and swallowed rather than thrown. It is reached
+   * from the error path as well as the good one, and letting it throw there
+   * would replace the real reason a build failed with a second one, while
+   * skipping the sandbox release that has to happen either way.
+   */
+  async #save(
+    session: BuildSession,
+    project: Project | undefined,
+    entitlements: UserEntitlements | undefined,
+    acquired: AcquiredSandbox,
+    persists: boolean,
+    publish: (type: string, data: Record<string, unknown>) => Promise<void>,
+  ): Promise<void> {
+    if (!persists || project === undefined || entitlements === undefined) {
+      return;
+    }
+    try {
+      const saved = await this.#deps.persistence.save({
+        sandbox: acquired.running,
+        provider: acquired.provider,
+        project,
+        entitlements,
+        // Traceable back to the turn that produced it without putting the
+        // user's prompt — which is theirs, and arbitrary text — in a commit.
+        commitMessage: `LotusBuild session ${session.id}`,
+      });
+      await publish('project.saved', { bytes: saved.bytes, committed: saved.committed });
+      this.#deps.log.info({ sessionId: session.id, ...saved }, 'saved the project');
+    } catch (error) {
+      this.#deps.log.error({ sessionId: session.id, err: error }, 'could not save the project');
+      await publish('project.save_failed', {
+        error: error instanceof AppError ? error.message : 'The project could not be saved.',
+      });
     }
   }
 

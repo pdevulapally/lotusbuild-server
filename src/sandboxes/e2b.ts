@@ -65,7 +65,12 @@ class E2BSandbox implements RunningSandbox {
 
   async runCommand(
     command: string,
-    options: { readonly cwd: string; readonly timeoutMs: number; readonly background?: boolean },
+    options: {
+      readonly cwd: string;
+      readonly timeoutMs: number;
+      readonly background?: boolean;
+      readonly envs?: Readonly<Record<string, string>>;
+    },
   ): Promise<CommandOutcome> {
     if (options.background === true) {
       // A dev server never exits, so waiting for it would hang the build. The
@@ -73,6 +78,7 @@ class E2BSandbox implements RunningSandbox {
       // dies when the sandbox does.
       await this.#sandbox.commands.run(command, {
         cwd: options.cwd,
+        ...(options.envs === undefined ? {} : { envs: { ...options.envs } }),
         background: true,
       });
       return { exitCode: 0, stdout: '', stderr: '' };
@@ -82,6 +88,7 @@ class E2BSandbox implements RunningSandbox {
       const result = await this.#sandbox.commands.run(command, {
         cwd: options.cwd,
         timeoutMs: options.timeoutMs,
+        ...(options.envs === undefined ? {} : { envs: { ...options.envs } }),
         background: false,
       });
       return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };

@@ -96,6 +96,13 @@ const runnerSpec = {
     'how much of a tool result is fed back to the model before it is truncated',
     { min: 500, max: 200000 },
   ),
+  FIREBASE_STORAGE_BUCKET: asString('bucket holding the saved git repository for every project'),
+  SNAPSHOT_URL_TTL_SECONDS: asInteger(
+    'how long a signed upload or download URL for a project snapshot stays valid',
+    { min: 60, max: 3600 },
+  ),
+  GIT_AUTHOR_NAME: asString('name on the commits the agent makes inside a project'),
+  GIT_AUTHOR_EMAIL: asString('email on those commits'),
   E2B_API_KEY: asString('key sandboxes are created with'),
   E2B_DOMAIN: asString('E2B domain to reach (e2b.app unless self-hosted)'),
   PREVIEW_READY_TIMEOUT_SECONDS: asInteger(

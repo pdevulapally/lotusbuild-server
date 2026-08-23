@@ -5,6 +5,7 @@ import { type Platform, platforms } from '../entitlements/schema.ts';
 import { AppError } from '../http/errors.ts';
 import {
   type Fields,
+  countField,
   enumField,
   optionalStringField,
   stringField,
@@ -27,6 +28,8 @@ export interface Project {
   readonly description: string | undefined;
   readonly platform: Platform;
   readonly status: (typeof projectStatuses)[number];
+  /** Bytes the last saved snapshot occupies, and so what it charges storage. */
+  readonly snapshotBytes: number;
   readonly createdAt: Date;
 }
 
@@ -44,6 +47,7 @@ function parseProject(id: string, fields: Fields, where: string): Project {
     description: optionalStringField(fields, 'description'),
     platform: enumField(fields, 'platform', where, platforms),
     status: enumField(fields, 'status', where, projectStatuses),
+    snapshotBytes: countField(fields, 'snapshotBytes', where),
     createdAt: timestampField(fields, 'createdAt', where),
   };
 }
@@ -123,8 +127,14 @@ export class ProjectRepository {
       description: input.description,
       platform: input.platform,
       status: 'draft',
+      snapshotBytes: 0,
       createdAt,
     };
+  }
+
+  /** For callers that update a project inside their own transaction. */
+  refFor(projectId: string) {
+    return this.#firestore.doc(`${projectsCollectionPath}/${projectId}`);
   }
 
   async listOwnedBy(ownerUid: string, limit: number): Promise<readonly Project[]> {

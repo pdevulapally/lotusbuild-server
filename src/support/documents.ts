@@ -63,6 +63,18 @@ export function integerField(
   return value;
 }
 
+/**
+ * A non-negative count, absent meaning none has been recorded. For a stored
+ * size that is the same state as zero, so callers are not made to tell apart
+ * "no snapshot yet" from "a snapshot of nothing".
+ */
+export function countField(fields: Fields, name: string, where: string): number {
+  const value = fields[name];
+  return value === undefined || value === null
+    ? 0
+    : integerField(fields, name, where, { min: 0 });
+}
+
 export function timestampField(fields: Fields, name: string, where: string): Date {
   const value = raw(fields, name, where);
   if (!(value instanceof Timestamp)) {

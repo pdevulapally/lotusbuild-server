@@ -19,7 +19,19 @@ export interface RunningSandbox {
   readonly externalId: string;
   runCommand(
     command: string,
-    options: { readonly cwd: string; readonly timeoutMs: number; readonly background?: boolean },
+    options: {
+      readonly cwd: string;
+      readonly timeoutMs: number;
+      readonly background?: boolean;
+      /**
+       * Values the command reads as environment variables. Anything that is not
+       * ours to trust — a commit message, a signed URL, a configured identity —
+       * travels this way rather than being pasted into the command string,
+       * where quoting it correctly is the only thing between us and the shell
+       * running it.
+       */
+      readonly envs?: Readonly<Record<string, string>>;
+    },
   ): Promise<CommandOutcome>;
   writeFile(path: string, content: string): Promise<void>;
   readFile(path: string): Promise<string>;

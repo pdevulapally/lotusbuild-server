@@ -229,6 +229,86 @@ export class MeteringService {
     return { meterKey: meter.key, consumed: after, periodStart };
   }
 
+  /**
+   * Moves a gauge to a new reading, inside the caller's transaction.
+   *
+   * A gauge is not spent, it is occupied — bytes stored, sandboxes running — so
+   * it is set rather than added to. The caller passes what this one contributor
+   * held before as well as what it holds now, because the meter counts every
+   * contributor together: a project growing from 10MB to 12MB must move the
+   * user's total by two, not by twelve. Reading the old figure in the same
+   * transaction that writes the new one is what keeps the two from drifting.
+   */
+  async setGaugeIn(
+    transaction: Transaction,
+    input: {
+      readonly uid: string;
+      readonly entitlements: UserEntitlements;
+      readonly meterKey: string;
+      readonly previousQuantity: number;
+      readonly quantity: number;
+      readonly now: Date;
+    },
+  ): Promise<number> {
+    for (const [name, value] of [
+      ['previousQuantity', input.previousQuantity],
+      ['quantity', input.quantity],
+    ] as const) {
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new Error(
+          `A gauge ${name} must be a non-negative integer, got ${value} for "${input.meterKey}".`,
+        );
+      }
+    }
+
+    const { meter, limit } = await this.#resolve(input.entitlements, input.meterKey);
+    if (meter.kind !== 'GAUGE') {
+      throw new EntitlementConfigError(
+        `Meter "${meter.key}" is a ${meter.kind}, which is spent rather than occupied. Setting ` +
+          'it would silently discard what has already been charged to it.',
+      );
+    }
+
+    const ref = this.#usageRef(input.uid, input.meterKey);
+    const snapshot = await transaction.get(ref);
+    const periodStart = periodStartFor(meter, input.now);
+    const state = this.#state(snapshot, periodStart, ref.path);
+
+    const total = state.consumed - input.previousQuantity + input.quantity;
+    if (total < 0) {
+      // The contributor claims to have held more than the meter ever recorded.
+      // Carrying on would hand back capacity that was never taken.
+      throw new Error(
+        `Usage for ${input.uid}/${meter.key} reads ${state.consumed} but a contributor claims to ` +
+          `have held ${input.previousQuantity}.`,
+      );
+    }
+    if (total + state.reserved > limit.hardLimit) {
+      throw this.#exceeded(input.entitlements, meter, limit, state, input.quantity, periodStart);
+    }
+
+    transaction.set(ref, {
+      meterKey: meter.key,
+      consumed: total,
+      reserved: state.reserved,
+      periodStart: Timestamp.fromDate(periodStart),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+    return total;
+  }
+
+  /** `setGaugeIn` for callers with nothing else to commit alongside it. */
+  async setGauge(input: {
+    readonly uid: string;
+    readonly entitlements: UserEntitlements;
+    readonly meterKey: string;
+    readonly previousQuantity: number;
+    readonly quantity: number;
+    readonly now: Date;
+  }): Promise<number> {
+    return this.#firestore.runTransaction((transaction) => this.setGaugeIn(transaction, input));
+  }
+
   /** `consumeIn` for callers with nothing else to commit alongside it. */
   async consume(input: {
     readonly uid: string;

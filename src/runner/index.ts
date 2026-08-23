@@ -9,6 +9,7 @@ import { ConfigurationStore } from '../entitlements/store.ts';
 import { SubscriptionCache } from '../entitlements/subscription-cache.ts';
 import { initialiseFirebase } from '../firebase.ts';
 import { MeteringService } from '../metering/service.ts';
+import { ProjectPersistence } from '../projects/persistence.ts';
 import { ProjectRepository } from '../projects/repository.ts';
 import { connectRedis } from '../redis/client.ts';
 import { E2BAdapter } from '../sandboxes/e2b.ts';
@@ -16,6 +17,7 @@ import type { SandboxAdapter } from '../sandboxes/provider.ts';
 import { SandboxService } from '../sandboxes/service.ts';
 import { SessionEvents } from '../sessions/events.ts';
 import { SessionRepository } from '../sessions/repository.ts';
+import { SnapshotStore } from '../storage/snapshots.ts';
 import { UserRepository } from '../users/repository.ts';
 import { SessionRunner, runUntilStopped } from './loop.ts';
 
@@ -74,6 +76,15 @@ async function main(): Promise<void> {
     ['e2b', new E2BAdapter(config.E2B_API_KEY, config.E2B_DOMAIN)],
   ]);
 
+  const snapshots = new SnapshotStore(
+    firebase.app,
+    config.FIREBASE_STORAGE_BUCKET,
+    config.SNAPSHOT_URL_TTL_SECONDS,
+  );
+  // Proven before any work is claimed. Discovering the bucket is missing at save
+  // time means a build that ran, cost money and threw its result away.
+  await snapshots.assertReachable();
+
   const runner = new SessionRunner({
     runnerId,
     anthropic: new Anthropic({
@@ -93,6 +104,15 @@ async function main(): Promise<void> {
     configuration,
     metering,
     sandboxes: new SandboxService(configuration, metering, adapters),
+    persistence: new ProjectPersistence(
+      firebase.firestore,
+      projects,
+      configuration,
+      metering,
+      snapshots,
+      { name: config.GIT_AUTHOR_NAME, email: config.GIT_AUTHOR_EMAIL },
+      config.AGENT_COMMAND_TIMEOUT_SECONDS * 1000,
+    ),
     events: new SessionEvents(redis, subscriber, {
       retentionSeconds: config.SESSION_EVENT_RETENTION_SECONDS,
       maxPerSession: config.SESSION_EVENT_MAX_PER_SESSION,
