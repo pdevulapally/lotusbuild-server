@@ -67,6 +67,21 @@ const apiSpec = {
     'open event streams this process will hold at once',
     { min: 1, max: 10000 },
   ),
+  STRIPE_SECRET_KEY: asString('Stripe secret key this service bills with'),
+  STRIPE_WEBHOOK_SECRET: asString('signing secret for the Stripe webhook endpoint'),
+  STRIPE_EVENT_REPLAY_WINDOW_SECONDS: asInteger(
+    'how long a handled Stripe event id is remembered so a redelivery is not applied twice',
+    { min: 3600, max: 604800 },
+  ),
+  STRIPE_CHECKOUT_SUCCESS_URL: asUrl('where Stripe returns a customer who completed checkout', {
+    protocols: ['https:', 'http:'],
+  }),
+  STRIPE_CHECKOUT_CANCEL_URL: asUrl('where Stripe returns a customer who abandoned checkout', {
+    protocols: ['https:', 'http:'],
+  }),
+  STRIPE_PORTAL_RETURN_URL: asUrl('where the Stripe billing portal returns a customer', {
+    protocols: ['https:', 'http:'],
+  }),
   CORS_ALLOWED_ORIGINS: asList(
     'browser origins permitted to call this API',
     asUrl('allowed origin', { protocols: ['https:', 'http:'] }),

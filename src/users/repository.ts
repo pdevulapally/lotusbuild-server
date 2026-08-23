@@ -126,6 +126,23 @@ export class UserRepository {
     return parseUser(snapshot.data() ?? {}, ref.path);
   }
 
+  /**
+   * The stored account. Absent is an error: every caller here is acting for an
+   * authenticated user, so a missing record means `ensure` never ran.
+   */
+  async read(uid: string): Promise<UserRecord> {
+    const ref = this.#ref(uid);
+    const snapshot = await ref.get();
+    if (!snapshot.exists) {
+      throw new AppError({
+        code: 'user/not-initialised',
+        statusCode: 409,
+        message: 'This account has not been initialised. Call /me once before creating resources.',
+      });
+    }
+    return parseUser(snapshot.data() ?? {}, ref.path);
+  }
+
   refFor(uid: string) {
     return this.#ref(uid);
   }

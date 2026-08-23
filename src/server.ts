@@ -6,10 +6,15 @@ import type { Auth } from 'firebase-admin/auth';
 import Fastify, { type FastifyInstance } from 'fastify';
 
 import { authenticatedUser, registerAuth } from './auth/plugin.ts';
+import type { BillingRepository } from './billing/repository.ts';
+import { registerBillingRoutes } from './billing/routes.ts';
 import type { Config } from './config/index.ts';
 import type { EntitlementService } from './entitlements/service.ts';
+import type { ConfigurationStore } from './entitlements/store.ts';
 import { registerProjectRoutes } from './projects/routes.ts';
 import type { ProjectRepository } from './projects/repository.ts';
+import type Stripe from 'stripe';
+
 import type { SessionEvents } from './sessions/events.ts';
 import type { SessionRepository } from './sessions/repository.ts';
 import { registerSessionRoutes } from './sessions/routes.ts';
@@ -31,6 +36,9 @@ export interface Dependencies {
   readonly projects: ProjectRepository;
   readonly sessions: SessionRepository;
   readonly sessionEvents: SessionEvents;
+  readonly configuration: ConfigurationStore;
+  readonly stripe: Stripe;
+  readonly billing: BillingRepository;
 }
 
 export function buildServer(config: Config, dependencies: Dependencies): FastifyInstance {
@@ -113,6 +121,18 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
   registerSessionRoutes(app, sessions, sessionEvents, {
     heartbeatSeconds: config.SSE_HEARTBEAT_SECONDS,
     maxConnections: config.SSE_MAX_CONNECTIONS,
+  });
+  registerBillingRoutes(app, {
+    stripe: dependencies.stripe,
+    billing: dependencies.billing,
+    users,
+    configuration: dependencies.configuration,
+    webhookSecret: config.STRIPE_WEBHOOK_SECRET,
+    urls: {
+      checkoutSuccess: config.STRIPE_CHECKOUT_SUCCESS_URL,
+      checkoutCancel: config.STRIPE_CHECKOUT_CANCEL_URL,
+      portalReturn: config.STRIPE_PORTAL_RETURN_URL,
+    },
   });
 
   return app;

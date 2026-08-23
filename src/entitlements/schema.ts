@@ -6,6 +6,7 @@ import {
   indexByKey,
   integerField,
   objectArrayField,
+  optionalStringField,
   stringField,
 } from '../support/documents.ts';
 import { type CapabilityDefinition, isMergeStrategy, mergeStrategies } from './merge.ts';
@@ -98,6 +99,12 @@ export interface Plan {
   readonly name: string;
   readonly status: (typeof planStatuses)[number];
   readonly rank: number;
+  /**
+   * The Stripe price that sells this plan. Absent for a plan nobody buys — the
+   * default one everybody already has, or one kept only to honour subscriptions
+   * that already exist.
+   */
+  readonly stripePriceId: string | undefined;
   readonly entitlements: ReadonlyMap<string, EntitlementValue>;
   readonly meterLimits: ReadonlyMap<string, MeterLimit>;
   readonly rateLimits: ReadonlyMap<RateLimitClass, RateLimit>;
@@ -329,6 +336,7 @@ export function parsePlan(fields: Fields, where: string, registry: Registry): Pl
     name: stringField(fields, 'name', where),
     status: enumField(fields, 'status', where, planStatuses),
     rank: integerField(fields, 'rank', where, { min: 0 }),
+    stripePriceId: optionalStringField(fields, 'stripePriceId'),
     entitlements,
     meterLimits,
     rateLimits,

@@ -1,3 +1,5 @@
+import { BillingRepository } from './billing/repository.ts';
+import { createStripe } from './billing/stripe.ts';
 import { EnvironmentError, loadConfig } from './config/index.ts';
 import { EntitlementService } from './entitlements/service.ts';
 import { ConfigurationStore } from './entitlements/store.ts';
@@ -42,10 +44,11 @@ async function main(): Promise<void> {
   // allowance into a refusal to start, rather than into the first user's 500.
   await configuration.get();
 
+  const subscriptionCache = new SubscriptionCache(redis, config.SUBSCRIPTION_CACHE_TTL_SECONDS);
   const entitlements = new EntitlementService(
     firebase.firestore,
     configuration,
-    new SubscriptionCache(redis, config.SUBSCRIPTION_CACHE_TTL_SECONDS),
+    subscriptionCache,
   );
   const users = new UserRepository(firebase.firestore);
   const projects = new ProjectRepository(firebase.firestore, users, entitlements);
@@ -66,6 +69,14 @@ async function main(): Promise<void> {
     entitlements,
     users,
     projects,
+    configuration,
+    stripe: createStripe(config.STRIPE_SECRET_KEY),
+    billing: new BillingRepository(
+      firebase.firestore,
+      redis,
+      subscriptionCache,
+      config.STRIPE_EVENT_REPLAY_WINDOW_SECONDS,
+    ),
     sessions: new SessionRepository(
       firebase.firestore,
       projects,

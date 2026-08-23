@@ -70,4 +70,6 @@ export const redisKeyPrefixes = {
   subscription: 'sub:',
   /** Doubles as the pub/sub channel name; channels are not part of the keyspace. */
   sessionEvents: 'ev:',
+  /** Stripe event ids already handled, so a redelivery is not applied twice. */
+  stripeEvent: 'evt:',
 } as const;

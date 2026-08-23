@@ -69,6 +69,23 @@ export function registerErrorHandler(app: FastifyInstance): void {
         .send(body('request/invalid', error.message, request.id));
     }
 
+    // Fastify's own errors — a body that is not JSON, an empty one where a body
+    // was required, a payload past the limit, a content type nothing parses —
+    // describe what the caller sent and already carry the right status. Letting
+    // them fall through to 500 blames us for their mistake, and hides a
+    // four-hundred-class problem behind a page that says nothing.
+    const status = (error as FastifyError).statusCode;
+    if (typeof status === 'number' && status >= 400 && status < 500) {
+      request.log.info({ code: error.code, statusCode: status }, 'request rejected');
+      return reply
+        .code(status)
+        .send(
+          body('request/invalid', error.message, request.id, {
+            reason: error.code ?? 'unspecified',
+          }),
+        );
+    }
+
     // Anything else is our bug. Log it in full, tell the client nothing.
     request.log.error({ err: error }, 'unhandled error');
     return reply
