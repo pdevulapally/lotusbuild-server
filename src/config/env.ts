@@ -125,6 +125,22 @@ export const asEnum = <const T extends readonly [string, ...string[]]>(
   },
 });
 
+/**
+ * Only "true" and "false". Not "1", not "yes", not the empty string: a setting
+ * that turns a safety check off must be unambiguous in the file an operator
+ * reads, and a typo must fail to start rather than quietly pick a side.
+ */
+export const asBoolean = (description: string): EnvVarSpec<boolean> => ({
+  description: `${description} (true or false)`,
+  parse: (raw) => {
+    const value = raw.trim().toLowerCase();
+    if (value !== 'true' && value !== 'false') {
+      throw new Error(`expected true or false, got "${raw.trim()}"`);
+    }
+    return value === 'true';
+  },
+});
+
 export const asUrl = (
   description: string,
   { protocols }: { protocols: readonly string[] },

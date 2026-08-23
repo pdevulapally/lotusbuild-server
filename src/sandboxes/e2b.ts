@@ -15,14 +15,31 @@ import type { CommandOutcome, RunningSandbox, SandboxAdapter } from './provider.
 export class E2BAdapter implements SandboxAdapter {
   readonly #apiKey: string;
   readonly #domain: string;
+  readonly #validateApiKey: boolean;
 
-  constructor(apiKey: string, domain: string) {
+  constructor(apiKey: string, domain: string, validateApiKey: boolean) {
     this.#apiKey = apiKey;
     this.#domain = domain;
+    this.#validateApiKey = validateApiKey;
   }
 
+  /**
+   * The domain is the whole difference between E2B's cloud and our own: the SDK
+   * derives its control plane from it as `https://api.${domain}`, and sandbox
+   * hostnames come back per sandbox from that API. Nothing else here knows or
+   * cares which one it is talking to.
+   *
+   * The key format check is separate because it happens *before* any request.
+   * E2B's cloud issues `e2b_<hex>`; a self-hosted deployment issues whatever it
+   * likes, and the check would reject a perfectly good key without ever leaving
+   * the process.
+   */
   #connection() {
-    return { apiKey: this.#apiKey, domain: this.#domain };
+    return {
+      apiKey: this.#apiKey,
+      domain: this.#domain,
+      validateApiKey: this.#validateApiKey,
+    };
   }
 
   async start(

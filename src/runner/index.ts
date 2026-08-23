@@ -73,7 +73,7 @@ async function main(): Promise<void> {
   // what this deployment is able to start. A platform pointing at something
   // absent fails loudly when a build asks for it, never silently elsewhere.
   const adapters = new Map<string, SandboxAdapter>([
-    ['e2b', new E2BAdapter(config.E2B_API_KEY, config.E2B_DOMAIN)],
+    ['e2b', new E2BAdapter(config.E2B_API_KEY, config.E2B_DOMAIN, config.E2B_VALIDATE_API_KEY)],
   ]);
 
   const snapshots = new SnapshotStore(

@@ -1,6 +1,7 @@
 import {
   EnvironmentError,
   type LoadedEnv,
+  asBoolean,
   asEnum,
   asInteger,
   asList,
@@ -119,7 +120,11 @@ const runnerSpec = {
   GIT_AUTHOR_NAME: asString('name on the commits the agent makes inside a project'),
   GIT_AUTHOR_EMAIL: asString('email on those commits'),
   E2B_API_KEY: asString('key sandboxes are created with'),
-  E2B_DOMAIN: asString('E2B domain to reach (e2b.app unless self-hosted)'),
+  E2B_DOMAIN: asString('E2B domain to reach (e2b.app for their cloud, ours when self-hosted)'),
+  E2B_VALIDATE_API_KEY: asBoolean(
+    'whether to require the e2b_<hex> key format before calling out; false for a self-hosted ' +
+      'deployment that issues keys of its own shape',
+  ),
   PREVIEW_READY_TIMEOUT_SECONDS: asInteger(
     'how long to wait for a dev server to answer on its port before calling the preview failed',
     { min: 5, max: 600 },
