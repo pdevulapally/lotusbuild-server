@@ -19,6 +19,8 @@ export interface CapabilityDefinition {
   readonly key: string;
   readonly valueKind: EntitlementValueKind;
   readonly mergeStrategy: MergeStrategy;
+  /** What this capability is called on the pricing page. Copy lives in config. */
+  readonly label: string;
 }
 
 /** One source's opinion about one capability. */

@@ -124,6 +124,7 @@ export function parseRegistry(fields: Fields, where: string): Registry {
         key: stringField(entry, 'key', at),
         valueKind: enumField(entry, 'valueKind', at, entitlementValueKinds),
         mergeStrategy,
+        label: stringField(entry, 'label', at),
       };
     }),
     (capability) => capability.key,

@@ -128,7 +128,11 @@ export async function runAgentTurn(input: {
       // literal: which model a plan may use is a commercial decision.
       model: input.session.model,
       max_tokens: input.limits.maxOutputTokens,
-
+      // An agent turn resends the whole conversation, so the prefix is paid for
+      // again on every step. Caching the last cacheable block means each step
+      // writes the prefix once and the next step reads it at a fraction of the
+      // rate — the same tokens, most of the cost removed.
+      cache_control: { type: 'ephemeral' },
       system,
       tools: [...toolSpecs],
       messages: conversation,
@@ -136,10 +140,23 @@ export async function runAgentTurn(input: {
     stream.on('text', input.events.text);
     const message = await stream.finalMessage();
 
+    // Cached reads and writes are input tokens this turn actually consumed, so
+    // they are metered like any other. Counting only `input_tokens` would let
+    // caching silently uncap every plan, because the cached majority of the
+    // prefix arrives under the two fields below and would never be charged.
+    // What the three cost differs; that is margin, not the caller's allowance.
+    const inputTokens = [
+      message.usage.input_tokens,
+      message.usage.cache_read_input_tokens,
+      message.usage.cache_creation_input_tokens,
+    ]
+      .filter((count): count is number => typeof count === 'number')
+      .reduce((total, count) => total + count, 0);
+
     // Charged before anything else happens with the response: a turn that
     // crashes mid-step still used the tokens it used.
     for (const [meterKey, quantity] of [
-      [input.registry.inputTokenMeterKey, message.usage.input_tokens],
+      [input.registry.inputTokenMeterKey, inputTokens],
       [input.registry.outputTokenMeterKey, message.usage.output_tokens],
     ] as const) {
       if (quantity > 0) {

@@ -77,7 +77,11 @@ export const planDocuments = [
     rank: 0,
     entitlements: [
       { capabilityKey: "ai.run", value: {"kind": "boolean", "value": true} },
-      { capabilityKey: "ai.model.allowlist", value: {"kind": "stringList", "value": ["claude-3-5-haiku-20241022", "claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219", "claude-opus-5"]} },
+      // Haiku only. The free tier is the one place usage is unbounded by
+      // revenue, and an Opus turn costs five times the input and five times the
+      // output of a Haiku one — a maxed-out free account on Opus is $2.25 that
+      // nobody pays. Model access is the upgrade lever, not a giveaway.
+      { capabilityKey: "ai.model.allowlist", value: {"kind": "stringList", "value": ["claude-haiku-4-5"]} },
       { capabilityKey: "ai.effort", value: {"kind": "string", "value": "low"} },
       { capabilityKey: "platform.web", value: {"kind": "boolean", "value": true} },
       { capabilityKey: "platform.mobile", value: {"kind": "boolean", "value": false} },
@@ -108,7 +112,7 @@ export const planDocuments = [
     rank: 1,
     entitlements: [
       { capabilityKey: "ai.run", value: {"kind": "boolean", "value": true} },
-      { capabilityKey: "ai.model.allowlist", value: {"kind": "stringList", "value": ["claude-3-5-haiku-20241022", "claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219", "claude-opus-5"]} },
+      { capabilityKey: "ai.model.allowlist", value: {"kind": "stringList", "value": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]} },
       { capabilityKey: "ai.effort", value: {"kind": "string", "value": "high"} },
       { capabilityKey: "platform.web", value: {"kind": "boolean", "value": true} },
       { capabilityKey: "platform.mobile", value: {"kind": "boolean", "value": true} },
@@ -145,7 +149,7 @@ export const planDocuments = [
       { capabilityKey: "git.persistence", value: {"kind": "boolean", "value": true} },
       { capabilityKey: "preview.live", value: {"kind": "boolean", "value": true} },
       { capabilityKey: "ai.run", value: {"kind": "boolean", "value": true} },
-      { capabilityKey: "ai.model.allowlist", value: {"kind": "stringList", "value": ["claude-3-5-haiku-20241022", "claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219", "claude-opus-5"]} },
+      { capabilityKey: "ai.model.allowlist", value: {"kind": "stringList", "value": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]} },
     ],
     meterLimits: [
       { meterKey: "ai.tokens.input", includedAllowance: 3000000, hardLimit: 6000000, overageEnabled: true },

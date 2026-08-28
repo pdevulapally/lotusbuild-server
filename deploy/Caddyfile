@@ -9,5 +9,12 @@ api.lotusbuild.co.uk {
 
 	# `encode` only touches responses, so the Stripe webhook still verifies:
 	# its signature is over the raw request body, which is proxied untouched.
-	reverse_proxy 127.0.0.1:4100
+	reverse_proxy 127.0.0.1:4100 {
+		# Replace rather than append. Caddy's default appends the real peer to
+		# whatever X-Forwarded-For the client sent, and Fastify runs with
+		# trustProxy, so it reads the leftmost entry — which the client controls.
+		# The IP-keyed rate limits on /plans and the Stripe webhook are only
+		# real if this header is ours.
+		header_up X-Forwarded-For {remote_host}
+	}
 }

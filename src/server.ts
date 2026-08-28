@@ -161,6 +161,9 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     users,
     configuration: dependencies.configuration,
     webhookSecret: config.STRIPE_WEBHOOK_SECRET,
+    // The same staleness budget the configuration itself runs on: a price
+    // change and a plan change should reach the pricing page together.
+    catalogueTtlMs: config.CONFIG_CACHE_TTL_SECONDS * 1000,
     urls: {
       checkoutSuccess: config.STRIPE_CHECKOUT_SUCCESS_URL,
       checkoutCancel: config.STRIPE_CHECKOUT_CANCEL_URL,

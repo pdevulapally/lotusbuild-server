@@ -2,8 +2,10 @@ import type { FastifyInstance } from 'fastify';
 import type Stripe from 'stripe';
 
 import { authenticatedUser } from '../auth/plugin.ts';
+import type { Plan } from '../entitlements/schema.ts';
 import type { ConfigurationStore } from '../entitlements/store.ts';
 import { AppError } from '../http/errors.ts';
+import { cached } from '../support/cache.ts';
 import type { UserRepository } from '../users/repository.ts';
 import type { BillingRepository } from './repository.ts';
 import { planPrices, readSubscription, throughStripe } from './stripe.ts';
@@ -39,6 +41,8 @@ export function registerBillingRoutes(
     readonly configuration: ConfigurationStore;
     readonly webhookSecret: string;
     readonly urls: BillingUrls;
+    /** How long the public plan catalogue is held before Stripe is asked again. */
+    readonly catalogueTtlMs: number;
   },
 ): void {
   const { stripe, billing, users, configuration, urls } = deps;
@@ -69,6 +73,102 @@ export function registerBillingRoutes(
     await billing.linkCustomer(uid, customer.id);
     return customer.id;
   };
+
+  /**
+   * The plan catalogue, as the pricing page needs it.
+   *
+   * Unauthenticated, because the pricing page renders before anyone signs in.
+   * The alternative is the marketing copy keeping its own copy of the numbers,
+   * which drifts from what the plans actually grant and from what Stripe
+   * actually charges — and a page promising more than the entitlements allow is
+   * a refund, not a typo.
+   *
+   * Rows are derived from the registry's own capability and meter definitions,
+   * so a capability added to configuration is advertised without a deploy and
+   * one removed stops being advertised. Every field is named rather than spread:
+   * a plan document also carries its Stripe price id, its rate-limit budgets and
+   * its sandbox instructions, none of which are the public's business.
+   *
+   * Held for a TTL because it costs a Stripe call per priced plan to build, and
+   * `cached` collapses concurrent misses into one load, so a burst of traffic on
+   * the pricing page cannot turn into a burst of traffic at Stripe.
+   */
+  const catalogue = cached(deps.catalogueTtlMs, async () => {
+    const { registry, plans } = await configuration.get();
+
+    const priceFor = async (plan: Plan) => {
+      const priceId = plan.stripePriceId;
+      if (priceId === undefined) {
+        return null;
+      }
+      const price = await throughStripe(
+        'read a price',
+        () => stripe.prices.retrieve(priceId),
+        (error) => app.log.error({ err: error, plan: plan.key }, 'stripe rejected a price lookup'),
+      );
+      const { unit_amount: amountMinor, recurring } = price;
+      if (amountMinor === null || recurring === null) {
+        // A one-off or metered price cannot be rendered as "£X a month", and
+        // guessing a number onto a pricing page is how customers get billed
+        // something they were never shown.
+        throw new AppError({
+          code: 'config/plan-price-unusable',
+          statusCode: 500,
+          message: `Stripe price ${priceId} for plan "${plan.key}" carries no recurring amount.`,
+        });
+      }
+      return { amountMinor, currency: price.currency, interval: recurring.interval };
+    };
+
+    return Promise.all(
+      [...plans.values()]
+        .filter((plan) => plan.status === 'ACTIVE')
+        .sort((left, right) => left.rank - right.rank)
+        .map(async (plan) => ({
+          key: plan.key,
+          name: plan.name,
+          rank: plan.rank,
+          price: await priceFor(plan),
+          capabilities: [...plan.entitlements].flatMap(([key, entitlement]) => {
+            const definition = registry.capabilities.get(key);
+            if (definition === undefined) {
+              return [];
+            }
+            return [
+              { key, label: definition.label, kind: entitlement.kind, value: entitlement.value },
+            ];
+          }),
+          allowances: [...plan.meterLimits].flatMap(([key, limit]) => {
+            const meter = registry.meters.get(key);
+            if (meter === undefined) {
+              return [];
+            }
+            return [
+              {
+                key,
+                label: meter.label,
+                unit: meter.unit,
+                included: limit.includedAllowance,
+                limit: limit.hardLimit,
+              },
+            ];
+          }),
+        })),
+    );
+  });
+
+  app.get(
+    '/plans',
+    {
+      config: {
+        // Keyed by address, like the webhook: there is no account to key on
+        // before sign-in. Serving from the TTL cache, so this bounds CPU rather
+        // than spend.
+        rateLimit: { max: 120, timeWindow: '1 minute' },
+      },
+    },
+    async () => ({ plans: await catalogue.get() }),
+  );
 
   app.post<{ Body: { planKey: string } }>(
     '/billing/checkout',
