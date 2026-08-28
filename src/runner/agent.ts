@@ -26,8 +26,9 @@ export interface AgentEvents {
   toolCall(name: string, input: Record<string, unknown>): Promise<void>;
   toolResult(name: string, result: { text: string; isError: boolean }): Promise<void>;
   preview(preview: { url: string; port: number }): Promise<void>;
-  step(step: { number: number; of: number }): Promise<void>;
+  step(step: { number: number; of: number; steered?: boolean }): Promise<void>;
 }
+
 
 export interface AgentRun {
   /** Everything the model said, for the transcript. */
@@ -91,6 +92,12 @@ export async function runAgentTurn(input: {
   readonly events: AgentEvents;
   /** Throws if the lease is gone, so a stolen session stops between steps. */
   readonly assertStillOurs: () => void;
+  /**
+   * Returns the next pending steer prompt (if any) and clears it atomically.
+   * Called between steps so mid-turn user corrections are injected without
+   * interrupting an in-flight API request.
+   */
+  readonly drainSteer: () => string | undefined;
 }): Promise<AgentRun> {
   const conversation = conversationFrom(input.messages);
   const system = systemPrompt(input.project, input.provider);
@@ -106,13 +113,22 @@ export async function runAgentTurn(input: {
 
   for (let step = 1; step <= input.limits.maxSteps; step += 1) {
     input.assertStillOurs();
-    await input.events.step({ number: step, of: input.limits.maxSteps });
+
+    // Inject pending steer prompt into the conversation before the next model call.
+    const steerPrompt = input.drainSteer();
+    if (steerPrompt !== undefined) {
+      conversation.push({ role: 'user', content: steerPrompt });
+      await input.events.step({ number: step, of: input.limits.maxSteps, steered: true });
+    } else {
+      await input.events.step({ number: step, of: input.limits.maxSteps });
+    }
 
     const stream = input.anthropic.messages.stream({
       // From the session, which took it from the plan's allowlist. Never a
       // literal: which model a plan may use is a commercial decision.
       model: input.session.model,
       max_tokens: input.limits.maxOutputTokens,
+
       system,
       tools: [...toolSpecs],
       messages: conversation,

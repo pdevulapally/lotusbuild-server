@@ -73,7 +73,36 @@ export class SessionRunner {
       });
     }, this.#deps.heartbeatSeconds * 1000);
 
+    let unsubscribeCancel: (() => void) | undefined;
+    // The latest steer prompt queued by the user. Replaced atomically so
+    // the agent always sees the most recent instruction mid-turn.
+    let pendingSteer: string | undefined;
+
+    try {
+      unsubscribeCancel = await events.subscribe(session.id, (event) => {
+        if (event.type === 'session.cancel_requested') {
+          leaseLost = new AppError({
+            code: 'session/cancelled',
+            statusCode: 409,
+            message: 'Cancelled by user',
+            details: { sessionId: session.id },
+          });
+          log.info({ sessionId: session.id }, 'received cancellation request for session');
+        } else if (event.type === 'session.steer') {
+          const prompt = (event.data as Record<string, unknown>)['prompt'];
+          if (typeof prompt === 'string' && prompt.length > 0) {
+            pendingSteer = prompt;
+            log.info({ sessionId: session.id }, 'received steer prompt for session');
+          }
+        }
+      });
+    } catch (err) {
+      log.warn({ sessionId: session.id, err }, 'could not subscribe to session events');
+    }
+
     const publish = async (type: string, data: Record<string, unknown>): Promise<void> => {
+
+
       try {
         await events.append(session.id, type, data);
       } catch (error) {
@@ -168,6 +197,11 @@ export class SessionRunner {
             throw leaseLost;
           }
         },
+        drainSteer: () => {
+          const prompt = pendingSteer;
+          pendingSteer = undefined;
+          return prompt;
+        },
         events: {
           // Text arrives as it is generated. Not awaited: the model does not
           // wait for Redis, and back-pressure here would stall generation.
@@ -192,6 +226,68 @@ export class SessionRunner {
         await sessions.appendAssistantMessage(session.id, runnerId, run.reply);
       }
       await publish('agent.finished', { steps: run.steps, stopReason: run.stopReason });
+
+      // Hot turn chaining: check the queue before releasing the sandbox.
+      // If the user enqueued a follow-up while this turn was running, dequeue
+      // it and run the next turn in the same live sandbox without cold-booting.
+      let nextQueued = await sessions.dequeueNextMessage(session.id, runnerId);
+      while (nextQueued !== undefined) {
+        await publish('session.queued', { queuedMessageId: nextQueued.id });
+        log.info(
+          { sessionId: session.id, queuedMessageId: nextQueued.id },
+          'hot-chaining queued message in existing sandbox',
+        );
+
+        const chainMessages = await sessions.listMessages(
+          session.ownerUid,
+          session.id,
+          this.#deps.messageHistoryLimit,
+        );
+
+        const chainRun = await runAgentTurn({
+          anthropic: this.#deps.anthropic,
+          session,
+          project,
+          provider: acquired.provider,
+          sandbox: acquired.running,
+          messages: chainMessages,
+          entitlements,
+          registry,
+          metering: this.#deps.metering,
+          limits: this.#deps.limits,
+          assertStillOurs: () => {
+            if (leaseLost !== undefined) {
+              throw leaseLost;
+            }
+          },
+          drainSteer: () => {
+            const prompt = pendingSteer;
+            pendingSteer = undefined;
+            return prompt;
+          },
+          events: {
+            text: (delta) => {
+              void publish('agent.text', { delta });
+            },
+            step: (step) => publish('agent.step', step),
+            toolCall: (name, toolInput) => publish('agent.tool_call', { name, input: toolInput }),
+            toolResult: (name, result) =>
+              publish('agent.tool_result', {
+                name,
+                isError: result.isError,
+                text: result.text.slice(0, this.#deps.limits.toolOutputMaxChars),
+              }),
+            preview: (preview) => publish('preview.ready', preview),
+          },
+        });
+
+        if (chainRun.reply !== '') {
+          await sessions.appendAssistantMessage(session.id, runnerId, chainRun.reply);
+        }
+        await publish('agent.finished', { steps: chainRun.steps, stopReason: chainRun.stopReason });
+
+        nextQueued = await sessions.dequeueNextMessage(session.id, runnerId);
+      }
 
       await this.#save(session, project, entitlements, acquired, persists, publish);
       await this.#letGo(session, acquired);
@@ -222,11 +318,13 @@ export class SessionRunner {
       }
     } finally {
       clearInterval(heartbeat);
+      unsubscribeCancel?.();
     }
   }
 
   /**
    * Commits and stores the project, if the plan includes it.
+
    *
    * A failure here is reported and swallowed rather than thrown. It is reached
    * from the error path as well as the good one, and letting it throw there

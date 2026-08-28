@@ -11,6 +11,7 @@ import { registerBillingRoutes } from './billing/routes.ts';
 import type { Config } from './config/index.ts';
 import type { EntitlementService } from './entitlements/service.ts';
 import type { ConfigurationStore } from './entitlements/store.ts';
+import type { MeteringService } from './metering/service.ts';
 import { registerProjectRoutes } from './projects/routes.ts';
 import type { ProjectRepository } from './projects/repository.ts';
 import type Stripe from 'stripe';
@@ -32,6 +33,7 @@ export interface Dependencies {
   readonly firebaseAuth: Auth;
   readonly redis: Redis;
   readonly entitlements: EntitlementService;
+  readonly metering: MeteringService;
   readonly users: UserRepository;
   readonly projects: ProjectRepository;
   readonly sessions: SessionRepository;
@@ -42,7 +44,7 @@ export interface Dependencies {
 }
 
 export function buildServer(config: Config, dependencies: Dependencies): FastifyInstance {
-  const { firebaseAuth, redis, entitlements, users, projects, sessions, sessionEvents } =
+  const { firebaseAuth, redis, entitlements, metering, users, projects, sessions, sessionEvents } =
     dependencies;
   const app = Fastify({
     logger: { level: config.LOG_LEVEL },
@@ -116,6 +118,37 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
       })),
     };
   });
+
+  app.get(
+    '/me/usage',
+    { preHandler: [app.requireAuth, app.enforceRateLimit('read')] },
+    async (request) => {
+      const user = authenticatedUser(request);
+      const stored = await users.ensure(user);
+      const resolved = await entitlements.forUser(user.uid);
+      const usage = await metering.readUsageBreakdown(user.uid, resolved);
+
+      return {
+        uid: stored.uid,
+        plan: { key: resolved.planKey, name: resolved.planName },
+        meters: usage.map((entry) => ({
+          meterKey: entry.meterKey,
+          unit: entry.unit,
+          label: entry.label,
+          kind: entry.kind,
+          resetPeriod: entry.resetPeriod,
+          consumed: entry.consumed,
+          reserved: entry.reserved,
+          totalUsed: entry.consumed + entry.reserved,
+          includedAllowance: entry.includedAllowance,
+          hardLimit: entry.hardLimit,
+          overageEnabled: entry.overageEnabled,
+          periodStart: entry.periodStart.toISOString(),
+        })),
+      };
+    },
+  );
+
 
   registerProjectRoutes(app, projects);
   registerSessionRoutes(app, sessions, sessionEvents, {

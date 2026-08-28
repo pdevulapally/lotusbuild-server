@@ -39,6 +39,21 @@ export interface Reservation {
   readonly operationId: string;
 }
 
+export interface MeterUsageSummary {
+  readonly meterKey: string;
+  readonly unit: string;
+  readonly label: string;
+  readonly kind: MeterDefinition['kind'];
+  readonly resetPeriod: MeterDefinition['resetPeriod'];
+  readonly consumed: number;
+  readonly reserved: number;
+  readonly includedAllowance: number;
+  readonly hardLimit: number;
+  readonly overageEnabled: boolean;
+  readonly periodStart: Date;
+}
+
+
 /**
  * Passing a limit is not one failure. A counter is a quota already spent, and
  * the remedy is a bigger plan. A gauge is a ceiling being stood on right now,
@@ -228,6 +243,87 @@ export class MeteringService {
 
     return { meterKey: meter.key, consumed: after, periodStart };
   }
+
+  /**
+   * Decrements a counter meter inside the caller's transaction, e.g. when an unstarted
+   * operation is cancelled before claiming any runner time.
+   */
+  async refundIn(
+    transaction: Transaction,
+    input: {
+      readonly uid: string;
+      readonly entitlements: UserEntitlements;
+      readonly meterKey: string;
+      readonly quantity: number;
+      readonly now: Date;
+    },
+  ): Promise<Consumption> {
+    this.#assertPositive(input.quantity, input.meterKey);
+    const { meter } = await this.#resolve(input.entitlements, input.meterKey);
+    if (meter.kind !== 'COUNTER') {
+      throw new EntitlementConfigError(
+        `Meter "${meter.key}" is a ${meter.kind}, which is released rather than refunded.`,
+      );
+    }
+
+    const ref = this.#usageRef(input.uid, input.meterKey);
+    const snapshot = await transaction.get(ref);
+    const periodStart = periodStartFor(meter, input.now);
+    const state = this.#state(snapshot, periodStart, ref.path);
+
+    const after = Math.max(0, state.consumed - input.quantity);
+
+    transaction.set(ref, {
+      meterKey: meter.key,
+      consumed: after,
+      reserved: state.reserved,
+      periodStart: Timestamp.fromDate(periodStart),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    return { meterKey: meter.key, consumed: after, periodStart };
+  }
+
+  /**
+   * Reads the current usage summary across all declared meters for a user.
+   */
+  async readUsageBreakdown(
+    uid: string,
+    entitlements: UserEntitlements,
+    now: Date = new Date(),
+  ): Promise<readonly MeterUsageSummary[]> {
+    const { registry } = await this.#configuration.get();
+    const summaries: MeterUsageSummary[] = [];
+
+    for (const [meterKey, meter] of registry.meters) {
+      const limit = entitlements.meterLimits.get(meterKey);
+      if (limit === undefined) {
+        continue;
+      }
+
+      const ref = this.#usageRef(uid, meterKey);
+      const snapshot = await ref.get();
+      const periodStart = periodStartFor(meter, now);
+      const state = this.#state(snapshot, periodStart, ref.path);
+
+      summaries.push({
+        meterKey: meter.key,
+        unit: meter.unit,
+        label: meter.label,
+        kind: meter.kind,
+        resetPeriod: meter.resetPeriod,
+        consumed: state.consumed,
+        reserved: state.reserved,
+        includedAllowance: limit.includedAllowance,
+        hardLimit: limit.hardLimit,
+        overageEnabled: limit.overageEnabled,
+        periodStart,
+      });
+    }
+
+    return summaries;
+  }
+
 
   /**
    * Moves a gauge to a new reading, inside the caller's transaction.

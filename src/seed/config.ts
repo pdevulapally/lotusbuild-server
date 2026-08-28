@@ -44,15 +44,15 @@ export const registryDocument = {
   sandboxProviders: [
     {
       platform: "mobile",
-      provider: "vps",
-      template: "lotusbuild-expo:2",
+      provider: "e2b",
+      template: "base",
       timeoutSeconds: 1800,
-      memoryMb: 1536,
-      cpus: 1,
+      memoryMb: 2048,
+      cpus: 2,
       concurrencyMeterKey: "sandbox.concurrent.mobile",
-      workdir: "/workspace",
+      workdir: "/home/user/project",
       idleGraceSeconds: 300,
-      agentInstructions: "This is an Expo (React Native) project. A blank Expo app with web support is already installed at the project root \u2014 edit it rather than scaffolding a new one, and do not run create-expo-app.\n\nWrite screens in App.js (or App.tsx) and files it imports. Use React Native components \u2014 View, Text, Pressable, FlatList, StyleSheet \u2014 never HTML elements like div or span, which do not exist here.\n\nTo show the user their app, run start_preview with:\n  command: npx expo start --web --port 8081 --host lan\n  port: 8081\n\nThat serves the app through react-native-web, which is what the user sees in the preview. The same server also hosts the Expo Go manifest, so one command covers both the browser preview and the QR code for a real phone \u2014 do not start a second server for it.\n\nOnly add a dependency if the app genuinely needs it: installing packages on this sandbox is slow, and every one is time the user spends watching a spinner.",
+      agentInstructions: "This is an Expo (React Native) project. A blank Expo app with web support is already installed at the project root \u2014 edit it rather than scaffolding a new one, and do not run create-expo-app.\n\nWrite screens in App.js (or App.tsx) and files it imports. Use React Native components \u2014 View, Text, Pressable, FlatList, StyleSheet \u2014 never HTML elements like div or span, which do not exist here.\n\nTo show the user their app, run start_preview with:\n  command: npx expo start --web --port 8081 --host 0.0.0.0\n  port: 8081\n\nThat serves the app through react-native-web, which is what the user sees in the preview. The same server also hosts the Expo Go manifest, so one command covers both the browser preview and the QR code for a real phone \u2014 do not start a second server for it.\n\nOnly add a dependency if the app genuinely needs it: installing packages on this sandbox is slow, and every one is time the user spends watching a spinner.",
     },
     {
       platform: "web",
@@ -77,7 +77,7 @@ export const planDocuments = [
     rank: 0,
     entitlements: [
       { capabilityKey: "ai.run", value: {"kind": "boolean", "value": true} },
-      { capabilityKey: "ai.model.allowlist", value: {"kind": "stringList", "value": ["claude-opus-5"]} },
+      { capabilityKey: "ai.model.allowlist", value: {"kind": "stringList", "value": ["claude-3-5-haiku-20241022", "claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219", "claude-opus-5"]} },
       { capabilityKey: "ai.effort", value: {"kind": "string", "value": "low"} },
       { capabilityKey: "platform.web", value: {"kind": "boolean", "value": true} },
       { capabilityKey: "platform.mobile", value: {"kind": "boolean", "value": false} },
@@ -108,7 +108,7 @@ export const planDocuments = [
     rank: 1,
     entitlements: [
       { capabilityKey: "ai.run", value: {"kind": "boolean", "value": true} },
-      { capabilityKey: "ai.model.allowlist", value: {"kind": "stringList", "value": ["claude-opus-5"]} },
+      { capabilityKey: "ai.model.allowlist", value: {"kind": "stringList", "value": ["claude-3-5-haiku-20241022", "claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219", "claude-opus-5"]} },
       { capabilityKey: "ai.effort", value: {"kind": "string", "value": "high"} },
       { capabilityKey: "platform.web", value: {"kind": "boolean", "value": true} },
       { capabilityKey: "platform.mobile", value: {"kind": "boolean", "value": true} },
@@ -145,7 +145,7 @@ export const planDocuments = [
       { capabilityKey: "git.persistence", value: {"kind": "boolean", "value": true} },
       { capabilityKey: "preview.live", value: {"kind": "boolean", "value": true} },
       { capabilityKey: "ai.run", value: {"kind": "boolean", "value": true} },
-      { capabilityKey: "ai.model.allowlist", value: {"kind": "stringList", "value": ["claude-opus-5"]} },
+      { capabilityKey: "ai.model.allowlist", value: {"kind": "stringList", "value": ["claude-3-5-haiku-20241022", "claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219", "claude-opus-5"]} },
     ],
     meterLimits: [
       { meterKey: "ai.tokens.input", includedAllowance: 3000000, hardLimit: 6000000, overageEnabled: true },
@@ -164,3 +164,4 @@ export const planDocuments = [
     ],
   },
 ] as const;
+

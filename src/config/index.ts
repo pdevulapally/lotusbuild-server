@@ -52,7 +52,13 @@ const sharedSpec = {
     'ceiling on events held per session, bounding what one runaway build can occupy in Redis',
     { min: 100, max: 100000 },
   ),
+  FIREBASE_STORAGE_BUCKET: asString('bucket holding the saved git repository for every project'),
+  SNAPSHOT_URL_TTL_SECONDS: asInteger(
+    'how long a signed upload or download URL for a project snapshot stays valid',
+    { min: 60, max: 3600 },
+  ),
 } as const;
+
 
 const apiSpec = {
   HOST: asString('interface to bind (127.0.0.1 behind a reverse proxy, 0.0.0.0 otherwise)'),
@@ -111,11 +117,6 @@ const runnerSpec = {
   AGENT_TOOL_OUTPUT_MAX_CHARS: asInteger(
     'how much of a tool result is fed back to the model before it is truncated',
     { min: 500, max: 200000 },
-  ),
-  FIREBASE_STORAGE_BUCKET: asString('bucket holding the saved git repository for every project'),
-  SNAPSHOT_URL_TTL_SECONDS: asInteger(
-    'how long a signed upload or download URL for a project snapshot stays valid',
-    { min: 60, max: 3600 },
   ),
   GIT_AUTHOR_NAME: asString('name on the commits the agent makes inside a project'),
   GIT_AUTHOR_EMAIL: asString('email on those commits'),

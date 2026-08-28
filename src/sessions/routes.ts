@@ -12,10 +12,12 @@ import {
 } from './events.ts';
 import {
   type BuildSession,
+  type QueuedMessage,
   type SessionMessage,
   type SessionRepository,
   promptMaxLength,
 } from './repository.ts';
+
 
 /** Same constraints as the project routes: ids reach a document path. */
 const documentId = '^[A-Za-z0-9_-]{1,128}$';
@@ -69,7 +71,17 @@ function toMessageResponse(message: SessionMessage) {
   };
 }
 
+function toQueuedMessageResponse(msg: QueuedMessage) {
+  return {
+    id: msg.id,
+    sessionId: msg.sessionId,
+    prompt: msg.prompt,
+    createdAt: msg.createdAt.toISOString(),
+  };
+}
+
 /** One SSE frame. `data` is JSON, so it can never contain the blank line terminator. */
+
 function frame(event: SessionEvent): string {
   return `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`;
 }
@@ -216,7 +228,7 @@ export function registerSessionRoutes(
     },
   );
 
-  app.post<{ Params: { sessionId: string }; Body: { prompt: string } }>(
+  app.post<{ Params: { sessionId: string }; Body: { prompt: string; steer?: boolean } }>(
     '/sessions/:sessionId/messages',
     {
       preHandler: [app.requireAuth, app.enforceRateLimit('build')],
@@ -238,26 +250,144 @@ export function registerSessionRoutes(
               maxLength: promptMaxLength,
               pattern: promptText,
             },
+            steer: {
+              type: 'boolean',
+            },
           },
         },
       },
     },
     async (request, reply) => {
       const user = authenticatedUser(request);
-      const session = await sessions.appendPrompt(
-        user.uid,
-        request.params.sessionId,
-        request.body.prompt.trim(),
-      );
+      const prompt = request.body.prompt.trim();
+      const current = await sessions.readOwned(user.uid, request.params.sessionId);
+
+      if (request.body.steer === true) {
+        if (current.status === 'RUNNING') {
+          publish(request.log, current.id, 'session.steer', { prompt });
+          return reply.code(200).send({ steered: true, sessionId: current.id });
+        }
+        if (current.status === 'QUEUED') {
+          const queued = await sessions.enqueueMessage(user.uid, current.id, prompt);
+          publish(request.log, current.id, 'session.message_queued', {
+            queuedMessageId: queued.id,
+            prompt: queued.prompt,
+          });
+          return reply.code(202).send({
+            queued: true,
+            queuedMessage: toQueuedMessageResponse(queued),
+          });
+        }
+      }
+
+      if (current.status === 'QUEUED' || current.status === 'RUNNING') {
+        const queued = await sessions.enqueueMessage(user.uid, current.id, prompt);
+        publish(request.log, current.id, 'session.message_queued', {
+          queuedMessageId: queued.id,
+          prompt: queued.prompt,
+        });
+        return reply.code(202).send({
+          queued: true,
+          queuedMessage: toQueuedMessageResponse(queued),
+        });
+      }
+
+      const session = await sessions.appendPrompt(user.uid, current.id, prompt);
       publish(request.log, session.id, 'session.queued', {
         status: session.status,
         messageCount: session.messageCount,
       });
-      return reply.code(202).send(toResponse(session));
+      return reply.code(202).send({
+        queued: false,
+        session: toResponse(session),
+      });
+    },
+  );
+
+  app.get<{ Params: { sessionId: string } }>(
+    '/sessions/:sessionId/queued-messages',
+    {
+      preHandler: [app.requireAuth, app.enforceRateLimit('read')],
+      schema: {
+        params: {
+          type: 'object',
+          required: ['sessionId'],
+          additionalProperties: false,
+          properties: { sessionId: { type: 'string', pattern: documentId } },
+        },
+      },
+    },
+    async (request) => {
+      const user = authenticatedUser(request);
+      const queuedMessages = await sessions.listQueuedMessages(user.uid, request.params.sessionId);
+      return {
+        queuedMessages: queuedMessages.map(toQueuedMessageResponse),
+      };
+    },
+  );
+
+  app.delete<{ Params: { sessionId: string; messageId: string } }>(
+    '/sessions/:sessionId/queued-messages/:messageId',
+    {
+      preHandler: [app.requireAuth, app.enforceRateLimit('write')],
+      schema: {
+        params: {
+          type: 'object',
+          required: ['sessionId', 'messageId'],
+          additionalProperties: false,
+          properties: {
+            sessionId: { type: 'string', pattern: documentId },
+            messageId: { type: 'string', pattern: documentId },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const user = authenticatedUser(request);
+      await sessions.deleteQueuedMessage(
+        user.uid,
+        request.params.sessionId,
+        request.params.messageId,
+      );
+      publish(request.log, request.params.sessionId, 'session.message_dequeued', {
+        queuedMessageId: request.params.messageId,
+      });
+      return reply.code(204).send();
+    },
+  );
+
+  app.post<{ Params: { sessionId: string } }>(
+    '/sessions/:sessionId/cancel',
+
+    {
+      preHandler: [app.requireAuth, app.enforceRateLimit('write')],
+      schema: {
+        params: {
+          type: 'object',
+          required: ['sessionId'],
+          additionalProperties: false,
+          properties: { sessionId: { type: 'string', pattern: documentId } },
+        },
+      },
+    },
+    async (request, reply) => {
+      const user = authenticatedUser(request);
+      const session = await sessions.cancel(user.uid, request.params.sessionId);
+      if (session.status === 'FAILED') {
+        publish(request.log, session.id, 'session.failed', {
+          error: session.error ?? 'Cancelled by user',
+        });
+      } else if (session.cancelRequested === true) {
+        publish(request.log, session.id, 'session.cancel_requested', {
+          sessionId: session.id,
+        });
+      }
+      return reply.code(200).send(toResponse(session));
     },
   );
 
   let openStreams = 0;
+
 
   /**
    * The live event stream.

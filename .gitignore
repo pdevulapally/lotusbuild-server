@@ -8,3 +8,5 @@ dist/
 *firebase-adminsdk*.json
 *service-account*.json
 secrets/
+.env.example
+.md*

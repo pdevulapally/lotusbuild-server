@@ -25,6 +25,7 @@ import {
 
 export const sessionsCollectionPath = 'sessions';
 export const messagesCollectionName = 'messages';
+export const queuedMessagesCollectionName = 'queued_messages';
 
 /**
  * Recovered from the previous schema. IDLE is not "finished": a session that has
@@ -54,6 +55,7 @@ export interface BuildSession {
   readonly claimedBy: string | undefined;
   readonly heartbeatAt: Date | undefined;
   readonly error: string | undefined;
+  readonly cancelRequested?: boolean | undefined;
   /**
    * Meter holds the claiming runner took out. Recorded on the session so that
    * whoever inherits an expired lease can give them back: a hold nobody returns
@@ -68,6 +70,13 @@ export interface SessionMessage {
   readonly seq: number;
   readonly role: MessageRole;
   readonly content: string;
+  readonly createdAt: Date;
+}
+
+export interface QueuedMessage {
+  readonly id: string;
+  readonly sessionId: string;
+  readonly prompt: string;
   readonly createdAt: Date;
 }
 
@@ -98,6 +107,7 @@ function parseSession(id: string, fields: Fields, where: string): BuildSession {
     claimedBy: optionalStringField(fields, 'claimedBy'),
     heartbeatAt: optionalTimestampField(fields, 'heartbeatAt', where),
     error: optionalStringField(fields, 'error'),
+    cancelRequested: fields['cancelRequested'] === true ? true : undefined,
     reservationIds: stringArrayField(fields, 'reservationIds', where),
     messageCount: integerField(fields, 'messageCount', where, { min: 1 }),
     createdAt: timestampField(fields, 'createdAt', where),
@@ -112,6 +122,16 @@ function parseMessage(id: string, fields: Fields, where: string): SessionMessage
     createdAt: timestampField(fields, 'createdAt', where),
   };
 }
+
+function parseQueuedMessage(id: string, sessionId: string, fields: Fields, where: string): QueuedMessage {
+  return {
+    id,
+    sessionId,
+    prompt: stringField(fields, 'prompt', where),
+    createdAt: timestampField(fields, 'createdAt', where),
+  };
+}
+
 
 export interface NewSession {
   readonly prompt: string;
@@ -375,7 +395,214 @@ export class SessionRepository {
   }
 
   /**
+   * Staging a prompt in the session queue while a turn is active.
+   */
+  async enqueueMessage(uid: string, sessionId: string, prompt: string): Promise<QueuedMessage> {
+    const session = await this.readOwned(uid, sessionId);
+    const ref = this.#ref(session.id).collection(queuedMessagesCollectionName).doc();
+    const now = new Date();
+
+    await ref.create({
+      prompt,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    return {
+      id: ref.id,
+      sessionId: session.id,
+      prompt,
+      createdAt: now,
+    };
+  }
+
+  /**
+   * Lists all queued messages for a session in order of creation.
+   */
+  async listQueuedMessages(uid: string, sessionId: string): Promise<readonly QueuedMessage[]> {
+    const session = await this.readOwned(uid, sessionId);
+    const snapshot = await this.#ref(session.id)
+      .collection(queuedMessagesCollectionName)
+      .orderBy('createdAt', 'asc')
+      .get();
+
+    return snapshot.docs.map((doc) =>
+      parseQueuedMessage(doc.id, session.id, doc.data(), doc.ref.path),
+    );
+  }
+
+  /**
+   * Deletes a queued message from the session queue.
+   */
+  async deleteQueuedMessage(uid: string, sessionId: string, queuedMessageId: string): Promise<void> {
+    const session = await this.readOwned(uid, sessionId);
+    const ref = this.#ref(session.id)
+      .collection(queuedMessagesCollectionName)
+      .doc(queuedMessageId);
+
+    const snapshot = await ref.get();
+    if (!snapshot.exists) {
+      throw new AppError({
+        code: 'session/queued-message-not-found',
+        statusCode: 404,
+        message: 'No such queued message.',
+      });
+    }
+
+    await ref.delete();
+  }
+
+  /**
+   * Dequeues the next message in the queue under the runner's lease,
+   * charges the build quota, and appends it to the messages collection.
+   */
+  async dequeueNextMessage(sessionId: string, runnerId: string): Promise<QueuedMessage | undefined> {
+    const ref = this.#ref(sessionId);
+    const queuedSnapshot = await ref
+      .collection(queuedMessagesCollectionName)
+      .orderBy('createdAt', 'asc')
+      .limit(1)
+      .get();
+
+    const nextDoc = queuedSnapshot.docs[0];
+    if (nextDoc === undefined) {
+      return undefined;
+    }
+
+    const nextData = parseQueuedMessage(nextDoc.id, sessionId, nextDoc.data(), nextDoc.ref.path);
+    const now = new Date();
+
+    await this.#firestore.runTransaction(async (transaction) => {
+      const session = await this.#requireLease(transaction, ref, runnerId);
+      const entitlements = await this.#entitlements.forUser(session.ownerUid);
+      const { registry } = await this.#configuration.get();
+
+      // Deduct build meter for this turn
+      await this.#metering.consumeIn(transaction, {
+        uid: session.ownerUid,
+        entitlements,
+        meterKey: registry.buildMeterKey,
+        quantity: 1,
+        now,
+      });
+
+      const seq = session.messageCount;
+      transaction.create(ref.collection(messagesCollectionName).doc(messageId(seq)), {
+        role: 'user',
+        content: nextData.prompt,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+      transaction.delete(nextDoc.ref);
+      transaction.update(ref, {
+        messageCount: FieldValue.increment(1),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    });
+
+    return nextData;
+  }
+
+  /**
+   * Appends a mid-turn steering message directly into the conversation transcript under the runner's lease.
+   */
+  async appendSteerMessage(sessionId: string, runnerId: string, prompt: string): Promise<void> {
+    const ref = this.#ref(sessionId);
+    await this.#firestore.runTransaction(async (transaction) => {
+      const session = await this.#requireLease(transaction, ref, runnerId);
+      const seq = session.messageCount;
+      transaction.create(ref.collection(messagesCollectionName).doc(messageId(seq)), {
+        role: 'user',
+        content: prompt,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+      transaction.update(ref, {
+        messageCount: FieldValue.increment(1),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    });
+  }
+
+  /**
+   * Cancels a queued or running session.
+
+   *
+   * If the session is QUEUED, it is immediately marked FAILED with 'Cancelled by user',
+   * claimableAt is deleted so no runner will claim it, and the builds.started counter is refunded.
+   * If the session is RUNNING, cancelRequested is set to true so the active runner halts on its
+   * next step, tears down resources, and transitions the session to FAILED.
+   */
+  async cancel(uid: string, sessionId: string): Promise<BuildSession> {
+    const session = await this.readOwned(uid, sessionId);
+    const entitlements = await this.#entitlements.forUser(uid);
+    const { registry } = await this.#configuration.get();
+    const ref = this.#ref(sessionId);
+    const now = new Date();
+
+    return this.#firestore.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(ref);
+      if (!snapshot.exists) {
+        throw new AppError({
+          code: 'session/not-found',
+          statusCode: 404,
+          message: 'No such session.',
+        });
+      }
+      const current = parseSession(snapshot.id, snapshot.data() ?? {}, ref.path);
+      if (current.ownerUid !== uid) {
+        throw new AppError({
+          code: 'session/not-found',
+          statusCode: 404,
+          message: 'No such session.',
+        });
+      }
+
+      if (current.status === 'IDLE' || current.status === 'FAILED') {
+        throw new AppError({
+          code: 'session/not-cancellable',
+          statusCode: 409,
+          message: `Cannot cancel a session that is already ${current.status}.`,
+          details: { status: current.status },
+        });
+      }
+
+      if (current.status === 'QUEUED') {
+        await this.#metering.refundIn(transaction, {
+          uid,
+          entitlements,
+          meterKey: registry.buildMeterKey,
+          quantity: 1,
+          now,
+        });
+
+        transaction.update(ref, {
+          status: 'FAILED',
+          error: 'Cancelled by user',
+          claimableAt: FieldValue.delete(),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+
+        return {
+          ...current,
+          status: 'FAILED' as const,
+          error: 'Cancelled by user',
+          cancelRequested: undefined,
+        };
+      }
+
+      transaction.update(ref, {
+        cancelRequested: true,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      return {
+        ...current,
+        cancelRequested: true,
+      };
+    });
+  }
+
+  /**
    * Takes the session that has been waiting longest, if there is one.
+
    *
    * `claimableAt` is the whole scheduler. Queued sessions carry the instant they
    * were queued; a running session carries the instant its lease expires, so a
@@ -552,6 +779,14 @@ export class SessionRepository {
       });
     }
     const session = parseSession(snapshot.id, snapshot.data() ?? {}, ref.path);
+    if (session.cancelRequested === true) {
+      throw new AppError({
+        code: 'session/cancelled',
+        statusCode: 409,
+        message: 'Cancelled by user',
+        details: { sessionId: session.id },
+      });
+    }
     if (session.status !== 'RUNNING' || session.claimedBy !== runnerId) {
       throw new AppError({
         code: 'session/lease-lost',
@@ -561,6 +796,7 @@ export class SessionRepository {
       });
     }
     return session;
+
   }
 
   async #withLease(

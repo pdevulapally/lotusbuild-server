@@ -1,8 +1,11 @@
 import { FieldValue, type Firestore } from 'firebase-admin/firestore';
 
+import type { ConfigurationStore } from '../entitlements/store.ts';
 import type { EntitlementService } from '../entitlements/service.ts';
 import { type Platform, platforms } from '../entitlements/schema.ts';
 import { AppError } from '../http/errors.ts';
+import type { MeteringService } from '../metering/service.ts';
+import type { SnapshotStore } from '../storage/snapshots.ts';
 import {
   type Fields,
   countField,
@@ -14,6 +17,8 @@ import {
 import type { UserRepository } from '../users/repository.ts';
 
 export const projectsCollectionPath = 'projects';
+export const sessionsCollectionPath = 'sessions';
+export const messagesCollectionName = 'messages';
 
 /** Recovered from the previous schema: varchar(100) name, varchar(500) description. */
 export const projectNameMaxLength = 100;
@@ -39,6 +44,11 @@ export interface NewProject {
   readonly platform: Platform;
 }
 
+export interface UpdateProject {
+  readonly name?: string | undefined;
+  readonly description?: string | undefined;
+}
+
 function parseProject(id: string, fields: Fields, where: string): Project {
   return {
     id,
@@ -56,12 +66,26 @@ export class ProjectRepository {
   readonly #firestore: Firestore;
   readonly #users: UserRepository;
   readonly #entitlements: EntitlementService;
+  readonly #metering: MeteringService | undefined;
+  readonly #configuration: ConfigurationStore | undefined;
+  readonly #snapshots: SnapshotStore | undefined;
 
-  constructor(firestore: Firestore, users: UserRepository, entitlements: EntitlementService) {
+  constructor(
+    firestore: Firestore,
+    users: UserRepository,
+    entitlements: EntitlementService,
+    metering?: MeteringService | undefined,
+    configuration?: ConfigurationStore | undefined,
+    snapshots?: SnapshotStore | undefined,
+  ) {
     this.#firestore = firestore;
     this.#users = users;
     this.#entitlements = entitlements;
+    this.#metering = metering;
+    this.#configuration = configuration;
+    this.#snapshots = snapshots;
   }
+
 
   /**
    * Creates a project if the owner's plan permits the platform and they are
@@ -132,6 +156,104 @@ export class ProjectRepository {
     };
   }
 
+  /**
+   * Updates an existing project's name and/or description.
+   */
+  async update(ownerUid: string, projectId: string, input: UpdateProject): Promise<Project> {
+    const existing = await this.readOwned(ownerUid, projectId);
+    if (input.name === undefined && input.description === undefined) {
+      return existing;
+    }
+
+    const ref = this.refFor(projectId);
+    const updates: Record<string, unknown> = {
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+
+    if (input.name !== undefined) {
+      updates.name = input.name;
+    }
+    if (input.description !== undefined) {
+      updates.description = input.description === '' ? FieldValue.delete() : input.description;
+    }
+
+    await ref.update(updates);
+
+    return {
+      ...existing,
+      name: input.name ?? existing.name,
+      description:
+        input.description !== undefined
+          ? input.description === ''
+            ? undefined
+            : input.description
+          : existing.description,
+    };
+  }
+
+  /**
+   * Deletes a project, decrements the owner's project count, releases any
+   * storage gauge occupancy, deletes associated sessions and messages, and
+   * deletes the snapshot archive in storage.
+   */
+  async delete(ownerUid: string, projectId: string): Promise<void> {
+    const project = await this.readOwned(ownerUid, projectId);
+    const ref = this.refFor(projectId);
+    const userRef = this.#users.refFor(ownerUid);
+
+    await this.#firestore.runTransaction(async (transaction) => {
+      // Release storage meter gauge if bytes were charged
+      if (this.#metering !== undefined && this.#configuration !== undefined && project.snapshotBytes > 0) {
+        const { registry } = await this.#configuration.get();
+        const entitlements = await this.#entitlements.forUser(ownerUid);
+        await this.#metering.setGaugeIn(transaction, {
+          uid: ownerUid,
+          entitlements,
+          meterKey: registry.storageMeterKey,
+          previousQuantity: project.snapshotBytes,
+          quantity: 0,
+          now: new Date(),
+        });
+      }
+
+      transaction.delete(ref);
+      transaction.update(userRef, {
+        projectCount: FieldValue.increment(-1),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    });
+
+    // Delete associated sessions and message sub-collections
+    const sessionDocs = await this.#firestore
+      .collection(sessionsCollectionPath)
+      .where('projectId', '==', projectId)
+      .get();
+
+    for (const sessionDoc of sessionDocs.docs) {
+      const messages = await sessionDoc.ref.collection(messagesCollectionName).get();
+      const queuedMessages = await sessionDoc.ref.collection('queued_messages').get();
+      const batch = this.#firestore.batch();
+      for (const msg of messages.docs) {
+        batch.delete(msg.ref);
+      }
+      for (const qMsg of queuedMessages.docs) {
+        batch.delete(qMsg.ref);
+      }
+      batch.delete(sessionDoc.ref);
+      await batch.commit();
+    }
+
+
+    // Clean up durable git snapshot archive if snapshot store is available
+    if (this.#snapshots !== undefined) {
+      try {
+        await this.#snapshots.remove(projectId);
+      } catch {
+        // Ignored: Snapshot removal is best-effort if file does not exist
+      }
+    }
+  }
+
   /** For callers that update a project inside their own transaction. */
   refFor(projectId: string) {
     return this.#firestore.doc(`${projectsCollectionPath}/${projectId}`);
@@ -175,3 +297,4 @@ export class ProjectRepository {
     return project;
   }
 }
+

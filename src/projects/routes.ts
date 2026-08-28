@@ -121,4 +121,68 @@ export function registerProjectRoutes(app: FastifyInstance, projects: ProjectRep
       return toResponse(await projects.readOwned(user.uid, request.params.projectId));
     },
   );
+
+  app.patch<{
+    Params: { projectId: string };
+    Body: { name?: string; description?: string };
+  }>(
+    '/projects/:projectId',
+    {
+      preHandler: [app.requireAuth, app.enforceRateLimit('write')],
+      schema: {
+        params: {
+          type: 'object',
+          required: ['projectId'],
+          additionalProperties: false,
+          properties: { projectId: { type: 'string', pattern: documentId } },
+        },
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            name: {
+              type: 'string',
+              minLength: 1,
+              maxLength: projectNameMaxLength,
+              pattern: printableLine,
+            },
+            description: {
+              type: 'string',
+              maxLength: projectDescriptionMaxLength,
+              pattern: printableLine,
+            },
+          },
+        },
+      },
+    },
+    async (request) => {
+      const user = authenticatedUser(request);
+      const project = await projects.update(user.uid, request.params.projectId, {
+        name: request.body.name?.trim(),
+        description: request.body.description?.trim(),
+      });
+      return toResponse(project);
+    },
+  );
+
+  app.delete<{ Params: { projectId: string } }>(
+    '/projects/:projectId',
+    {
+      preHandler: [app.requireAuth, app.enforceRateLimit('write')],
+      schema: {
+        params: {
+          type: 'object',
+          required: ['projectId'],
+          additionalProperties: false,
+          properties: { projectId: { type: 'string', pattern: documentId } },
+        },
+      },
+    },
+    async (request, reply) => {
+      const user = authenticatedUser(request);
+      await projects.delete(user.uid, request.params.projectId);
+      return reply.code(204).send();
+    },
+  );
 }
+

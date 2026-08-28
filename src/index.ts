@@ -11,7 +11,9 @@ import { ProjectRepository } from './projects/repository.ts';
 import { SessionEvents } from './sessions/events.ts';
 import { SessionRepository } from './sessions/repository.ts';
 import { UserRepository } from './users/repository.ts';
+import { SnapshotStore } from './storage/snapshots.ts';
 import { buildServer } from './server.ts';
+
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -50,9 +52,22 @@ async function main(): Promise<void> {
     configuration,
     subscriptionCache,
   );
+  const snapshots = new SnapshotStore(
+    firebase.app,
+    config.FIREBASE_STORAGE_BUCKET,
+    config.SNAPSHOT_URL_TTL_SECONDS,
+  );
   const users = new UserRepository(firebase.firestore);
-  const projects = new ProjectRepository(firebase.firestore, users, entitlements);
   const metering = new MeteringService(firebase.firestore, configuration);
+  const projects = new ProjectRepository(
+    firebase.firestore,
+    users,
+    entitlements,
+    metering,
+    configuration,
+    snapshots,
+  );
+
 
   // A connection in subscribe mode cannot run ordinary commands, so the event
   // stream needs its own. One for the whole process, not one per client.
@@ -67,9 +82,11 @@ async function main(): Promise<void> {
     firebaseAuth: firebase.auth,
     redis,
     entitlements,
+    metering,
     users,
     projects,
     configuration,
+
     stripe: createStripe(config.STRIPE_SECRET_KEY),
     billing: new BillingRepository(
       firebase.firestore,
