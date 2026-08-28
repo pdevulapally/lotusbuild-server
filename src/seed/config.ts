@@ -108,6 +108,8 @@ export const planDocuments = [
   {
     key: "pro",
     name: "Pro",
+    // £24.00. Stripe publishes this on demand; nothing is pasted from a dashboard.
+    price: { amountMinor: 2400, currency: "gbp", interval: "month" },
     status: "ACTIVE",
     rank: 1,
     entitlements: [
@@ -139,6 +141,8 @@ export const planDocuments = [
   {
     key: "business",
     name: "Business",
+    // £72.00.
+    price: { amountMinor: 7200, currency: "gbp", interval: "month" },
     status: "ACTIVE",
     rank: 2,
     entitlements: [

@@ -69,6 +69,16 @@ export class ConfigurationStore {
         );
       }
 
+      const defaultPlan = plans.get(registry.defaultPlanKey);
+      if (defaultPlan !== undefined && defaultPlan.price !== undefined) {
+        // Everyone already holds the default plan, so putting it up for sale
+        // would charge for something the buyer cannot fail to have.
+        throw new DocumentShapeError(
+          `${plansCollectionPath}/${defaultPlan.key}: the default plan carries a price, but the ` +
+            'plan everybody already has cannot be sold.',
+        );
+      }
+
       assertSandboxAllowancesAreUsable(registry, [...plans.values()], registry.sandboxTimeMeterKey);
 
       return { registry, plans };

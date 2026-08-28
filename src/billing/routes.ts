@@ -2,13 +2,12 @@ import type { FastifyInstance } from 'fastify';
 import type Stripe from 'stripe';
 
 import { authenticatedUser } from '../auth/plugin.ts';
-import type { Plan } from '../entitlements/schema.ts';
 import type { ConfigurationStore } from '../entitlements/store.ts';
 import { AppError } from '../http/errors.ts';
 import { cached } from '../support/cache.ts';
 import type { UserRepository } from '../users/repository.ts';
 import type { BillingRepository } from './repository.ts';
-import { planPrices, readSubscription, throughStripe } from './stripe.ts';
+import { ensurePriceId, readSubscription, throughStripe } from './stripe.ts';
 
 export interface BillingUrls {
   readonly checkoutSuccess: URL;
@@ -89,46 +88,22 @@ export function registerBillingRoutes(
    * a plan document also carries its Stripe price id, its rate-limit budgets and
    * its sandbox instructions, none of which are the public's business.
    *
-   * Held for a TTL because it costs a Stripe call per priced plan to build, and
-   * `cached` collapses concurrent misses into one load, so a burst of traffic on
-   * the pricing page cannot turn into a burst of traffic at Stripe.
+   * Reads no further than configuration. The amount lives in the plan document
+   * and Stripe is a projection of it, so the page and the checkout cannot
+   * disagree and rendering a price costs no API call.
    */
   const catalogue = cached(deps.catalogueTtlMs, async () => {
     const { registry, plans } = await configuration.get();
 
-    const priceFor = async (plan: Plan) => {
-      const priceId = plan.stripePriceId;
-      if (priceId === undefined) {
-        return null;
-      }
-      const price = await throughStripe(
-        'read a price',
-        () => stripe.prices.retrieve(priceId),
-        (error) => app.log.error({ err: error, plan: plan.key }, 'stripe rejected a price lookup'),
-      );
-      const { unit_amount: amountMinor, recurring } = price;
-      if (amountMinor === null || recurring === null) {
-        // A one-off or metered price cannot be rendered as "£X a month", and
-        // guessing a number onto a pricing page is how customers get billed
-        // something they were never shown.
-        throw new AppError({
-          code: 'config/plan-price-unusable',
-          statusCode: 500,
-          message: `Stripe price ${priceId} for plan "${plan.key}" carries no recurring amount.`,
-        });
-      }
-      return { amountMinor, currency: price.currency, interval: recurring.interval };
-    };
-
-    return Promise.all(
+    return (
       [...plans.values()]
         .filter((plan) => plan.status === 'ACTIVE')
         .sort((left, right) => left.rank - right.rank)
-        .map(async (plan) => ({
+        .map((plan) => ({
           key: plan.key,
           name: plan.name,
           rank: plan.rank,
-          price: await priceFor(plan),
+          price: plan.price,
           capabilities: [...plan.entitlements].flatMap(([key, entitlement]) => {
             const definition = registry.capabilities.get(key);
             if (definition === undefined) {
@@ -153,7 +128,7 @@ export function registerBillingRoutes(
               },
             ];
           }),
-        })),
+        }))
     );
   });
 
@@ -185,19 +160,19 @@ export function registerBillingRoutes(
     },
     async (request) => {
       const user = authenticatedUser(request);
-      const { registry, plans } = await configuration.get();
-      const purchasable = planPrices(plans, registry.defaultPlanKey);
+      const { plans } = await configuration.get();
+      const purchasable = [...plans.values()].filter((plan) => plan.price !== undefined);
 
       const plan = plans.get(request.body.planKey);
       // Reported the same way whether the plan does not exist, is retired, or
       // is not for sale: a caller probing plan keys learns nothing either way.
-      if (plan === undefined || plan.status !== 'ACTIVE' || plan.stripePriceId === undefined) {
+      if (plan === undefined || plan.status !== 'ACTIVE' || plan.price === undefined) {
         throw new AppError({
           code: 'billing/plan-not-purchasable',
           statusCode: 404,
           message: 'No such plan is available to buy.',
           details: {
-            available: [...purchasable.values()]
+            available: purchasable
               .filter((candidate) => candidate.status === 'ACTIVE')
               .map((candidate) => candidate.key),
           },
@@ -208,13 +183,16 @@ export function registerBillingRoutes(
         request.log.error({ err: error, uid: user.uid }, 'stripe rejected a billing call');
       };
       const customer = await customerFor(user.uid, onError);
+      // Published from the plan document if Stripe has not seen this amount yet,
+      // so a price change is a configuration edit and nothing else.
+      const priceId = await ensurePriceId(stripe, plan, onError);
       const session = await throughStripe(
         'start checkout',
         () =>
           stripe.checkout.sessions.create({
             mode: 'subscription',
             customer,
-            line_items: [{ price: plan.stripePriceId!, quantity: 1 }],
+            line_items: [{ price: priceId, quantity: 1 }],
             success_url: urls.checkoutSuccess.toString(),
             cancel_url: urls.checkoutCancel.toString(),
             client_reference_id: user.uid,
@@ -366,8 +344,8 @@ export function registerBillingRoutes(
       return 'removed';
     }
 
-    const { registry, plans } = await configuration.get();
-    const state = readSubscription(subscription, planPrices(plans, registry.defaultPlanKey));
+    const { plans } = await configuration.get();
+    const state = readSubscription(subscription, plans);
     return billing.applySubscription({
       uid,
       state,

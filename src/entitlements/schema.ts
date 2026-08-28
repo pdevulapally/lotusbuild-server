@@ -6,7 +6,6 @@ import {
   indexByKey,
   integerField,
   objectArrayField,
-  optionalStringField,
   stringField,
 } from '../support/documents.ts';
 import { type CapabilityDefinition, isMergeStrategy, mergeStrategies } from './merge.ts';
@@ -81,6 +80,16 @@ export interface Registry {
   readonly sandboxProviders: ReadonlyMap<Platform, SandboxProvider>;
 }
 
+export const billingIntervals = ['day', 'week', 'month', 'year'] as const;
+
+export interface PlanPrice {
+  /** The currency's minor unit — 2400 is £24.00. Integer, because money is not a float. */
+  readonly amountMinor: number;
+  /** ISO 4217, lowercase, as Stripe writes it. */
+  readonly currency: string;
+  readonly interval: (typeof billingIntervals)[number];
+}
+
 export interface MeterLimit {
   readonly meterKey: string;
   readonly includedAllowance: number;
@@ -100,11 +109,17 @@ export interface Plan {
   readonly status: (typeof planStatuses)[number];
   readonly rank: number;
   /**
-   * The Stripe price that sells this plan. Absent for a plan nobody buys — the
-   * default one everybody already has, or one kept only to honour subscriptions
-   * that already exist.
+   * What this plan costs. Absent for a plan nobody buys — the default one
+   * everybody already has, or one kept only to honour subscriptions that
+   * already exist.
+   *
+   * The amount lives here rather than as a Stripe price id, so configuration is
+   * the single source of truth and Stripe is kept as a projection of it. The
+   * price object in Stripe is created on demand from these numbers, which is
+   * also what stops the pricing page advertising one figure while the checkout
+   * charges another.
    */
-  readonly stripePriceId: string | undefined;
+  readonly price: PlanPrice | undefined;
   readonly entitlements: ReadonlyMap<string, EntitlementValue>;
   readonly meterLimits: ReadonlyMap<string, MeterLimit>;
   readonly rateLimits: ReadonlyMap<RateLimitClass, RateLimit>;
@@ -273,6 +288,29 @@ export function parseRegistry(fields: Fields, where: string): Registry {
   };
 }
 
+/**
+ * A plan's price, when it has one. Absent and malformed are different: a plan
+ * with no `price` is simply not for sale, while a `price` that cannot be read
+ * is refused, because the alternative is quietly treating a paid plan as free.
+ */
+function parsePlanPrice(fields: Fields, where: string): PlanPrice | undefined {
+  const raw = fields['price'];
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new DocumentShapeError(`${where}.price must be an object when it is present.`);
+  }
+  const at = `${where}.price`;
+  const price = raw as Fields;
+  return {
+    // Minimum 1: a zero-amount price would make a paid plan checkout for free.
+    amountMinor: integerField(price, 'amountMinor', at, { min: 1 }),
+    currency: stringField(price, 'currency', at),
+    interval: enumField(price, 'interval', at, billingIntervals),
+  };
+}
+
 export function parsePlan(fields: Fields, where: string, registry: Registry): Plan {
   const key = stringField(fields, 'key', where);
 
@@ -337,7 +375,7 @@ export function parsePlan(fields: Fields, where: string, registry: Registry): Pl
     name: stringField(fields, 'name', where),
     status: enumField(fields, 'status', where, planStatuses),
     rank: integerField(fields, 'rank', where, { min: 0 }),
-    stripePriceId: optionalStringField(fields, 'stripePriceId'),
+    price: parsePlanPrice(fields, where),
     entitlements,
     meterLimits,
     rateLimits,

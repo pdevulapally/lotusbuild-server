@@ -79,7 +79,7 @@ function customerIdOf(subscription: Stripe.Subscription): string {
  */
 export function readSubscription(
   subscription: Stripe.Subscription,
-  planByPrice: ReadonlyMap<string, Plan>,
+  plans: ReadonlyMap<string, Plan>,
 ): StripeSubscriptionState {
   const items = subscription.items.data;
   if (items.length !== 1) {
@@ -97,13 +97,30 @@ export function readSubscription(
 
   const item = items[0]!;
   const priceId = item.price.id;
-  const plan = planByPrice.get(priceId);
+  // Resolved through the price's own metadata rather than by matching its id
+  // against the current catalogue. A price change publishes a new Stripe price
+  // and moves the lookup key onto it, leaving existing subscribers on the old
+  // one — matching by id would fail for exactly those grandfathered customers,
+  // and their subscription is the one that must keep working.
+  const planKey = item.price.metadata[planKeyMetadataField];
+  if (planKey === undefined) {
+    // Every price we publish carries this. One without it was made by hand in
+    // the dashboard, and guessing which plan it meant would entitle a customer
+    // to something nobody decided to sell them.
+    throw new AppError({
+      code: 'billing/unlabelled-price',
+      statusCode: 500,
+      message: `Stripe price ${priceId} carries no "${planKeyMetadataField}", so what it sells cannot be told.`,
+      details: { priceId },
+    });
+  }
+  const plan = plans.get(planKey);
   if (plan === undefined) {
     throw new AppError({
       code: 'billing/unknown-price',
       statusCode: 500,
-      message: `No plan is configured for Stripe price ${priceId}.`,
-      details: { priceId, configured: [...planByPrice.keys()] },
+      message: `Stripe price ${priceId} names no plan we configure.`,
+      details: { priceId, planKey, configured: [...plans.keys()] },
     });
   }
 
@@ -131,37 +148,80 @@ export function readSubscription(
   };
 }
 
+/** Where a plan key is recorded on the Stripe objects we create. */
+export const planKeyMetadataField = 'planKey';
+
+/** The lookup key naming the price that currently sells a plan. */
+function lookupKeyFor(plan: Plan): string {
+  return `lotusbuild_${plan.key}`;
+}
+
 /**
- * Which plan each Stripe price sells, built from the plan documents.
+ * The Stripe price that sells this plan right now, created if it does not exist.
  *
- * Two plans sharing a price would make what a customer bought depend on map
- * ordering, and the default plan carrying one would mean the free tier could be
- * purchased — both are refused here rather than discovered at a checkout.
+ * Configuration owns the amount, so Stripe is brought into line with it rather
+ * than the other way round — no price ids are pasted between a dashboard and a
+ * plan document, and there is no window where the two disagree.
+ *
+ * Idempotent through the lookup key: an unchanged amount finds the existing
+ * price and creates nothing. A changed amount publishes a new price and moves
+ * the lookup key onto it, which is the only thing Stripe permits — prices are
+ * immutable. The old price stays active and its subscribers stay on the terms
+ * they agreed to, which is why `readSubscription` resolves plans through the
+ * price's metadata instead of the current catalogue.
  */
-export function planPrices(
-  plans: ReadonlyMap<string, Plan>,
-  defaultPlanKey: string,
-): ReadonlyMap<string, Plan> {
-  const byPrice = new Map<string, Plan>();
-  for (const plan of plans.values()) {
-    if (plan.stripePriceId === undefined) {
-      continue;
-    }
-    if (plan.key === defaultPlanKey) {
-      throw new EntitlementConfigError(
-        `The default plan "${plan.key}" carries a Stripe price, but the plan everyone already ` +
-          'has cannot be sold.',
-      );
-    }
-    const clash = byPrice.get(plan.stripePriceId);
-    if (clash !== undefined) {
-      throw new EntitlementConfigError(
-        `Plans "${clash.key}" and "${plan.key}" both sell Stripe price ${plan.stripePriceId}.`,
-      );
-    }
-    byPrice.set(plan.stripePriceId, plan);
+export async function ensurePriceId(
+  stripe: Stripe,
+  plan: Plan,
+  onError: (error: Error) => void,
+): Promise<string> {
+  const price = plan.price;
+  if (price === undefined) {
+    throw new EntitlementConfigError(
+      `Plan "${plan.key}" carries no price, so it cannot be sold.`,
+    );
   }
-  return byPrice;
+
+  const lookupKey = lookupKeyFor(plan);
+  const existing = await throughStripe(
+    'look up a price',
+    () => stripe.prices.list({ lookup_keys: [lookupKey], active: true, limit: 1 }),
+    onError,
+  );
+
+  const current = existing.data[0];
+  const matches =
+    current !== undefined &&
+    current.unit_amount === price.amountMinor &&
+    current.currency === price.currency &&
+    current.recurring !== null &&
+    current.recurring.interval === price.interval;
+  if (matches) {
+    return current.id;
+  }
+
+  const metadata = { [planKeyMetadataField]: plan.key };
+  const created = await throughStripe(
+    'publish a price',
+    () =>
+      stripe.prices.create({
+        currency: price.currency,
+        unit_amount: price.amountMinor,
+        recurring: { interval: price.interval },
+        lookup_key: lookupKey,
+        // Takes the key off whichever price held it, so the next checkout sells
+        // this one while existing subscriptions keep billing on the old.
+        transfer_lookup_key: true,
+        metadata,
+        // Reuse the product a previous price already belongs to, so a price
+        // change does not scatter a new product per revision across Stripe.
+        ...(current === undefined
+          ? { product_data: { name: plan.name, metadata } }
+          : { product: typeof current.product === 'string' ? current.product : current.product.id }),
+      }),
+    onError,
+  );
+  return created.id;
 }
 
 /**
