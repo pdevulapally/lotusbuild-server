@@ -1,0 +1,17 @@
+[Unit]
+Description=LotusBuild API
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=preet
+WorkingDirectory=/home/preet/apps/lotusbuild-server
+# /usr/bin/env so this keeps working if node moves (nvm, a distro upgrade).
+# --env-file is native in Node 22; nothing in the code reads a .env itself.
+ExecStart=/usr/bin/env node --env-file=.env dist/index.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

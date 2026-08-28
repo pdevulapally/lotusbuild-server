@@ -1,0 +1,15 @@
+[Unit]
+Description=LotusBuild build runner
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=preet
+WorkingDirectory=/home/preet/apps/lotusbuild-server
+ExecStart=/usr/bin/env node --env-file=.env dist/runner/index.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+# Installed to /etc/caddy/Caddyfile.
+#
+# Caddy terminates TLS and is the only thing exposed. The API stays bound to
+# 127.0.0.1:4100 (HOST in .env), so it is unreachable except through here.
+# The certificate is issued automatically over ACME on port 80; that works
+# because api.lotusbuild.co.uk already resolves to this box.
+api.lotusbuild.co.uk {
+	encode zstd gzip
+
+	# `encode` only touches responses, so the Stripe webhook still verifies:
+	# its signature is over the raw request body, which is proxied untouched.
+	reverse_proxy 127.0.0.1:4100
+}
