@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A newer push makes an in-flight run irrelevant, but never interrupt a
+  # deploy — cancelling one mid-restart leaves the server on a half-shipped tree.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: Typecheck, build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # Covers src and test together; the build config alone would not see the
+      # tests, and a test that no longer compiles is a test that stopped running.
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Verify no secret is committed
+        run: |
+          set -euo pipefail
+          if git ls-files | grep -iE '(^|/)\.env($|\.)|adminsdk|service-account|\.pem$|\.p12$'; then
+            echo "::error::A credential-shaped file is tracked by git."
+            exit 1
+          fi
+          # Excludes this workflow, whose own pattern would otherwise match it.
+          if git grep -nIE 'sk_live_|sk_test_|whsec_|-----BEGIN [A-Z ]*PRIVATE KEY-----' -- . ':!.github/'; then
+            echo "::error::A credential-shaped string is committed."
+            exit 1
+          fi
+          echo "No tracked secrets."
+
+      - name: Verify the deploy payload carries no tests
+        run: |
+          set -euo pipefail
+          # deploy.sh ships `git archive`, which honours export-ignore. If this
+          # ever lists a test file, production is about to receive one.
+          if git archive HEAD | tar -tf - | grep -E '^(test/|\.github/)'; then
+            echo "::error::The deploy payload includes test or CI files."
+            exit 1
+          fi
+          echo "Deploy payload is production-only."
+
+  deploy:
+    name: Deploy to production
+    needs: check
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # Lets you require a manual approval on the environment in repo settings,
+    # and stops two pushes deploying over each other.
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # deploy.sh builds the payload from git history, not the checkout.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Authorise SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Pinned rather than scanned: ssh-keyscan would trust whatever answers.
+          printf '%s\n' '194.164.94.249 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDrhAwZfwcoFmqQvzT2oN/UXV1dKnYOn13kOdAvto86x' > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy
+        env:
+          DEPLOY_HOST: preet@194.164.94.249
+        run: ./deploy.sh
+
+      - name: Confirm the API is serving
+        run: |
+          set -euo pipefail
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://api.lotusbuild.co.uk/health)
+          test "$code" = "200" || { echo "::error::health returned $code"; exit 1; }
+          echo "Live and healthy."

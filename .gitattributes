@@ -1,1 +1,10 @@
 * text=auto eol=lf
+
+# Never shipped to a server. `deploy.sh` builds the payload with `git archive`,
+# which honours export-ignore, so these are a CI gate and nothing more —
+# production holds no test files, no workflows and no deployment recipes.
+/test export-ignore
+/.github export-ignore
+/deploy export-ignore
+/tsconfig.test.json export-ignore
+/.gitattributes export-ignore

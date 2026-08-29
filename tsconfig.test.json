@@ -1,0 +1,11 @@
+{
+  // Type-checks the tests without letting them near `dist`. The build config
+  // keeps rootDir at "src", so adding test files there would move every emitted
+  // path down a level; this checks them and emits nothing.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}
