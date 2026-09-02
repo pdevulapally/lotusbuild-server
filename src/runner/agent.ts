@@ -969,6 +969,7 @@ export async function runAgentTurn(input: {
     provider: input.provider,
     commandTimeoutMs: input.limits.commandTimeoutMs,
     previewReadyTimeoutSeconds: input.limits.previewReadyTimeoutSeconds,
+    toolOutputMaxChars: input.limits.toolOutputMaxChars,
     onPreview: input.events.preview,
   };
 

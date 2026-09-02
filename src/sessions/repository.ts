@@ -397,6 +397,16 @@ export class SessionRepository {
     return snapshot.docs.map((doc) => parseSession(doc.id, doc.data(), doc.ref.path));
   }
 
+  /**
+   * The most recent `limit` messages, in chronological order.
+   *
+   * Every caller — the primary agent's context and the message-history route
+   * alike — wants the current state of the conversation, not a window fixed
+   * at its beginning. `orderBy(..., 'desc')` bounds the query to the newest
+   * `limit` documents before anything is fetched, so a long session is never
+   * read past that; the result is reversed only after it comes back, which
+   * reorders at most `limit` items, never the collection.
+   */
   async listMessages(
     ownerUid: string,
     sessionId: string,
@@ -405,11 +415,11 @@ export class SessionRepository {
     const session = await this.readOwned(ownerUid, sessionId);
     const snapshot = await this.#ref(session.id)
       .collection(messagesCollectionName)
-      .orderBy(FieldPath.documentId())
+      .orderBy(FieldPath.documentId(), 'desc')
       .limit(limit)
       .get();
 
-    return snapshot.docs.map((doc) => parseMessage(doc.id, doc.data(), doc.ref.path));
+    return snapshot.docs.map((doc) => parseMessage(doc.id, doc.data(), doc.ref.path)).reverse();
   }
 
   /**

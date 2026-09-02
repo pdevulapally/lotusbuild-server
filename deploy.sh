@@ -2,7 +2,6 @@
 # Deploys the API and the runner to the VPS over ssh.
 # One-time server setup (Caddy, systemd, .env) is in deploy/SETUP.md.
 #
-# Secrets are never shipped from here. ~/apps/lotusbuild-server/.env and the
 # Firebase service-account JSON exist on the server only; `git archive` sends
 # only the committed tree, so an untracked .env cannot leak into a deploy.
 set -euo pipefail

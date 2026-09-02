@@ -536,6 +536,7 @@ test('a specialist receives read-only tools and cannot delegate further', async 
   assert.deepEqual([...specialistCall.toolNames].sort(), [
     'list_files',
     'read_file',
+    'search_files',
     'submit_review',
   ]);
   // Depth is one because the tool does not exist further down, not because a
@@ -2318,13 +2319,22 @@ class ValidationSandbox implements RunningSandbox {
     this.allCommands.push(command);
     if (command.startsWith('# lotusbuild:validation-checkpoint')) {
       this.#snapshot = new Map(this.files);
-      return { exitCode: 0, stdout: `${this.#hash(this.files)}\n`, stderr: '' };
+      const hash = this.#hash(this.files);
+      // The content-only fake has no index or HEAD, so both trees are the
+      // content hash and the HEAD fields are empty — enough to exercise the
+      // tool's parse and restore flow. Git semantics are proven separately by
+      // the real-repository tests.
+      return {
+        exitCode: 0,
+        stdout: `index_tree=${hash}\nworking_tree=${hash}\nhead_ref=\nhead_commit=\n`,
+        stderr: '',
+      };
     }
     if (command.startsWith('# lotusbuild:validation-restore')) {
       if (this.#failRestore) {
         return { exitCode: 1, stdout: '', stderr: 'restore failed' };
       }
-      const checkpoint = options?.envs?.['LOTUSBUILD_CHECKPOINT_TREE'] ?? '';
+      const checkpoint = options?.envs?.['LOTUSBUILD_WORKING_TREE'] ?? '';
       const snapshot = this.#snapshot ?? new Map<string, string>();
       const mutated = this.#hash(this.files) !== checkpoint;
       const changed = this.#diff(snapshot, this.files);
@@ -2421,6 +2431,7 @@ test('the Testing specialist is offered and receives exactly its four tools', as
     'list_files',
     'read_file',
     'run_validation',
+    'search_files',
     'submit_review',
   ]);
   // Never the mutating or delegating tools.
@@ -2488,13 +2499,24 @@ for (const operation of ['deploy', 'test; rm -rf /']) {
   });
 }
 
-test('the restore strategy is checkpoint/restore, never reset --hard', async () => {
+test('the restore strategy reconstructs from checkpoint trees, never reset --hard or the live index', async () => {
   // A structural guard on the real scripts: reset --hard would destroy the
   // primary agent's uncommitted work, which is the one thing forbidden.
   assert.equal(validationRestoreScript.includes('reset --hard'), false);
-  assert.ok(validationRestoreScript.includes('read-tree'));
+  // The index and working tree are rebuilt from the checkpoint trees, and HEAD
+  // from the checkpoint ref/commit — never copied back from the post-validation
+  // .git/index, which validation may have corrupted.
+  assert.ok(validationRestoreScript.includes('read-tree "$LOTUSBUILD_WORKING_TREE"'));
+  assert.ok(validationRestoreScript.includes('read-tree "$LOTUSBUILD_INDEX_TREE"'));
   assert.ok(validationRestoreScript.includes('checkout-index'));
+  assert.ok(validationRestoreScript.includes('symbolic-ref HEAD'));
+  assert.ok(validationRestoreScript.includes('update-ref'));
+  // The live index is only ever read through a throwaway GIT_INDEX_FILE probe,
+  // never copied over the authoritative index as the restored state.
+  assert.ok(validationRestoreScript.includes('GIT_INDEX_FILE'));
+  assert.equal(validationRestoreScript.includes('/tmp/lotusbuild-val-probe .git/index'), false);
   assert.ok(validationCheckpointScript.includes('write-tree'));
+  assert.ok(validationCheckpointScript.includes('symbolic-ref -q HEAD'));
 });
 
 async function runValidationOnce(
@@ -2506,6 +2528,7 @@ async function runValidationOnce(
     provider,
     commandTimeoutMs: 1000,
     previewReadyTimeoutSeconds: 5,
+    toolOutputMaxChars: limits.toolOutputMaxChars,
     onPreview: async () => {},
   };
   const tool = makeRunValidation({
@@ -2548,7 +2571,7 @@ test('a validation-created file is removed by restoration', async () => {
     },
   });
   assert.equal(sandbox.files.has('.snapshot'), false);
-  assert.ok(result.text.includes('modified the workspace'));
+  assert.ok(result.text.includes('modified the project git state'));
 });
 
 test('a validation-modified tracked file is restored', async () => {
@@ -2581,7 +2604,7 @@ test('a workspace mutation is reported after restoration', async () => {
       return { exitCode: 0, stdout: 'ok', stderr: '' };
     },
   });
-  assert.ok(result.text.includes('modified the workspace'));
+  assert.ok(result.text.includes('modified the project git state'));
   assert.ok(result.text.includes('Changed:'));
   assert.equal(result.isError, false);
 });

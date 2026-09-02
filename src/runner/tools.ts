@@ -10,6 +10,13 @@ export interface ToolContext {
   readonly provider: SandboxProvider;
   readonly commandTimeoutMs: number;
   readonly previewReadyTimeoutSeconds: number;
+  /**
+   * How much of a tool result the outer loop keeps before it truncates the
+   * rest. `read_file` sizes its ranged reads against this directly, so the
+   * range it reports as delivered is always the range that actually reaches
+   * the model — see `renderFileRange`.
+   */
+  readonly toolOutputMaxChars: number;
   /** Told when a preview comes up, so the session can show it. */
   readonly onPreview: (preview: { readonly url: string; readonly port: number }) => Promise<void>;
 }
@@ -75,6 +82,79 @@ function requirePort(input: Record<string, unknown>, name: string): number {
   return value;
 }
 
+/** An omitted value returns `undefined`; a present one must be a valid offset. */
+function optionalNonNegativeInteger(input: Record<string, unknown>, name: string): number | undefined {
+  const value = input[name];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new Error(`"${name}" must be a non-negative integer when given.`);
+  }
+  return value;
+}
+
+/** An omitted value returns `undefined`; a present one must be a valid length. */
+function optionalPositiveInteger(input: Record<string, unknown>, name: string): number | undefined {
+  const value = input[name];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`"${name}" must be a positive integer when given.`);
+  }
+  return value;
+}
+
+/**
+ * Renders one read result with the metadata the model needs to continue: the
+ * exact range being returned, the file's total length, and whether more
+ * remains. `end` is exclusive, so `end - start` is exactly how many units of
+ * `content` follow.
+ *
+ * The unit is the UTF-16 code unit — what JavaScript's `string.length` and
+ * `string.slice` count — not the Unicode code point and not a
+ * human-perceived character. They agree for plain ASCII/BMP text, which is
+ * most source code, but a character outside the Basic Multilingual Plane
+ * (many emoji, some CJK extensions) is two code units, and this offset/limit
+ * addresses those two individually. Calling that "characters" would be false,
+ * so the wire format says what it actually is.
+ */
+function renderFileRange(
+  path: string,
+  start: number,
+  end: number,
+  total: number,
+  content: string,
+): string {
+  const hasMore = end < total;
+  return [
+    `${path}: UTF-16 code units ${start}-${end} of ${total} (has_more: ${hasMore})`,
+    '---',
+    content,
+  ].join('\n');
+}
+
+/**
+ * Moves a candidate offset/end back by one position if it sits between the
+ * two halves of a surrogate pair, so a range boundary this tool chooses never
+ * slices a non-BMP character in two.
+ *
+ * Only a genuine pair triggers the move — a high surrogate immediately
+ * followed by its low surrogate. A lone, already-malformed surrogate in the
+ * source is left exactly where it is: this corrects boundaries this tool
+ * introduces, not content it did not write.
+ */
+function snapBeforeSurrogatePair(content: string, position: number): number {
+  if (position <= 0 || position >= content.length) {
+    return position;
+  }
+  const before = content.charCodeAt(position - 1);
+  const at = content.charCodeAt(position);
+  const splitsAPair = before >= 0xd800 && before <= 0xdbff && at >= 0xdc00 && at <= 0xdfff;
+  return splitsAPair ? position - 1 : position;
+}
+
 function describe(outcome: { exitCode: number; stdout: string; stderr: string }): ToolResult {
   const parts = [`exit code: ${outcome.exitCode}`];
   if (outcome.stdout !== '') {
@@ -86,6 +166,327 @@ function describe(outcome: { exitCode: number; stdout: string; stderr: string })
   // A non-zero exit is reported as an error result rather than thrown, because
   // it is information the model must act on, not a failure of the tool call.
   return { text: parts.join('\n'), isError: outcome.exitCode !== 0 };
+}
+
+/** How many entries a page returns when the model does not specify `limit`. */
+const defaultEntryPageSize = 200;
+
+/**
+ * Turns a full, already-ordered list of entries into one bounded page: the
+ * `offset`/`limit` window, shrunk — by dropping whole trailing entries, never
+ * by slicing into one — so the rendered result fits `toolOutputMaxChars`.
+ *
+ * This mirrors ranged `read_file`'s truthful-metadata contract (the range
+ * reported is always the range actually delivered), adapted to whole entries
+ * rather than character positions. Because a page only ever loses whole
+ * entries, never part of one, nothing here can cut a result mid-character —
+ * there is no surrogate-pair boundary to reuse `snapBeforeSurrogatePair` for,
+ * unlike read_file's own character-offset slicing.
+ *
+ * `offset === total` is a legitimate empty final page (the caller reached the
+ * end). `offset < total` but not even one entry fitting is not: that would
+ * silently claim nothing was available when something was, so it fails
+ * explicitly instead.
+ */
+function paginateEntries<T>(input: {
+  readonly entries: readonly T[];
+  readonly offset: number;
+  readonly limit: number;
+  readonly maxChars: number;
+  /** Plural, used only in messages: "entries" or "matches". */
+  readonly noun: string;
+  readonly render: (page: readonly T[], start: number, end: number, total: number) => string;
+}): ToolResult {
+  const total = input.entries.length;
+  if (input.offset > total) {
+    return {
+      text: `"offset" (${input.offset}) is beyond the end: there are ${total} ${input.noun}.`,
+      isError: true,
+    };
+  }
+  if (input.offset === total) {
+    return { text: input.render([], input.offset, input.offset, total), isError: false };
+  }
+
+  let end = Math.min(input.offset + input.limit, total);
+  let rendered = input.render(input.entries.slice(input.offset, end), input.offset, end, total);
+  // Each iteration drops at least one entry and never more than are left, so
+  // `end` strictly decreases and is bounded below by `offset + 1` — this
+  // always terminates. The drop size is only an estimate (rendered size
+  // divided across the page); a wrong estimate costs another iteration, never
+  // correctness, since the loop re-renders and re-checks exactly every time.
+  while (rendered.length > input.maxChars && end > input.offset + 1) {
+    const overshoot = rendered.length - input.maxChars;
+    const pageCount = end - input.offset;
+    const perEntry = rendered.length / pageCount;
+    const drop = Math.max(1, Math.min(pageCount - 1, Math.ceil(overshoot / perEntry)));
+    end -= drop;
+    rendered = input.render(input.entries.slice(input.offset, end), input.offset, end, total);
+  }
+  if (rendered.length > input.maxChars) {
+    return {
+      text:
+        `Not even one of the ${total} available ${input.noun} fits in the tool output budget ` +
+        'for this page.',
+      isError: true,
+    };
+  }
+  return { text: rendered, isError: false };
+}
+
+/**
+ * Lists the files eligible for navigation and search in the CURRENT working
+ * tree: tracked files plus untracked files not excluded by `.gitignore`, when
+ * the current directory is inside a Git working tree — so a file `write_file`
+ * or `edit_file` created earlier in this same turn is included immediately,
+ * before it is ever staged or committed. Outside a Git working tree there is
+ * no tracked/ignored distinction to make, so every regular file is eligible;
+ * `git.persistence` is an entitlement, not a runtime guarantee, and
+ * `ProjectPersistence.restore` only runs `git init` when it is granted, so a
+ * plain (non-Git) working tree is a real, reachable state, not a defensive
+ * assumption — `list_files` already branched on exactly this before this
+ * change, for the same reason.
+ *
+ * A symlink is never eligible, in either branch: excluded once here, at the
+ * one place both tools build their file set, rather than trusted to a lexical
+ * path check that cannot see where a link actually points. `list_files` could
+ * safely show a symlink's path alone, but this list also feeds
+ * `search_files`, which reads content — so the exclusion lives where both
+ * can rely on it.
+ *
+ * `LOTUSBUILD_PATHSPEC`, when set, restricts a Git working tree to that
+ * pathspec. A pathspec has no equivalent outside Git, so a request for one
+ * there is refused explicitly (`LOTUSBUILD_ERROR=glob-requires-git`) rather
+ * than silently reinterpreted under different matching semantics.
+ *
+ * Everything is NUL-separated, including through the intermediate file: a
+ * shell variable cannot hold a NUL byte, so nothing here ever assigns this
+ * output to one — `git ls-files`/`find`'s own output is written straight to a
+ * file and read back from it, never captured with `$(...)`.
+ */
+const eligibleFilesFunction = [
+  'lotusbuild_eligible_files() {',
+  '  is_git=0',
+  '  git rev-parse --git-dir >/dev/null 2>&1 && is_git=1',
+  '  if [ "$is_git" = 0 ] && [ -n "${LOTUSBUILD_PATHSPEC:-}" ]; then',
+  '    echo LOTUSBUILD_ERROR=glob-requires-git',
+  '    return 1',
+  '  fi',
+  '  raw=$(mktemp)',
+  '  if [ "$is_git" = 1 ]; then',
+  '    if [ -n "${LOTUSBUILD_PATHSPEC:-}" ]; then',
+  '      git ls-files -z --cached --others --exclude-standard -- "$LOTUSBUILD_PATHSPEC" > "$raw"',
+  '    else',
+  '      git ls-files -z --cached --others --exclude-standard > "$raw"',
+  '    fi',
+  '  else',
+  '    find . -mindepth 1 -not -path "./.git" -not -path "./.git/*" -type f -print0 > "$raw"',
+  '  fi',
+  '  status=$?',
+  '  if [ "$status" != 0 ]; then',
+  '    rm -f "$raw"',
+  '    echo "LOTUSBUILD_ERROR=file-listing-failed exit=$status"',
+  '    return 1',
+  '  fi',
+  '  while IFS= read -r -d \'\' entry; do',
+  '    path=${entry#./}',
+  '    if [ ! -L "$path" ] && [ -f "$path" ]; then',
+  "      printf '%s\\0' \"$path\"",
+  '    fi',
+  '  done < "$raw" | sort -z',
+  '  rm -f "$raw"',
+  '}',
+].join('\n');
+
+/**
+ * Lists the eligible files, bounded and reported: `$LOTUSBUILD_SCOPE_PATH` is
+ * `cd`'d into first, exactly like the original `list_files`, so both a
+ * directory scope and Git's own cwd-relative path reporting fall out of one
+ * mechanism rather than two. A unique temp file (`mktemp`, not a fixed name)
+ * holds the listing before it is streamed back, because this tool is
+ * parallel-safe and a fixed path would race a concurrent call to itself.
+ *
+ * `LC_ALL=C` makes `sort` order strictly by byte value, independent of
+ * whatever locale the sandbox happens to be configured with — the same
+ * ordering everywhere, rather than one that could vary by deployment.
+ */
+const listFilesScript = [
+  'set -eu',
+  'export LC_ALL=C',
+  'cd "$LOTUSBUILD_SCOPE_PATH"',
+  eligibleFilesFunction,
+  'tmpfile=$(mktemp)',
+  'if ! lotusbuild_eligible_files > "$tmpfile"; then',
+  '  cat "$tmpfile"',
+  '  rm -f "$tmpfile"',
+  '  exit 1',
+  'fi',
+  'cat "$tmpfile"',
+  'rm -f "$tmpfile"',
+].join('\n');
+
+/** How many files one grep invocation searches — comfortably under any realistic ARG_MAX. */
+const searchBatchSize = 200;
+
+/**
+ * Searches one batch of files for literal text. `$@` is the batch.
+ *
+ * `grep --null -H -n -F -I`: `-F` is fixed-string matching, never a regex;
+ * `-H`/`-n` guarantee the filename and line number are always present, even
+ * for one file; `--null` puts a NUL (not `:`) right after the filename, so a
+ * match parses back into (path, line, content) unambiguously even when a
+ * path or a matched line itself contains a colon. `-I` makes a binary file
+ * behave as though it were searched and had no matching data — no output
+ * line for it at all, confirmed empirically — which is deterministic and
+ * needs no parsing of a human-readable diagnostic, unlike grep's default
+ * "Binary file ... matches" text.
+ *
+ * grep's own exit convention is used directly, never translated: 0 means it
+ * matched something in this batch, 1 means it searched successfully and
+ * matched nothing, and anything else is the search itself failing (a file
+ * that could not be opened, for instance). This turns that into a plain
+ * success/failure return — 0 or 1 is fine, anything else is not — which is
+ * what the caller uses to decide whether the whole search may be trusted.
+ */
+const searchBatchFunction = [
+  'lotusbuild_search_batch() {',
+  '  if [ "$#" -eq 0 ]; then',
+  '    return 0',
+  '  fi',
+  '  status=0',
+  '  grep --null -H -n -F -I -- "$LOTUSBUILD_QUERY" "$@" || status=$?',
+  '  [ "$status" -le 1 ]',
+  '}',
+].join('\n');
+
+/**
+ * Searches every file named in the NUL-delimited list at path `$1`, in
+ * batches of `searchBatchSize` so no single grep invocation risks the
+ * platform's ARG_MAX regardless of how many files are eligible.
+ *
+ * Deliberately not `xargs`: GNU xargs remaps any exit status 1-125 from the
+ * command it runs to 123 (confirmed empirically), which destroys exactly the
+ * "no match" (1) versus "search failed" (>1) distinction grep otherwise
+ * gives for free. A plain loop building explicit argument batches keeps
+ * grep's real exit code reachable, at the cost of writing the batching by
+ * hand — the smaller, more deterministic mechanism the failure demanded.
+ *
+ * Returns immediately, without starting another batch, the moment one fails
+ * — there is no reason to keep searching once the answer is already "this
+ * failed". A batch that both matched something and then hit a failure later
+ * in the same grep call (one call can do both, across its files) still fails
+ * the whole search: the caller only trusts this function's stdout when it
+ * returns success, so a failed batch's partial stdout is simply never read.
+ */
+const searchOverFilesFunction = [
+  'lotusbuild_search_over_files() {',
+  // $1 is this function's own argument (the file-list path) and must be
+  // saved before "set --" below, which — clearing positional parameters to
+  // start accumulating a batch in them — would otherwise wipe it out first.
+  '  files_list=$1',
+  '  set --',
+  '  batch_count=0',
+  '  while IFS= read -r -d "" entry; do',
+  '    set -- "$@" "$entry"',
+  '    batch_count=$((batch_count + 1))',
+  `    if [ "$batch_count" -ge ${searchBatchSize} ]; then`,
+  '      lotusbuild_search_batch "$@" || return 1',
+  '      set --',
+  '      batch_count=0',
+  '    fi',
+  '  done < "$files_list"',
+  '  lotusbuild_search_batch "$@"',
+  '}',
+].join('\n');
+
+/**
+ * Runs `lotusbuild_search_over_files` against a file list given as `$1`,
+ * standalone — exported so the failure-propagation behaviour above can be
+ * proven directly against a hand-built file list, independent of how (or
+ * whether) `search_files` itself would ever produce one that fails. `$1`
+ * arrives as a script argument, not an env var: `bash -c script _ path`.
+ */
+export const searchOverFilesScript = [
+  'set -eu',
+  'export LC_ALL=C',
+  searchBatchFunction,
+  searchOverFilesFunction,
+  'lotusbuild_search_over_files "$1"',
+].join('\n');
+
+/**
+ * Searches the eligible file set for literal text.
+ *
+ * Two markers on stdout are what let the caller distinguish three outcomes
+ * without guessing from an exit code: `LOTUSBUILD_ERROR=...` (from
+ * `lotusbuild_eligible_files`, e.g. glob requested outside Git) means the
+ * listing itself never got to run a search; `LOTUSBUILD_SEARCH_FAILED` means
+ * listing succeeded but the search itself did not — `search_over_files`
+ * above returned failure — and the diagnostic that follows is grep's own
+ * stderr; `LOTUSBUILD_MATCHES_START` means the search genuinely completed,
+ * and everything after it is real output, possibly empty. Zero matches and
+ * zero eligible files both take the success path with nothing captured —
+ * neither is a failure.
+ */
+const searchFilesScript = [
+  'set -eu',
+  // Confirmed empirically: under a UTF-8 locale, `grep -F` can fail to match
+  // a literal multi-byte sequence — including plain ASCII characters that
+  // are byte-identical between query and file — that it matches correctly
+  // under `C`. Forcing `LC_ALL=C` makes the match purely byte-for-byte,
+  // which is what "exact, literal text" is supposed to mean here regardless
+  // of the sandbox's own locale configuration.
+  'export LC_ALL=C',
+  'cd "$LOTUSBUILD_SCOPE_PATH"',
+  eligibleFilesFunction,
+  searchBatchFunction,
+  searchOverFilesFunction,
+  'tmpfile=$(mktemp)',
+  'if ! lotusbuild_eligible_files > "$tmpfile"; then',
+  '  cat "$tmpfile"',
+  '  rm -f "$tmpfile"',
+  '  exit 1',
+  'fi',
+  'if [ ! -s "$tmpfile" ]; then',
+  '  echo LOTUSBUILD_MATCHES_START',
+  '  rm -f "$tmpfile"',
+  '  exit 0',
+  'fi',
+  'if lotusbuild_search_over_files "$tmpfile" > "$tmpfile.out" 2> "$tmpfile.err"; then',
+  '  echo LOTUSBUILD_MATCHES_START',
+  '  cat "$tmpfile.out"',
+  '  rm -f "$tmpfile" "$tmpfile.out" "$tmpfile.err"',
+  'else',
+  '  echo LOTUSBUILD_SEARCH_FAILED',
+  '  cat "$tmpfile.err"',
+  '  rm -f "$tmpfile" "$tmpfile.out" "$tmpfile.err"',
+  '  exit 1',
+  'fi',
+].join('\n');
+
+interface SearchMatch {
+  readonly path: string;
+  readonly line: number;
+  readonly content: string;
+}
+
+/** Parses one line of `grep --null -H -n -I` output. `undefined` only for a stray blank line. */
+function parseMatchLine(raw: string): SearchMatch | undefined {
+  const nul = raw.indexOf('\u0000');
+  if (nul === -1) {
+    return undefined;
+  }
+  const path = raw.slice(0, nul);
+  const rest = raw.slice(nul + 1);
+  const colon = rest.indexOf(':');
+  if (colon === -1) {
+    return undefined;
+  }
+  const line = Number(rest.slice(0, colon));
+  if (!Number.isInteger(line)) {
+    return undefined;
+  }
+  return { path, line, content: rest.slice(colon + 1) };
 }
 
 /**
@@ -148,58 +549,411 @@ const definitions: readonly ToolDefinition[] = [
   },
   {
     spec: {
-      name: 'read_file',
+      name: 'edit_file',
       description:
-        'Read a file from the project directory. Paths are relative to the project directory.',
+        'Replace one exact occurrence of text in an existing file. "old_string" must match the ' +
+        "current file's content exactly, character for character, and occur exactly once — the " +
+        'call fails if it occurs zero times or more than once, and never guesses which occurrence ' +
+        'you meant or repairs whitespace to make it match. If it fails, read the file again and ' +
+        'give a longer, more specific old_string (more surrounding lines) rather than retrying the ' +
+        'same input. "new_string" may be empty to delete old_string. Prefer this over write_file ' +
+        'for changes to part of an existing file: it costs far less than resending the whole file ' +
+        'and cannot disturb content you did not intend to touch.',
       input_schema: {
         type: 'object',
-        required: ['path'],
+        required: ['path', 'old_string', 'new_string'],
         properties: {
           path: { type: 'string', description: 'Path relative to the project directory.' },
+          old_string: {
+            type: 'string',
+            description: 'Exact text to replace. Must occur exactly once in the current file.',
+          },
+          new_string: {
+            type: 'string',
+            description: 'Replacement text. An empty string deletes old_string.',
+          },
         },
       },
     },
     async run(input, context) {
       const path = resolveInWorkdir(context.provider, requireString(input, 'path'));
-      return { text: await context.sandbox.readFile(path), isError: false };
+      const oldString = requireString(input, 'old_string');
+      const newStringRaw = input['new_string'];
+      if (typeof newStringRaw !== 'string') {
+        throw new Error('"new_string" must be a string.');
+      }
+      const newString = newStringRaw;
+
+      // Read fresh at execution time rather than trusting anything the model
+      // saw earlier: if the file changed since its last read, old_string is
+      // matched against what the file actually contains now. A match that no
+      // longer holds fails exactly like a match that never held — there is no
+      // separate staleness check to write, because there is nothing cached to
+      // go stale.
+      const content = await context.sandbox.readFile(path);
+      // Every starting position old_string could match, not just a
+      // non-overlapping tiling of them: "aaa" in "aaaa" matches at both index
+      // 0 and index 1, and replacing one or the other produces a different
+      // file, so both count toward ambiguity. Advancing the search by one
+      // position after each hit (rather than by old_string's length) is what
+      // finds the overlapping candidate as well as the tiled one.
+      const matches: number[] = [];
+      for (let from = 0; ; from += 1) {
+        const at = content.indexOf(oldString, from);
+        if (at === -1) {
+          break;
+        }
+        matches.push(at);
+        from = at;
+      }
+
+      if (matches.length === 0) {
+        return { text: `edit_file failed:\nold_string was not found in ${path}`, isError: true };
+      }
+      if (matches.length > 1) {
+        return {
+          text:
+            `edit_file failed:\nold_string matched ${matches.length} locations in ${path}. ` +
+            'Provide a more specific old_string.',
+          isError: true,
+        };
+      }
+
+      const [at] = matches;
+      if (at === undefined) {
+        // Unreachable: matches.length === 1 was just checked.
+        throw new Error('edit_file: the single match could not be read back.');
+      }
+      const startLine = content.slice(0, at).split('\n').length;
+      const endLine = startLine + oldString.split('\n').length - 1;
+      const updated = content.slice(0, at) + newString + content.slice(at + oldString.length);
+      await context.sandbox.writeFile(path, updated);
+
+      const where = endLine === startLine ? `line ${startLine}` : `lines ${startLine}-${endLine}`;
+      return { text: `Replaced 1 occurrence in ${path} (${where}).`, isError: false };
     },
   },
   {
     spec: {
+      name: 'read_file',
+      description:
+        'Read a file from the project directory. Paths are relative to the project directory. ' +
+        'The result reports the range actually returned (start, end, total, has_more), in UTF-16 ' +
+        'code units — JavaScript string length units, where plain ASCII text is one per character ' +
+        'but an emoji or other character outside the Basic Multilingual Plane is two — so you can ' +
+        'page through a file larger than one read: pass the previous result\'s "end" as the next ' +
+        '"offset" and repeat until has_more is false. Omit "offset" to start at the beginning; ' +
+        'omit "limit" to use the standard read window. There is no separate maximum on "limit" — ' +
+        'the amount actually returned is always capped to what one tool result can carry, and the ' +
+        'reported range always matches what you actually received. A boundary is never placed in ' +
+        'the middle of a two-unit character: if that would happen, the actual range is shifted by ' +
+        'one unit and reported as it truly is.',
+      input_schema: {
+        type: 'object',
+        required: ['path'],
+        properties: {
+          path: { type: 'string', description: 'Path relative to the project directory.' },
+          offset: {
+            type: 'number',
+            description: 'UTF-16 code unit offset to start reading from. Omit to start at 0.',
+          },
+          limit: {
+            type: 'number',
+            description:
+              'Maximum UTF-16 code units to read from offset. Omit to use the standard window.',
+          },
+        },
+      },
+    },
+    async run(input, context) {
+      const path = resolveInWorkdir(context.provider, requireString(input, 'path'));
+      const requestedOffset = optionalNonNegativeInteger(input, 'offset') ?? 0;
+      // The standard window is the tool-output budget itself: a deliberate
+      // default derived from AGENT_TOOL_OUTPUT_MAX_CHARS, not an arbitrary
+      // constant of its own, and it is what the shrink loop below would end up
+      // enforcing regardless of what was asked for.
+      const limit = optionalPositiveInteger(input, 'limit') ?? context.toolOutputMaxChars;
+
+      const content = await context.sandbox.readFile(path);
+      const total = content.length;
+      if (requestedOffset > total) {
+        return {
+          text:
+            `"offset" (${requestedOffset}) is beyond the end of ${path}, which has ${total} ` +
+            `UTF-16 code units. The largest valid offset is ${total}.`,
+          isError: true,
+        };
+      }
+      // An explicit offset the model chose, rather than one this tool handed
+      // back from a previous read, could land inside a surrogate pair; a
+      // previous `end` never does, because every `end` below is snapped the
+      // same way before it is returned.
+      const offset = snapBeforeSurrogatePair(content, requestedOffset);
+
+      let end = snapBeforeSurrogatePair(content, Math.min(offset + limit, total));
+      let rendered = renderFileRange(path, offset, end, total, content.slice(offset, end));
+      // The generic tool-output truncation in the outer loop would otherwise
+      // cut this reply after it has already claimed a larger range as
+      // delivered. Shrinking the range here, before returning, is what keeps
+      // "end" truthful: whatever this says was returned is what the model
+      // actually receives, never more. Each iteration reduces `end` by at
+      // least the current overshoot before the surrogate snap (which only
+      // ever moves it one further back), so this always terminates.
+      while (rendered.length > context.toolOutputMaxChars && end > offset) {
+        const overshoot = rendered.length - context.toolOutputMaxChars;
+        end = snapBeforeSurrogatePair(content, Math.max(offset, end - overshoot));
+        rendered = renderFileRange(path, offset, end, total, content.slice(offset, end));
+      }
+      if (rendered.length > context.toolOutputMaxChars) {
+        // Only reachable if even an empty range plus this path's own name
+        // cannot fit the configured budget — a configuration problem, not a
+        // normal read, so it is reported rather than silently returned oversize.
+        return {
+          text: `${path} could not be read: even an empty range does not fit in the tool output budget.`,
+          isError: true,
+        };
+      }
+      return { text: rendered, isError: false };
+    },
+  },
+  {
+    // Read-only and side-effect-free: it only ever inspects the sandbox's
+    // current files, so it is safe to run concurrently with itself and with
+    // any other read-only tool.
+    parallelSafe: true,
+    spec: {
       name: 'list_files',
       description:
-        'List the files tracked in the project, optionally under one directory. Use this to ' +
-        'find your way around before reading anything.',
+        'List the files eligible for navigation under the project directory, or one directory ' +
+        'within it: every Git-tracked file plus every untracked file not excluded by ' +
+        '.gitignore, when the project is a Git working tree — including a file you just wrote ' +
+        'or edited earlier in this turn, before it is ever staged. Outside a Git working tree, ' +
+        'every regular file is listed, since there is no tracked/ignored distinction to make. ' +
+        'Symlinks and .git internals are never listed. Results are ordered by path and ' +
+        'paginated: the response reports the range actually returned (start, end, total, ' +
+        'has_more) — pass the previous result\'s "end" as the next "offset" to continue.',
       input_schema: {
         type: 'object',
         required: [],
         properties: {
           path: {
             type: 'string',
-            description: 'Directory relative to the project directory. Omit for the whole tree.',
+            description: 'Directory relative to the project directory to scope to. Omit for the whole project.',
+          },
+          glob: {
+            type: 'string',
+            description:
+              'Restrict results to a Git pathspec (e.g. "*.ts", "src/**/*.tsx"). Only accepted ' +
+              'when the project is a Git working tree.',
+          },
+          offset: {
+            type: 'number',
+            description: 'Entry offset to start listing from. Omit to start at 0.',
+          },
+          limit: {
+            type: 'number',
+            description: 'Maximum entries to return. Omit to use the standard page size.',
           },
         },
       },
     },
     async run(input, context) {
-      const requested = input['path'];
-      if (requested !== undefined && typeof requested !== 'string') {
+      const requestedPath = input['path'];
+      if (requestedPath !== undefined && typeof requestedPath !== 'string') {
         throw new Error('"path" must be a string when given.');
       }
-      const path = resolveInWorkdir(context.provider, requested ?? '.');
-      // The command is fixed and the path travels as an environment variable, so
-      // a directory name is never spliced into something a shell parses. This is
-      // the read-only agents' only way to see the tree, and it must stay one.
-      const outcome = await context.sandbox.runCommand(
-        'set -eu\ncd "$LOTUSBUILD_LIST_PATH"\n' +
-          'if git rev-parse --git-dir >/dev/null 2>&1; then git ls-files; else ls -1A; fi\n',
-        {
-          cwd: context.provider.workdir,
-          timeoutMs: context.commandTimeoutMs,
-          envs: { LOTUSBUILD_LIST_PATH: path },
+      const scopePath = resolveInWorkdir(context.provider, requestedPath ?? '.');
+
+      const rawGlob = input['glob'];
+      if (rawGlob !== undefined && (typeof rawGlob !== 'string' || rawGlob === '')) {
+        throw new Error('"glob" must be a non-empty string when given.');
+      }
+
+      const offset = optionalNonNegativeInteger(input, 'offset') ?? 0;
+      const limit = optionalPositiveInteger(input, 'limit') ?? defaultEntryPageSize;
+
+      const outcome = await context.sandbox.runCommand(listFilesScript, {
+        cwd: context.provider.workdir,
+        timeoutMs: context.commandTimeoutMs,
+        envs: { LOTUSBUILD_SCOPE_PATH: scopePath, LOTUSBUILD_PATHSPEC: rawGlob ?? '' },
+      });
+
+      if (outcome.exitCode !== 0) {
+        if (outcome.stdout.includes('LOTUSBUILD_ERROR=glob-requires-git')) {
+          return {
+            text: '"glob" requires the project to be a Git working tree, which it is not right now.',
+            isError: true,
+          };
+        }
+        return describe(outcome);
+      }
+
+      const entries = outcome.stdout.split('\u0000').filter((entry) => entry !== '');
+      return paginateEntries({
+        entries,
+        offset,
+        limit,
+        maxChars: context.toolOutputMaxChars,
+        noun: 'entries',
+        render: (page, start, end, total) => {
+          const hasMore = end < total;
+          return [
+            `${scopePath}: entries ${start}-${end} of ${total} (has_more: ${hasMore})`,
+            '---',
+            ...page,
+          ].join('\n');
         },
-      );
-      return describe(outcome);
+      });
+    },
+  },
+  {
+    parallelSafe: true,
+    spec: {
+      name: 'search_files',
+      description:
+        'Search file contents for exact, literal text — not a regular expression — across every ' +
+        'file list_files would list: Git-tracked files, plus untracked non-ignored files when ' +
+        'the project is a Git working tree, or every regular file otherwise. Case-sensitive, ' +
+        'single-line: "query" must not contain a line break, since a literal search cannot ' +
+        'truthfully represent one — search once per line instead. Binary files and symlinks are ' +
+        'skipped, never their content. Each result is one matching line: file path, 1-based line ' +
+        'number, and the line\'s content, exactly as it currently stands in the working tree — ' +
+        'including an unstaged edit to a tracked file. A search that ran successfully and found ' +
+        'nothing reports zero matches; if the search itself could not be completed, the call ' +
+        'fails explicitly instead — zero matches is never used to mean "the search did not run". ' +
+        'Results are ordered by file path, then by line, and paginated by match: the response ' +
+        'reports the range actually returned (start, end, total, has_more) — pass the previous ' +
+        'result\'s "end" as the next "offset" to continue. Use ranged read_file afterward to see ' +
+        'more context around a match.',
+      input_schema: {
+        type: 'object',
+        required: ['query'],
+        properties: {
+          query: {
+            type: 'string',
+            description:
+              'Exact, literal text to search for, on a single line — no \\n, \\r, or NUL.',
+          },
+          path: {
+            type: 'string',
+            description: 'Directory relative to the project directory to scope to. Omit for the whole project.',
+          },
+          glob: {
+            type: 'string',
+            description:
+              'Restrict the search to a Git pathspec (e.g. "*.ts"). Only accepted when the ' +
+              'project is a Git working tree.',
+          },
+          offset: {
+            type: 'number',
+            description: 'Match offset to start returning results from. Omit to start at 0.',
+          },
+          limit: {
+            type: 'number',
+            description: 'Maximum matches to return. Omit to use the standard page size.',
+          },
+        },
+      },
+    },
+    async run(input, context) {
+      const query = requireString(input, 'query');
+      // A pattern spanning more than one line is not "exact, literal text"
+      // for a line-oriented search: grep treats each line of a multi-line
+      // -F pattern as a separate alternative to match against (confirmed
+      // empirically), so "foo\nbar" would silently become "lines containing
+      // foo OR bar" rather than the two-line sequence it looks like. Refused
+      // rather than reinterpreted.
+      if (query.includes('\n') || query.includes('\r')) {
+        throw new Error(
+          '"query" must be a single line. Line breaks are not supported: search once per line, ' +
+            'or use ranged read_file to inspect the surrounding text directly.',
+        );
+      }
+      // Environment variable values cannot contain a NUL byte at the OS
+      // level — Node's own child-process layer refuses one outright
+      // (confirmed empirically) — so this is refused here, explicitly and
+      // with a clear reason, rather than left to fail unpredictably however
+      // the sandbox's own transport happens to handle it.
+      if (query.includes('\u0000')) {
+        throw new Error('"query" must not contain a NUL character.');
+      }
+
+      const requestedPath = input['path'];
+      if (requestedPath !== undefined && typeof requestedPath !== 'string') {
+        throw new Error('"path" must be a string when given.');
+      }
+      const scopePath = resolveInWorkdir(context.provider, requestedPath ?? '.');
+
+      const rawGlob = input['glob'];
+      if (rawGlob !== undefined && (typeof rawGlob !== 'string' || rawGlob === '')) {
+        throw new Error('"glob" must be a non-empty string when given.');
+      }
+
+      const offset = optionalNonNegativeInteger(input, 'offset') ?? 0;
+      const limit = optionalPositiveInteger(input, 'limit') ?? defaultEntryPageSize;
+
+      const outcome = await context.sandbox.runCommand(searchFilesScript, {
+        cwd: context.provider.workdir,
+        timeoutMs: context.commandTimeoutMs,
+        envs: {
+          LOTUSBUILD_SCOPE_PATH: scopePath,
+          LOTUSBUILD_PATHSPEC: rawGlob ?? '',
+          LOTUSBUILD_QUERY: query,
+        },
+      });
+
+      if (outcome.stdout.includes('LOTUSBUILD_ERROR=glob-requires-git')) {
+        return {
+          text: '"glob" requires the project to be a Git working tree, which it is not right now.',
+          isError: true,
+        };
+      }
+
+      const failedMarker = 'LOTUSBUILD_SEARCH_FAILED\n';
+      const failedAt = outcome.stdout.indexOf(failedMarker);
+      if (failedAt !== -1) {
+        // Listing succeeded, but the search over those files did not — never
+        // reported as zero matches, which would tell the model source text
+        // is absent when the truth is that it was never actually searched.
+        const diagnostic = outcome.stdout.slice(failedAt + failedMarker.length).trim();
+        return {
+          text:
+            'search_files could not complete: the search itself failed partway through, so its ' +
+            `result cannot be trusted as "no matches".\n${diagnostic === '' ? outcome.stderr : diagnostic}`,
+          isError: true,
+        };
+      }
+
+      const marker = 'LOTUSBUILD_MATCHES_START\n';
+      const markerAt = outcome.stdout.indexOf(marker);
+      if (outcome.exitCode !== 0 || markerAt === -1) {
+        return describe(outcome);
+      }
+
+      const matches: SearchMatch[] = [];
+      for (const raw of outcome.stdout.slice(markerAt + marker.length).split('\n')) {
+        const match = parseMatchLine(raw);
+        if (match !== undefined) {
+          matches.push(match);
+        }
+      }
+
+      return paginateEntries({
+        entries: matches,
+        offset,
+        limit,
+        maxChars: context.toolOutputMaxChars,
+        noun: 'matches',
+        render: (page, start, end, total) => {
+          const hasMore = end < total;
+          const lines = page.map((match) => `${match.path}:${match.line}: ${match.content}`);
+          return [
+            `"${query}": matches ${start}-${end} of ${total} (has_more: ${hasMore})`,
+            '---',
+            ...lines,
+          ].join('\n');
+        },
+      });
     },
   },
   {
@@ -270,8 +1024,10 @@ function setOf(names: readonly string[]): ToolSet {
 export const workspaceTools: ToolSet = setOf([
   'run_command',
   'write_file',
+  'edit_file',
   'read_file',
   'list_files',
+  'search_files',
   'start_preview',
 ]);
 
@@ -282,7 +1038,7 @@ export const workspaceTools: ToolSet = setOf([
  * `npm install`, `git checkout` all go through it — so granting it to a
  * read-only role would make the role read-only in name only.
  */
-export const readOnlyTools: ToolSet = setOf(['read_file', 'list_files']);
+export const readOnlyTools: ToolSet = setOf(['read_file', 'list_files', 'search_files']);
 
 export function specsOf(tools: ToolSet): readonly Tool[] {
   return [...tools.values()].map((definition) => definition.spec);
@@ -314,62 +1070,116 @@ export async function runTool(
   }
 }
 
+// The whole point of a throwaway index is that `git add -A` never touches the
+// authoritative `.git/index`. `GIT_INDEX_FILE` seeds it from a copy of the real
+// index so staged state is the base, then adds everything on disk on top — the
+// result is a tree of the complete working state, computed without disturbing
+// anything. The same recipe serves the checkpoint, the mutation probe, and
+// verification; it is a shell function so the fixed temp path lives in one
+// place.
+const workingTreeProbe = [
+  'lotusbuild_working_tree() {',
+  '  rm -f /tmp/lotusbuild-val-probe',
+  '  [ -f .git/index ] && cp -p .git/index /tmp/lotusbuild-val-probe',
+  '  GIT_INDEX_FILE=/tmp/lotusbuild-val-probe git add -A',
+  '  GIT_INDEX_FILE=/tmp/lotusbuild-val-probe git write-tree',
+  '  rm -f /tmp/lotusbuild-val-probe',
+  '}',
+].join('\n');
+
 /**
- * Captures the whole working tree — tracked changes, staged state, untracked
- * files and deletions — as one git tree object, without disturbing the tree.
+ * Captures three independent facts about the pre-validation repository, without
+ * mutating any of them: the index tree (staged state), the full working tree
+ * (staged + unstaged + untracked + deletions), and HEAD — its commit and, if
+ * attached, its branch ref.
  *
- * `git add -A` followed by `write-tree` records everything currently on disk;
- * the index is saved and put back around it, so the working tree and the
- * staged/unstaged distinction the primary agent set up are untouched. The tree
- * id it prints is the exact state validation must be returned to. The marker on
- * line one lets nothing but this tool be mistaken for it.
+ * File content alone is not the state to protect. `git status` is a function of
+ * HEAD, the index, and the working tree, so restoring content without the index
+ * would silently turn unstaged into staged, and restoring the tree without HEAD
+ * would leave a validation `git commit` in place. All three are captured here
+ * as values that cross into the restore phase, so restoration reconstructs the
+ * repository from the checkpoint rather than from whatever validation leaves in
+ * `.git`. The marker on line one lets nothing else be mistaken for this.
  */
 export const validationCheckpointScript = [
   '# lotusbuild:validation-checkpoint',
   'set -eu',
-  'had_index=0; [ -f .git/index ] && had_index=1',
-  '[ "$had_index" = 1 ] && cp -p .git/index /tmp/lotusbuild-val-index',
-  'git add -A',
-  'tree=$(git write-tree)',
-  'if [ "$had_index" = 1 ]; then cp -p /tmp/lotusbuild-val-index .git/index; else rm -f .git/index; fi',
-  'printf "%s\\n" "$tree"',
+  workingTreeProbe,
+  'index_tree=$(git write-tree)',
+  'working_tree=$(lotusbuild_working_tree)',
+  // symbolic-ref fails on a detached HEAD, rev-parse fails on an unborn one;
+  // either empty is a real state to reproduce, not an error.
+  'head_ref=$(git symbolic-ref -q HEAD || true)',
+  'head_commit=$(git rev-parse -q --verify HEAD || true)',
+  'printf "index_tree=%s\\n" "$index_tree"',
+  'printf "working_tree=%s\\n" "$working_tree"',
+  'printf "head_ref=%s\\n" "$head_ref"',
+  'printf "head_commit=%s\\n" "$head_commit"',
 ].join('\n');
 
 /**
- * Detects whether validation changed the tree, restores it to the checkpoint
- * exactly, and verifies the result — all against `LOTUSBUILD_CHECKPOINT_TREE`.
+ * Returns the repository to the exact pre-validation HEAD, index and working
+ * tree, whatever validation did to them, and verifies all three independently.
  *
- * Restoration is `read-tree` + `checkout-index -f` + `clean -fd`, never
- * `reset --hard`: it rewrites every checkpoint file over whatever validation
- * left, and removes only files validation created (checkpoint untracked files
- * are in the index after read-tree, so `clean` keeps them). `-x` is omitted, so
- * gitignored build artefacts are left alone rather than deleting node_modules.
- * Mutation and verification are computed the same way the checkpoint was — a
- * full `add -A` tree — so both compare like with like. It prints mutated,
- * verified, and the changed paths; the original index is restored around each
- * probe so the staged state survives.
+ * Nothing here trusts the post-validation `.git`. The working tree is rebuilt
+ * from the checkpoint's WORKING_TREE (`read-tree` + `checkout-index -f`), then
+ * validation-created files are removed with `clean -fd` — never `-x`, so
+ * gitignored dependency and build directories are left alone rather than
+ * deleting `node_modules`. The index is then reset to the checkpoint's
+ * INDEX_TREE, reproducing every staged/unstaged distinction, because status is
+ * decided by index-vs-HEAD and index-vs-working, not by content. HEAD is put
+ * back last: an attached HEAD restores its branch ref to the original commit
+ * (or deletes it, if it was unborn) and re-attaches; a detached HEAD is written
+ * directly. `reset --hard` is never used — it would destroy the primary agent's
+ * uncommitted work. Verification recomputes all three via a throwaway index and
+ * fails closed on any mismatch.
  */
 export const validationRestoreScript = [
   '# lotusbuild:validation-restore',
   'set -eu',
-  'had_index=0; [ -f .git/index ] && had_index=1',
-  '[ "$had_index" = 1 ] && cp -p .git/index /tmp/lotusbuild-val-index',
-  'git add -A',
-  'after=$(git write-tree)',
-  'if [ "$after" = "$LOTUSBUILD_CHECKPOINT_TREE" ]; then mutated=0; changed=""; else',
+  workingTreeProbe,
+  // Post-validation state, for mutation reporting — captured before anything is
+  // put back. A HEAD that moved with no file change still counts as mutation.
+  'cur_index_tree=$(git write-tree)',
+  'cur_working_tree=$(lotusbuild_working_tree)',
+  'cur_head_ref=$(git symbolic-ref -q HEAD || true)',
+  'cur_head_commit=$(git rev-parse -q --verify HEAD || true)',
+  'mutated=0; changed=""',
+  'if [ "$cur_working_tree" != "$LOTUSBUILD_WORKING_TREE" ]; then',
   '  mutated=1',
-  '  changed=$(git diff --name-status "$LOTUSBUILD_CHECKPOINT_TREE" "$after" | head -n 50 || true)',
+  '  changed=$(git diff --name-status "$LOTUSBUILD_WORKING_TREE" "$cur_working_tree" | head -n 50 || true)',
   'fi',
-  'git read-tree "$LOTUSBUILD_CHECKPOINT_TREE"',
+  '[ "$cur_index_tree" != "$LOTUSBUILD_INDEX_TREE" ] && mutated=1 || true',
+  '[ "$cur_head_ref" != "$LOTUSBUILD_HEAD_REF" ] && mutated=1 || true',
+  '[ "$cur_head_commit" != "$LOTUSBUILD_HEAD_COMMIT" ] && mutated=1 || true',
+  // Working tree: content of the full checkpoint, minus validation's extras.
+  'git read-tree "$LOTUSBUILD_WORKING_TREE"',
   'git checkout-index -a -f',
   'git clean -fd -q',
-  'if [ "$had_index" = 1 ]; then cp -p /tmp/lotusbuild-val-index .git/index; else rm -f .git/index; fi',
-  'had_index2=0; [ -f .git/index ] && had_index2=1',
-  '[ "$had_index2" = 1 ] && cp -p .git/index /tmp/lotusbuild-val-verify',
-  'git add -A',
-  'verify=$(git write-tree)',
-  'if [ "$had_index2" = 1 ]; then cp -p /tmp/lotusbuild-val-verify .git/index; else rm -f .git/index; fi',
-  'verified=0; [ "$verify" = "$LOTUSBUILD_CHECKPOINT_TREE" ] && verified=1',
+  // Index: the original staged state, reconstructed from the checkpoint tree.
+  'git read-tree "$LOTUSBUILD_INDEX_TREE"',
+  // HEAD: branch identity and commit, or detached commit.
+  'if [ -n "$LOTUSBUILD_HEAD_REF" ]; then',
+  '  if [ -n "$LOTUSBUILD_HEAD_COMMIT" ]; then',
+  '    git update-ref "$LOTUSBUILD_HEAD_REF" "$LOTUSBUILD_HEAD_COMMIT"',
+  '  else',
+  '    git update-ref -d "$LOTUSBUILD_HEAD_REF" 2>/dev/null || true',
+  '  fi',
+  '  git symbolic-ref HEAD "$LOTUSBUILD_HEAD_REF"',
+  'elif [ -n "$LOTUSBUILD_HEAD_COMMIT" ]; then',
+  '  git update-ref --no-deref HEAD "$LOTUSBUILD_HEAD_COMMIT"',
+  'fi',
+  // Verify each axis independently, against the checkpoint, via a throwaway
+  // index so the probe never disturbs the index just reconstructed.
+  'v_index=$(git write-tree)',
+  'v_working=$(lotusbuild_working_tree)',
+  'v_head_ref=$(git symbolic-ref -q HEAD || true)',
+  'v_head_commit=$(git rev-parse -q --verify HEAD || true)',
+  'verified=1',
+  '[ "$v_index" = "$LOTUSBUILD_INDEX_TREE" ] || verified=0',
+  '[ "$v_working" = "$LOTUSBUILD_WORKING_TREE" ] || verified=0',
+  '[ "$v_head_ref" = "$LOTUSBUILD_HEAD_REF" ] || verified=0',
+  '[ "$v_head_commit" = "$LOTUSBUILD_HEAD_COMMIT" ] || verified=0',
   'printf "mutated=%s\\n" "$mutated"',
   'printf "verified=%s\\n" "$verified"',
   'printf "changed:\\n%s\\n" "$changed"',
@@ -382,6 +1192,46 @@ interface RestoreReport {
   readonly mutated: boolean;
   readonly verified: boolean;
   readonly changed: readonly string[];
+}
+
+interface Checkpoint {
+  readonly indexTree: string;
+  readonly workingTree: string;
+  /** Branch ref, e.g. "refs/heads/main". Empty when HEAD is detached. */
+  readonly headRef: string;
+  /** HEAD commit. Empty when HEAD is unborn (no commits yet). */
+  readonly headCommit: string;
+}
+
+/**
+ * Reads the checkpoint script's output. The two trees are required — without
+ * them there is nothing to restore to — while the HEAD fields are legitimately
+ * empty for a detached or unborn HEAD, so only their presence as lines is
+ * required, not their value.
+ */
+function parseCheckpoint(stdout: string): Checkpoint | undefined {
+  const fields = new Map<string, string>();
+  for (const line of stdout.split('\n')) {
+    const eq = line.indexOf('=');
+    if (eq > 0) {
+      fields.set(line.slice(0, eq), line.slice(eq + 1).trim());
+    }
+  }
+  const indexTree = fields.get('index_tree');
+  const workingTree = fields.get('working_tree');
+  const headRef = fields.get('head_ref');
+  const headCommit = fields.get('head_commit');
+  if (
+    indexTree === undefined ||
+    indexTree === '' ||
+    workingTree === undefined ||
+    workingTree === '' ||
+    headRef === undefined ||
+    headCommit === undefined
+  ) {
+    return undefined;
+  }
+  return { indexTree, workingTree, headRef, headCommit };
 }
 
 /** Reads the restore script's output. Missing either flag means it did not run. */
@@ -492,9 +1342,10 @@ export function makeRunValidation(guard: {
           ...(envs === undefined ? {} : { envs }),
         });
 
-      const checkpoint = await run(validationCheckpointScript);
-      const checkpointTree = checkpoint.stdout.trim().split('\n').pop() ?? '';
-      if (checkpoint.exitCode !== 0 || checkpointTree === '') {
+      const checkpointResult = await run(validationCheckpointScript);
+      const checkpoint =
+        checkpointResult.exitCode === 0 ? parseCheckpoint(checkpointResult.stdout) : undefined;
+      if (checkpoint === undefined) {
         return {
           text:
             'Validation could not checkpoint the workspace and was not run, so nothing was ' +
@@ -509,7 +1360,10 @@ export function makeRunValidation(guard: {
       const outcome = await run(command, {});
 
       const restore = await run(validationRestoreScript, {
-        LOTUSBUILD_CHECKPOINT_TREE: checkpointTree,
+        LOTUSBUILD_INDEX_TREE: checkpoint.indexTree,
+        LOTUSBUILD_WORKING_TREE: checkpoint.workingTree,
+        LOTUSBUILD_HEAD_REF: checkpoint.headRef,
+        LOTUSBUILD_HEAD_COMMIT: checkpoint.headCommit,
       });
       const report = parseRestoreReport(restore.stdout);
       if (restore.exitCode !== 0 || report === undefined) {
@@ -547,8 +1401,8 @@ export function makeRunValidation(guard: {
       if (report.mutated) {
         lines.push(
           '',
-          'Note: this validation modified the workspace. The changes were discarded and the ' +
-            'pre-validation project state was restored.',
+          'Note: this validation modified the project git state — its files, staged state or ' +
+            'HEAD. The changes were discarded and the pre-validation state was restored.',
           ...(report.changed.length === 0
             ? []
             : [`Changed: ${report.changed.slice(0, 20).join('; ')}`]),
