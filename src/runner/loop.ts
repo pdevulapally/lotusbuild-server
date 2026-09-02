@@ -4,12 +4,63 @@ import type { EntitlementService, UserEntitlements } from '../entitlements/servi
 import type { ConfigurationStore } from '../entitlements/store.ts';
 import { AppError } from '../http/errors.ts';
 import type { MeteringService } from '../metering/service.ts';
-import type { ProjectPersistence } from '../projects/persistence.ts';
+import type { ProjectPersistence, RestoreOutcome } from '../projects/persistence.ts';
 import type { Project, ProjectRepository } from '../projects/repository.ts';
 import type { AcquiredSandbox, SandboxService } from '../sandboxes/service.ts';
 import type { SessionEvents } from '../sessions/events.ts';
-import type { BuildSession, SessionRepository } from '../sessions/repository.ts';
-import { type AgentLimits, runAgentTurn } from './agent.ts';
+import type {
+  ClaimedSession,
+  SessionLease,
+  SessionRepository,
+} from '../sessions/repository.ts';
+import {
+  type AgentLimits,
+  type AgentRun,
+  type ProblemReporter,
+  blockerExplanation,
+  runAgentTurn,
+} from './agent.ts';
+
+/**
+ * Gives back specialist token holds a dead runner left open.
+ *
+ * `release` returns false for a hold that already reached a terminal outcome,
+ * which is exactly the case a successor cannot distinguish on its own — so
+ * running this against an already-settled hold is a no-op rather than a second
+ * accounting event. A hold is only forgotten once it is reconciled: one that
+ * cannot be released stays recorded, because a ledger that disagrees with
+ * itself is something to look at, not something to quietly drop.
+ */
+export async function reconcileSpecialistReservations(input: {
+  readonly uid: string;
+  readonly reservationIds: readonly string[];
+  readonly release: (uid: string, reservationId: string, now: Date) => Promise<boolean>;
+  readonly forget: (reservationId: string) => Promise<void>;
+  readonly onProblem: ProblemReporter;
+  readonly now: Date;
+}): Promise<void> {
+  for (const reservationId of input.reservationIds) {
+    try {
+      await input.release(input.uid, reservationId, input.now);
+    } catch (cause) {
+      input.onProblem(
+        cause instanceof Error ? cause : new Error(String(cause)),
+        `releasing abandoned specialist reservation ${reservationId}`,
+      );
+      continue;
+    }
+    try {
+      await input.forget(reservationId);
+    } catch (cause) {
+      // Reconciled but still listed. Harmless: the next attempt releases a
+      // closed hold, which does nothing.
+      input.onProblem(
+        cause instanceof Error ? cause : new Error(String(cause)),
+        `clearing reconciled specialist reservation ${reservationId}`,
+      );
+    }
+  }
+}
 
 export interface RunnerLogger {
   info(details: object, message: string): void;
@@ -59,16 +110,30 @@ export class SessionRunner {
     return true;
   }
 
-  async #work(session: BuildSession): Promise<void> {
+  async #work(session: ClaimedSession): Promise<void> {
     const { sessions, sandboxes, events, log, runnerId } = this.#deps;
+    const authority: SessionLease = {
+      sessionId: session.id,
+      runnerId,
+      token: session.leaseToken,
+    };
 
     // The lease is renewed on a timer, and losing it is how a runner learns it
     // was declared dead. The flag is read between agent steps rather than
     // thrown from the timer, so the loop unwinds where it can clean up.
     let leaseLost: Error | undefined;
+    // Stops in-flight model streams rather than waiting for the next step
+    // boundary to notice. It never replaces the lease checks: ownership is
+    // decided by Firestore, and this only stops us paying for work we have
+    // already lost the right to do.
+    const cancellation = new AbortController();
+    const stopWork = (reason: Error): void => {
+      leaseLost = reason;
+      cancellation.abort(reason);
+    };
     const heartbeat = setInterval(() => {
       void sessions.heartbeat(session.id, runnerId).catch((error: unknown) => {
-        leaseLost = error instanceof Error ? error : new Error(String(error));
+        stopWork(error instanceof Error ? error : new Error(String(error)));
         log.warn({ sessionId: session.id, err: leaseLost }, 'lost the lease on this session');
       });
     }, this.#deps.heartbeatSeconds * 1000);
@@ -81,12 +146,14 @@ export class SessionRunner {
     try {
       unsubscribeCancel = await events.subscribe(session.id, (event) => {
         if (event.type === 'session.cancel_requested') {
-          leaseLost = new AppError({
-            code: 'session/cancelled',
-            statusCode: 409,
-            message: 'Cancelled by user',
-            details: { sessionId: session.id },
-          });
+          stopWork(
+            new AppError({
+              code: 'session/cancelled',
+              statusCode: 409,
+              message: 'Cancelled by user',
+              details: { sessionId: session.id },
+            }),
+          );
           log.info({ sessionId: session.id }, 'received cancellation request for session');
         } else if (event.type === 'session.steer') {
           const prompt = (event.data as Record<string, unknown>)['prompt'];
@@ -101,8 +168,6 @@ export class SessionRunner {
     }
 
     const publish = async (type: string, data: Record<string, unknown>): Promise<void> => {
-
-
       try {
         await events.append(session.id, type, data);
       } catch (error) {
@@ -119,10 +184,19 @@ export class SessionRunner {
     let project: Project | undefined;
     let entitlements: UserEntitlements | undefined;
     let persists = false;
+    let saveAttempted = false;
+    // Proof that this sandbox holds the project's history rather than an empty
+    // directory. Saving without it would publish a fresh repository over a
+    // snapshot the user still owns — which is exactly what a failed restore
+    // leaves behind, and what a failure before restore never had.
+    let restored: RestoreOutcome | undefined;
 
     try {
       project = await this.#deps.projects.readOwned(session.ownerUid, session.projectId);
       entitlements = await this.#deps.entitlements.forUser(session.ownerUid);
+      // Narrowed once here: the reservation closures below run later, so a
+      // possibly-undefined outer binding would not be narrowed inside them.
+      const activeEntitlements = entitlements;
       persists = entitlements.capabilities.boolean('git.persistence');
       const { registry } = await this.#deps.configuration.get();
 
@@ -141,6 +215,24 @@ export class SessionRunner {
           },
         });
         await sessions.detachSandbox(session.id, runnerId);
+      }
+
+      // Specialist holds the previous holder took out and never closed. Found on
+      // the session document rather than in any process's memory, which is the
+      // only place a hold taken by a killed process can still be seen from.
+      if (session.specialistReservationIds.length > 0) {
+        await reconcileSpecialistReservations({
+          uid: session.ownerUid,
+          reservationIds: session.specialistReservationIds,
+          release: (uid, reservationId, when) =>
+            this.#deps.metering.release(uid, reservationId, when),
+          forget: (reservationId) =>
+            sessions.forgetSpecialistReservation(session.id, runnerId, reservationId),
+          onProblem: (error, what) => {
+            log.warn({ sessionId: session.id, err: error }, `recovery problem: ${what}`);
+          },
+          now: new Date(),
+        });
       }
 
       await publish('session.running', { runnerId, model: session.model, effort: session.effort });
@@ -167,12 +259,12 @@ export class SessionRunner {
       // Only a plan that pays for it gets its work back. For everyone else the
       // sandbox is genuinely disposable, which is the difference being sold.
       if (persists) {
-        const outcome = await this.#deps.persistence.restore(
+        restored = await this.#deps.persistence.restore(
           acquired.running,
           acquired.provider,
           project,
         );
-        await publish('project.restored', { outcome });
+        await publish('project.restored', { outcome: restored });
       }
 
       const messages = await sessions.listMessages(
@@ -219,13 +311,38 @@ export class SessionRunner {
               text: result.text.slice(0, this.#deps.limits.toolOutputMaxChars),
             }),
           preview: (preview) => publish('preview.ready', preview),
+          specialistStarted: (detail) =>
+            publish('agent.specialist_started', { role: detail.role, label: detail.label }),
+          // Verdict, count and the one-line conclusion. Never the instructions,
+          // the transcript, or how the specialist reached the answer.
+          specialistCompleted: (detail) =>
+            publish('agent.specialist_completed', {
+              role: detail.role,
+              label: detail.label,
+              verdict: detail.verdict,
+              findings: detail.findings,
+              summary: detail.summary,
+            }),
+        },
+        signal: cancellation.signal,
+        reservations: {
+          take: (hold) =>
+            sessions.reserveSpecialistTokens(session.id, runnerId, {
+              entitlements: activeEntitlements,
+              meterKey: hold.meterKey,
+              quantity: hold.quantity,
+              operationId: hold.operationId,
+              now: new Date(),
+            }),
+          forget: (reservationId) =>
+            sessions.forgetSpecialistReservation(session.id, runnerId, reservationId),
+        },
+        onProblem: (error, what) => {
+          log.error({ sessionId: session.id, err: error }, what);
         },
       });
 
-      if (run.reply !== '') {
-        await sessions.appendAssistantMessage(session.id, runnerId, run.reply);
-      }
-      await publish('agent.finished', { steps: run.steps, stopReason: run.stopReason });
+      await this.#deliver(session, run, publish);
 
       // Hot turn chaining: check the queue before releasing the sandbox.
       // If the user enqueued a follow-up while this turn was running, dequeue
@@ -278,18 +395,53 @@ export class SessionRunner {
                 text: result.text.slice(0, this.#deps.limits.toolOutputMaxChars),
               }),
             preview: (preview) => publish('preview.ready', preview),
+            specialistStarted: (detail) =>
+              publish('agent.specialist_started', { role: detail.role, label: detail.label }),
+            // Verdict, count and the one-line conclusion. Never the instructions,
+            // the transcript, or how the specialist reached the answer.
+            specialistCompleted: (detail) =>
+              publish('agent.specialist_completed', {
+                role: detail.role,
+                label: detail.label,
+                verdict: detail.verdict,
+                findings: detail.findings,
+                summary: detail.summary,
+              }),
+          },
+          signal: cancellation.signal,
+          reservations: {
+            take: (hold) =>
+              sessions.reserveSpecialistTokens(session.id, runnerId, {
+                entitlements: activeEntitlements,
+                meterKey: hold.meterKey,
+                quantity: hold.quantity,
+                operationId: hold.operationId,
+                now: new Date(),
+              }),
+            forget: (reservationId) =>
+              sessions.forgetSpecialistReservation(session.id, runnerId, reservationId),
+          },
+          onProblem: (error, what) => {
+            log.error({ sessionId: session.id, err: error }, what);
           },
         });
 
-        if (chainRun.reply !== '') {
-          await sessions.appendAssistantMessage(session.id, runnerId, chainRun.reply);
-        }
-        await publish('agent.finished', { steps: chainRun.steps, stopReason: chainRun.stopReason });
+        await this.#deliver(session, chainRun, publish);
 
         nextQueued = await sessions.dequeueNextMessage(session.id, runnerId);
       }
 
-      await this.#save(session, project, entitlements, acquired, persists, publish);
+      saveAttempted = true;
+      await this.#save(
+        session,
+        authority,
+        project,
+        entitlements,
+        acquired,
+        persists,
+        restored,
+        publish,
+      );
       await this.#letGo(session, acquired);
       acquired = undefined;
 
@@ -304,7 +456,26 @@ export class SessionRunner {
         // Saved before the machine is discarded, even now: a build that failed
         // at step nine still wrote eight steps of a project the user is paying
         // to keep.
-        await this.#save(session, project, entitlements, acquired, persists, publish);
+        if (!saveAttempted) {
+          saveAttempted = true;
+          try {
+            await this.#save(
+              session,
+              authority,
+              project,
+              entitlements,
+              acquired,
+              persists,
+              restored,
+              publish,
+            );
+          } catch (saveError) {
+            log.error(
+              { sessionId: session.id, err: saveError },
+              'could not preserve partial project work',
+            );
+          }
+        }
         await this.#letGo(session, acquired);
       }
       await publish('session.failed', { error: reason });
@@ -319,27 +490,78 @@ export class SessionRunner {
     } finally {
       clearInterval(heartbeat);
       unsubscribeCancel?.();
+      // Nothing should still be streaming by now; this is the backstop for a
+      // path that left one running.
+      cancellation.abort();
     }
   }
 
   /**
-   * Commits and stores the project, if the plan includes it.
-
+   * Puts the turn's answer in the transcript and says how it ended.
    *
-   * A failure here is reported and swallowed rather than thrown. It is reached
-   * from the error path as well as the good one, and letting it throw there
-   * would replace the real reason a build failed with a second one, while
-   * skipping the sandbox release that has to happen either way.
+   * A turn that ended with a blocking review still standing has its explanation
+   * appended here rather than left to the model's own account of what it did.
+   * The session still finishes IDLE and stays resumable: refusing to do
+   * something unsafe is a decision, not a system failure.
+   */
+  async #deliver(
+    session: ClaimedSession,
+    run: AgentRun,
+    publish: (type: string, data: Record<string, unknown>) => Promise<void>,
+  ): Promise<void> {
+    const blocked = run.unresolvedBlockers.length > 0;
+    const reply = blocked
+      ? [run.reply, blockerExplanation(run.unresolvedBlockers)]
+          .filter((part) => part !== '')
+          .join('\n\n')
+      : run.reply;
+
+    if (reply !== '') {
+      await this.#deps.sessions.appendAssistantMessage(session.id, this.#deps.runnerId, reply);
+    }
+    if (blocked) {
+      await publish('agent.blocked', {
+        blockers: run.unresolvedBlockers.map((blocker) => ({
+          id: blocker.id,
+          role: blocker.role,
+          label: blocker.label,
+          summary: blocker.summary,
+        })),
+      });
+    }
+    await publish('agent.finished', { steps: run.steps, stopReason: run.stopReason });
+  }
+
+  /**
+   * Commits and stores the project, if the plan includes it.
+   *
+   * A success-path failure propagates so a build is not reported idle without
+   * durable persistence. The caller catches a partial-save failure only while
+   * already handling another failure, preserving the original reason while
+   * still releasing the sandbox and finalising the session.
+   *
+   * `restored` is required rather than assumed: the failure path runs after any
+   * failure, including one that stopped the restore, and a sandbox whose history
+   * never arrived must not be published over the snapshot that still holds it.
    */
   async #save(
-    session: BuildSession,
+    session: ClaimedSession,
+    authority: SessionLease,
     project: Project | undefined,
     entitlements: UserEntitlements | undefined,
     acquired: AcquiredSandbox,
     persists: boolean,
+    restored: RestoreOutcome | undefined,
     publish: (type: string, data: Record<string, unknown>) => Promise<void>,
   ): Promise<void> {
     if (!persists || project === undefined || entitlements === undefined) {
+      return;
+    }
+    if (restored === undefined) {
+      this.#deps.log.warn(
+        { sessionId: session.id, projectId: project.id },
+        'not saving a workspace whose project history was never restored',
+      );
       return;
     }
     try {
@@ -348,21 +570,42 @@ export class SessionRunner {
         provider: acquired.provider,
         project,
         entitlements,
+        authority,
         // Traceable back to the turn that produced it without putting the
         // user's prompt — which is theirs, and arbitrary text — in a commit.
         commitMessage: `LotusBuild session ${session.id}`,
       });
       await publish('project.saved', { bytes: saved.bytes, committed: saved.committed });
-      this.#deps.log.info({ sessionId: session.id, ...saved }, 'saved the project');
+      this.#deps.log.info(
+        { sessionId: session.id, bytes: saved.bytes, committed: saved.committed },
+        'saved the project',
+      );
+      if (saved.cleanupFailure !== undefined) {
+        // Logged, not published: the save the user asked for succeeded, and an
+        // orphaned object in our bucket is ours to collect, not theirs to read
+        // about. The object name is the address an operator needs to find it,
+        // and this log never leaves the server.
+        const { superseded, cause } = saved.cleanupFailure;
+        this.#deps.log.error(
+          {
+            sessionId: session.id,
+            projectId: project.id,
+            snapshot: superseded,
+            err: cause,
+          },
+          'project saved, but its superseded snapshot could not be deleted',
+        );
+      }
     } catch (error) {
       this.#deps.log.error({ sessionId: session.id, err: error }, 'could not save the project');
       await publish('project.save_failed', {
         error: error instanceof AppError ? error.message : 'The project could not be saved.',
       });
+      throw error;
     }
   }
 
-  async #letGo(session: BuildSession, acquired: AcquiredSandbox): Promise<void> {
+  async #letGo(session: ClaimedSession, acquired: AcquiredSandbox): Promise<void> {
     const { sessions, sandboxes, log, runnerId } = this.#deps;
     await sandboxes.release({
       uid: session.ownerUid,

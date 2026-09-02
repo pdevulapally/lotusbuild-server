@@ -118,6 +118,14 @@ const runnerSpec = {
     'how much of a tool result is fed back to the model before it is truncated',
     { min: 500, max: 200000 },
   ),
+  AGENT_MAX_SPECIALIST_CONSULTATIONS: asInteger(
+    'specialist reviews one turn may ask for, bounding what optional consultation can cost',
+    { min: 0, max: 20 },
+  ),
+  AGENT_SPECIALIST_MAX_STEPS: asInteger(
+    'model calls one specialist review may take before it is abandoned as unavailable',
+    { min: 1, max: 50 },
+  ),
   GIT_AUTHOR_NAME: asString('name on the commits the agent makes inside a project'),
   GIT_AUTHOR_EMAIL: asString('email on those commits'),
   E2B_API_KEY: asString('key sandboxes are created with'),
@@ -144,6 +152,12 @@ const runnerSpec = {
 export type SharedConfig = LoadedEnv<typeof sharedSpec>;
 export type Config = ReturnType<typeof loadConfig>;
 export type RunnerConfig = ReturnType<typeof loadRunnerConfig>;
+
+export function loadSharedConfig(
+  source: Readonly<Record<string, string | undefined>> = process.env,
+) {
+  return loadEnv(sharedSpec, source);
+}
 
 export function loadConfig(source: Readonly<Record<string, string | undefined>> = process.env) {
   return loadEnv({ ...sharedSpec, ...apiSpec }, source);

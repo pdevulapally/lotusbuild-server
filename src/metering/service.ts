@@ -423,46 +423,49 @@ export class MeteringService {
    * less and settling more would let a plan be overspent by exactly the amount
    * nobody predicted, which is the amount that matters.
    */
-  async reserve(input: {
-    readonly uid: string;
-    readonly entitlements: UserEntitlements;
-    readonly meterKey: string;
-    readonly quantity: number;
-    readonly operationId: string;
-    readonly now: Date;
-  }): Promise<Reservation> {
+  async reserveIn(
+    transaction: Transaction,
+    input: {
+      readonly uid: string;
+      readonly entitlements: UserEntitlements;
+      readonly meterKey: string;
+      readonly quantity: number;
+      readonly operationId: string;
+      readonly now: Date;
+    },
+  ): Promise<Reservation> {
     this.#assertPositive(input.quantity, input.meterKey);
     const { meter, limit } = await this.#resolve(input.entitlements, input.meterKey);
 
     const usageRef = this.#usageRef(input.uid, input.meterKey);
+    // Firestore generates this locally, so the id exists before anything is
+    // written and a caller can commit it alongside its own record of the hold.
     const reservationRef = this.#firestore
       .collection(`${usersCollectionPath}/${input.uid}/${reservationsCollectionName}`)
       .doc();
 
-    await this.#firestore.runTransaction(async (transaction) => {
-      const snapshot = await transaction.get(usageRef);
-      const periodStart = periodStartFor(meter, input.now);
-      const state = this.#state(snapshot, periodStart, usageRef.path);
+    const snapshot = await transaction.get(usageRef);
+    const periodStart = periodStartFor(meter, input.now);
+    const state = this.#state(snapshot, periodStart, usageRef.path);
 
-      if (state.consumed + state.reserved + input.quantity > limit.hardLimit) {
-        throw this.#exceeded(input.entitlements, meter, limit, state, input.quantity, periodStart);
-      }
+    if (state.consumed + state.reserved + input.quantity > limit.hardLimit) {
+      throw this.#exceeded(input.entitlements, meter, limit, state, input.quantity, periodStart);
+    }
 
-      transaction.set(usageRef, {
-        meterKey: meter.key,
-        consumed: state.consumed,
-        reserved: state.reserved + input.quantity,
-        periodStart: Timestamp.fromDate(periodStart),
-        updatedAt: FieldValue.serverTimestamp(),
-      });
-      transaction.create(reservationRef, {
-        meterKey: meter.key,
-        estimatedQuantity: input.quantity,
-        status: 'OPEN',
-        operationId: input.operationId,
-        createdAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
-      });
+    transaction.set(usageRef, {
+      meterKey: meter.key,
+      consumed: state.consumed,
+      reserved: state.reserved + input.quantity,
+      periodStart: Timestamp.fromDate(periodStart),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+    transaction.create(reservationRef, {
+      meterKey: meter.key,
+      estimatedQuantity: input.quantity,
+      status: 'OPEN',
+      operationId: input.operationId,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
     });
 
     return {
@@ -472,6 +475,122 @@ export class MeteringService {
       status: 'OPEN',
       operationId: input.operationId,
     };
+  }
+
+  /** `reserveIn` for callers with nothing else to commit alongside it. */
+  async reserve(input: {
+    readonly uid: string;
+    readonly entitlements: UserEntitlements;
+    readonly meterKey: string;
+    readonly quantity: number;
+    readonly operationId: string;
+    readonly now: Date;
+  }): Promise<Reservation> {
+    return this.#firestore.runTransaction((transaction) => this.reserveIn(transaction, input));
+  }
+
+  /**
+   * Gives back several holds at once, inside a transaction the caller owns.
+   *
+   * Batched rather than offered one at a time because Firestore forbids reading
+   * after writing: closing holds one by one would read the second reservation
+   * after the first had already written the usage document. Every reservation
+   * and every affected meter is therefore read first, and each meter is written
+   * once carrying the whole decrement.
+   *
+   * A hold that is already SETTLED or RELEASED is skipped without touching the
+   * ledger, which is what makes running this against holds somebody else closed
+   * a no-op rather than a second accounting event. Returns the ids it released.
+   */
+  async releaseIn(
+    transaction: Transaction,
+    uid: string,
+    reservationIds: readonly string[],
+    now: Date,
+  ): Promise<readonly string[]> {
+    const { registry } = await this.#configuration.get();
+
+    const open: {
+      readonly ref: DocumentReference;
+      readonly id: string;
+      readonly meter: MeterDefinition;
+      readonly quantity: number;
+    }[] = [];
+    for (const reservationId of reservationIds) {
+      const ref = this.#reservationRef(uid, reservationId);
+      const snapshot = await transaction.get(ref);
+      if (!snapshot.exists) {
+        throw new Error(`No reservation ${reservationId} for ${uid}.`);
+      }
+      const fields = snapshot.data() ?? {};
+      if (enumField(fields, 'status', ref.path, reservationStatuses) !== 'OPEN') {
+        continue;
+      }
+      const meterKey = stringField(fields, 'meterKey', ref.path);
+      const meter = registry.meters.get(meterKey);
+      if (meter === undefined) {
+        throw new EntitlementConfigError(
+          `Reservation ${reservationId} is on meter "${meterKey}", which the registry no longer ` +
+            'declares, so the hold cannot be returned to it.',
+        );
+      }
+      open.push({
+        ref,
+        id: reservationId,
+        meter,
+        quantity: integerField(fields, 'estimatedQuantity', ref.path, { min: 1 }),
+      });
+    }
+
+    const byMeter = new Map<string, { readonly meter: MeterDefinition; readonly total: number }>();
+    for (const entry of open) {
+      const running = byMeter.get(entry.meter.key);
+      byMeter.set(entry.meter.key, {
+        meter: entry.meter,
+        total: (running === undefined ? 0 : running.total) + entry.quantity,
+      });
+    }
+
+    const pending: {
+      readonly ref: DocumentReference;
+      readonly meter: MeterDefinition;
+      readonly state: UsageState;
+      readonly total: number;
+      readonly periodStart: Date;
+    }[] = [];
+    for (const { meter, total } of byMeter.values()) {
+      const usageRef = this.#usageRef(uid, meter.key);
+      const snapshot = await transaction.get(usageRef);
+      const periodStart = periodStartFor(meter, now);
+      const state = this.#state(snapshot, periodStart, usageRef.path);
+      if (state.reserved < total) {
+        // Not a limit problem: the ledger disagrees with itself, and carrying on
+        // would silently invent capacity.
+        throw new Error(
+          `Usage for ${uid}/${meter.key} holds ${state.reserved} but the reservations being ` +
+            `released claim ${total}.`,
+        );
+      }
+      pending.push({ ref: usageRef, meter, state, total, periodStart });
+    }
+
+    for (const entry of pending) {
+      transaction.set(entry.ref, {
+        meterKey: entry.meter.key,
+        consumed: entry.state.consumed,
+        reserved: entry.state.reserved - entry.total,
+        periodStart: Timestamp.fromDate(entry.periodStart),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    }
+    for (const entry of open) {
+      transaction.update(entry.ref, {
+        status: 'RELEASED',
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    }
+
+    return open.map((entry) => entry.id);
   }
 
   /**

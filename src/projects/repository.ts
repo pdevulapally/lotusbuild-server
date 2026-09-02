@@ -1,12 +1,13 @@
-import { FieldValue, type Firestore } from 'firebase-admin/firestore';
+import { FieldValue, type Firestore, type Transaction } from 'firebase-admin/firestore';
 
 import type { ConfigurationStore } from '../entitlements/store.ts';
 import type { EntitlementService } from '../entitlements/service.ts';
 import { type Platform, platforms } from '../entitlements/schema.ts';
 import { AppError } from '../http/errors.ts';
 import type { MeteringService } from '../metering/service.ts';
-import type { SnapshotStore } from '../storage/snapshots.ts';
+import type { SnapshotStore, StoredSnapshot } from '../storage/snapshots.ts';
 import {
+  DocumentShapeError,
   type Fields,
   countField,
   enumField,
@@ -35,6 +36,13 @@ export interface Project {
   readonly status: (typeof projectStatuses)[number];
   /** Bytes the last saved snapshot occupies, and so what it charges storage. */
   readonly snapshotBytes: number;
+  readonly snapshot: StoredSnapshot;
+  /**
+   * The session allowed to mutate this project's workspace. `null` is an
+   * explicitly unlocked project; `undefined` is a legacy document that must be
+   * migrated before session activation can safely continue.
+   */
+  readonly activeSessionId: string | null | undefined;
   readonly createdAt: Date;
 }
 
@@ -49,7 +57,48 @@ export interface UpdateProject {
   readonly description?: string | undefined;
 }
 
+function activeSessionIdField(fields: Fields, where: string): string | null | undefined {
+  if (!Object.prototype.hasOwnProperty.call(fields, 'activeSessionId')) {
+    return undefined;
+  }
+  const value = fields['activeSessionId'];
+  if (value === null) {
+    return null;
+  }
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new DocumentShapeError(
+      `${where}: field "activeSessionId" must be a non-empty string or null.`,
+    );
+  }
+  return value;
+}
+
+function storedSnapshot(fields: Fields, where: string, snapshotBytes: number): StoredSnapshot {
+  const hasObjectName = Object.prototype.hasOwnProperty.call(fields, 'snapshotObjectName');
+  const hasGeneration = Object.prototype.hasOwnProperty.call(fields, 'snapshotObjectGeneration');
+  if (hasObjectName !== hasGeneration) {
+    throw new DocumentShapeError(
+      `${where}: snapshotObjectName and snapshotObjectGeneration must either both exist or both be absent.`,
+    );
+  }
+  if (!hasObjectName) {
+    return snapshotBytes === 0 ? { kind: 'none' } : { kind: 'legacy' };
+  }
+  if (snapshotBytes === 0) {
+    throw new DocumentShapeError(`${where}: an immutable snapshot cannot have zero recorded bytes.`);
+  }
+  const objectName = stringField(fields, 'snapshotObjectName', where);
+  const generation = stringField(fields, 'snapshotObjectGeneration', where);
+  if (!/^[1-9]\d*$/.test(generation)) {
+    throw new DocumentShapeError(
+      `${where}: field "snapshotObjectGeneration" must be a positive decimal generation.`,
+    );
+  }
+  return { kind: 'immutable', objectName, generation };
+}
+
 function parseProject(id: string, fields: Fields, where: string): Project {
+  const snapshotBytes = countField(fields, 'snapshotBytes', where);
   return {
     id,
     ownerUid: stringField(fields, 'ownerUid', where),
@@ -57,9 +106,27 @@ function parseProject(id: string, fields: Fields, where: string): Project {
     description: optionalStringField(fields, 'description'),
     platform: enumField(fields, 'platform', where, platforms),
     status: enumField(fields, 'status', where, projectStatuses),
-    snapshotBytes: countField(fields, 'snapshotBytes', where),
+    snapshotBytes,
+    snapshot: storedSnapshot(fields, where, snapshotBytes),
+    activeSessionId: activeSessionIdField(fields, where),
     createdAt: timestampField(fields, 'createdAt', where),
   };
+}
+
+export function projectSessionActiveError(): AppError {
+  return new AppError({
+    code: 'project/session-active',
+    statusCode: 409,
+    message: 'Another session is currently active for this project.',
+  });
+}
+
+export function projectSessionGuardUnmigratedError(): AppError {
+  return new AppError({
+    code: 'project/session-guard-unmigrated',
+    statusCode: 503,
+    message: 'This project is not ready to start a session yet.',
+  });
 }
 
 export class ProjectRepository {
@@ -133,6 +200,7 @@ export class ProjectRepository {
         description: input.description,
         platform: input.platform,
         status: 'draft',
+        activeSessionId: null,
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });
@@ -152,6 +220,8 @@ export class ProjectRepository {
       platform: input.platform,
       status: 'draft',
       snapshotBytes: 0,
+      snapshot: { kind: 'none' },
+      activeSessionId: null,
       createdAt,
     };
   }
@@ -197,11 +267,18 @@ export class ProjectRepository {
    * deletes the snapshot archive in storage.
    */
   async delete(ownerUid: string, projectId: string): Promise<void> {
-    const project = await this.readOwned(ownerUid, projectId);
     const ref = this.refFor(projectId);
     const userRef = this.#users.refFor(ownerUid);
 
     await this.#firestore.runTransaction(async (transaction) => {
+      const project = await this.readOwnedInTransaction(transaction, ownerUid, projectId);
+      if (project.activeSessionId === undefined) {
+        throw projectSessionGuardUnmigratedError();
+      }
+      if (project.activeSessionId !== null) {
+        throw projectSessionActiveError();
+      }
+
       // Release storage meter gauge if bytes were charged
       if (this.#metering !== undefined && this.#configuration !== undefined && project.snapshotBytes > 0) {
         const { registry } = await this.#configuration.get();
@@ -259,6 +336,16 @@ export class ProjectRepository {
     return this.#firestore.doc(`${projectsCollectionPath}/${projectId}`);
   }
 
+  async readOwnedInTransaction(
+    transaction: Transaction,
+    ownerUid: string,
+    projectId: string,
+  ): Promise<Project> {
+    const ref = this.refFor(projectId);
+    const snapshot = await transaction.get(ref);
+    return this.#ownedFromSnapshot(ownerUid, ref.path, snapshot);
+  }
+
   async listOwnedBy(ownerUid: string, limit: number): Promise<readonly Project[]> {
     const snapshot = await this.#firestore
       .collection(projectsCollectionPath)
@@ -278,9 +365,17 @@ export class ProjectRepository {
    * id space, and there is nothing they can do with the distinction.
    */
   async readOwned(ownerUid: string, projectId: string): Promise<Project> {
-    const ref = this.#firestore.doc(`${projectsCollectionPath}/${projectId}`);
+    const ref = this.refFor(projectId);
     const snapshot = await ref.get();
 
+    return this.#ownedFromSnapshot(ownerUid, ref.path, snapshot);
+  }
+
+  #ownedFromSnapshot(
+    ownerUid: string,
+    path: string,
+    snapshot: { readonly exists: boolean; readonly id: string; data(): Fields | undefined },
+  ): Project {
     const missing = new AppError({
       code: 'project/not-found',
       statusCode: 404,
@@ -290,7 +385,7 @@ export class ProjectRepository {
     if (!snapshot.exists) {
       throw missing;
     }
-    const project = parseProject(snapshot.id, snapshot.data() ?? {}, ref.path);
+    const project = parseProject(snapshot.id, snapshot.data() ?? {}, path);
     if (project.ownerUid !== ownerUid) {
       throw missing;
     }

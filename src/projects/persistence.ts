@@ -1,16 +1,15 @@
-import type { Firestore } from 'firebase-admin/firestore';
-import { FieldValue } from 'firebase-admin/firestore';
-
 import type { SandboxProvider } from '../entitlements/schema.ts';
 import type { UserEntitlements } from '../entitlements/service.ts';
-import type { ConfigurationStore } from '../entitlements/store.ts';
 import { AppError } from '../http/errors.ts';
-import type { MeteringService } from '../metering/service.ts';
 import type { RunningSandbox } from '../sandboxes/provider.ts';
-import { snapshotContentType } from '../storage/snapshots.ts';
-import type { SnapshotStore } from '../storage/snapshots.ts';
-import { countField } from '../support/documents.ts';
-import type { Project, ProjectRepository } from './repository.ts';
+import type { SessionLease } from '../sessions/repository.ts';
+import {
+  snapshotContentType,
+  type SnapshotStorage,
+  type StoredSnapshot,
+  type UploadedSnapshot,
+} from '../storage/snapshots.ts';
+import type { Project } from './repository.ts';
 
 /** Where the archive and the signed URL are staged, outside the project tree. */
 const archivePath = '/tmp/lotusbuild-repo.tar.gz';
@@ -21,11 +20,32 @@ export type RestoreOutcome = 'restored' | 'initialised';
 export interface SaveOutcome {
   readonly bytes: number;
   readonly committed: boolean;
+  /**
+   * The snapshot this save superseded could not be deleted.
+   *
+   * Returned rather than thrown because it happens after the project already
+   * points at the new snapshot: the save is durable, and what is left is an
+   * object nobody references. Reporting that as a failed save would tell the
+   * user their work was lost when it was not. It is still a real problem — it
+   * occupies bytes that are no longer metered — so the caller must record it.
+   */
+  readonly cleanupFailure:
+    | { readonly superseded: StoredSnapshot; readonly cause: unknown }
+    | undefined;
 }
 
 export interface GitIdentity {
   readonly name: string;
   readonly email: string;
+}
+
+export interface SnapshotPublisher {
+  assertPersistenceLease(authority: SessionLease): Promise<void>;
+  publishSnapshot(
+    authority: SessionLease,
+    entitlements: UserEntitlements,
+    snapshot: UploadedSnapshot,
+  ): Promise<{ readonly projectId: string; readonly previous: StoredSnapshot }>;
 }
 
 /**
@@ -43,27 +63,18 @@ export interface GitIdentity {
  * the API.
  */
 export class ProjectPersistence {
-  readonly #firestore: Firestore;
-  readonly #projects: ProjectRepository;
-  readonly #configuration: ConfigurationStore;
-  readonly #metering: MeteringService;
-  readonly #snapshots: SnapshotStore;
+  readonly #publisher: SnapshotPublisher;
+  readonly #snapshots: SnapshotStorage;
   readonly #identity: GitIdentity;
   readonly #commandTimeoutMs: number;
 
   constructor(
-    firestore: Firestore,
-    projects: ProjectRepository,
-    configuration: ConfigurationStore,
-    metering: MeteringService,
-    snapshots: SnapshotStore,
+    publisher: SnapshotPublisher,
+    snapshots: SnapshotStorage,
     identity: GitIdentity,
     commandTimeoutMs: number,
   ) {
-    this.#firestore = firestore;
-    this.#projects = projects;
-    this.#configuration = configuration;
-    this.#metering = metering;
+    this.#publisher = publisher;
     this.#snapshots = snapshots;
     this.#identity = identity;
     this.#commandTimeoutMs = commandTimeoutMs;
@@ -109,15 +120,18 @@ export class ProjectPersistence {
   /**
    * Puts the project back into a fresh sandbox, or starts a repository for one
    * that has never been saved.
+   *
+   * Which of the two happens is decided by the project document alone. `none`
+   * is the only state that may end in `git init`; every other state has already
+   * asserted that a snapshot exists, so a Storage object that cannot be produced
+   * fails the restore rather than quietly becoming an empty project.
    */
   async restore(
     sandbox: RunningSandbox,
     provider: SandboxProvider,
     project: Project,
   ): Promise<RestoreOutcome> {
-    const url = await this.#snapshots.readUrl(project.id);
-
-    if (url === undefined) {
+    if (project.snapshot.kind === 'none') {
       await this.#run(
         sandbox,
         provider,
@@ -126,6 +140,8 @@ export class ProjectPersistence {
       );
       return 'initialised';
     }
+
+    const url = await this.#snapshots.readUrl(project.id, project.snapshot);
 
     // The URL is handed over in a file rather than on the command line: it is a
     // bearer credential, and an argument is visible to every process in the
@@ -155,18 +171,28 @@ export class ProjectPersistence {
   /**
    * Commits whatever the agent did and stores the repository.
    *
-   * The order is deliberate: archive, measure, charge, then upload. Charging
-   * before the upload means a project that would exceed its plan's storage is
-   * refused while its previous snapshot is still intact — uploading first would
-   * have already overwritten the thing we then decided we could not keep.
+   * The order is deliberate: verify authority, upload to an immutable candidate,
+   * inspect trusted Storage metadata, then transactionally publish and charge.
+   * A candidate that loses the publish race is never referenced by the project.
+   *
+   * `publishSnapshot` is the commit boundary. Anything that fails before it
+   * throws, and the project keeps the snapshot it had. Once it returns, the save
+   * is durable and this method resolves — collecting the superseded object is
+   * the last step, and the only one whose failure is reported instead of raised.
    */
   async save(input: {
     readonly sandbox: RunningSandbox;
     readonly provider: SandboxProvider;
     readonly project: Project;
     readonly entitlements: UserEntitlements;
+    readonly authority: SessionLease;
     readonly commitMessage: string;
   }): Promise<SaveOutcome> {
+    // This pre-check stops a runner that is already stale before it commits or
+    // archives anything. The guarded publish below is still required because
+    // ownership can change while the archive is being uploaded.
+    await this.#publisher.assertPersistenceLease(input.authority);
+
     const stdout = await this.#run(
       input.sandbox,
       input.provider,
@@ -182,92 +208,47 @@ export class ProjectPersistence {
         '  echo committed=no',
         'fi',
         `tar -czf ${archivePath} .git`,
-        `echo bytes=$(stat -c %s ${archivePath})`,
         '',
       ].join('\n'),
       { ...this.#gitEnv(), LOTUSBUILD_COMMIT_MESSAGE: input.commitMessage },
     );
 
     const committed = stdout.includes('committed=yes');
-    const bytes = Number(/bytes=(\d+)/.exec(stdout)?.[1]);
-    if (!Number.isSafeInteger(bytes) || bytes <= 0) {
-      throw new AppError({
-        code: 'project/persistence-failed',
-        statusCode: 500,
-        message: 'The project archive could not be measured, so it was not saved.',
-        details: { stdout: stdout.slice(0, 300) },
-      });
-    }
+    const upload = await this.#snapshots.createUpload(input.project.id, input.authority.token);
+    await input.sandbox.writeFile(urlPath, upload.url);
+    await this.#run(
+      input.sandbox,
+      input.provider,
+      [
+        'set -eu',
+        `url=$(cat ${urlPath})`,
+        `rm -f ${urlPath}`,
+        `curl -sf -X PUT -H "Content-Type: ${snapshotContentType}" -H "x-goog-if-generation-match: 0" --upload-file ${archivePath} "$url"`,
+        `rm -f ${archivePath}`,
+        '',
+      ].join('\n'),
+    );
 
-    const previousBytes = await this.#charge(input.project, input.entitlements, bytes);
-
+    // Size and generation come from trusted Storage metadata, not sandbox
+    // stdout. The transaction is the publish point: until it commits, this
+    // immutable object is only an unreferenced candidate.
+    const uploaded = await this.#snapshots.inspectUpload(upload.objectName);
+    const published = await this.#publisher.publishSnapshot(
+      input.authority,
+      input.entitlements,
+      uploaded,
+    );
+    // Everything above this line decides whether the save happens; everything
+    // below it has already happened. Deleting what the publish superseded is
+    // garbage collection against durable state, so its failure is carried back
+    // as a fact about the storage rather than thrown as a fact about the save.
+    let cleanupFailure: SaveOutcome['cleanupFailure'];
     try {
-      const url = await this.#snapshots.writeUrl(input.project.id);
-      await input.sandbox.writeFile(urlPath, url);
-      await this.#run(
-        input.sandbox,
-        input.provider,
-        [
-          'set -eu',
-          `url=$(cat ${urlPath})`,
-          `rm -f ${urlPath}`,
-          `curl -sf -X PUT -H "Content-Type: ${snapshotContentType}" --upload-file ${archivePath} "$url"`,
-          `rm -f ${archivePath}`,
-          '',
-        ].join('\n'),
-      );
-    } catch (error) {
-      // The charge was taken for bytes that never arrived. Putting the meter
-      // back is the only honest thing to do: the stored snapshot is still the
-      // previous one, and its size is what the user is occupying.
-      await this.#charge(input.project, input.entitlements, previousBytes).catch(() => undefined);
-      throw error;
+      await this.#snapshots.removeStored(published.projectId, published.previous);
+    } catch (cause) {
+      cleanupFailure = { superseded: published.previous, cause };
     }
 
-    return { bytes, committed };
-  }
-
-  /**
-   * Moves the storage gauge to what this project now occupies, and records the
-   * figure on the project in the same transaction. Reading the old size and
-   * writing the new one together is what stops the meter and the projects
-   * drifting apart.
-   */
-  async #charge(
-    project: Project,
-    entitlements: UserEntitlements,
-    bytes: number,
-  ): Promise<number> {
-    const { registry } = await this.#configuration.get();
-    const ref = this.#projects.refFor(project.id);
-
-    return this.#firestore.runTransaction(async (transaction) => {
-      const snapshot = await transaction.get(ref);
-      if (!snapshot.exists) {
-        throw new AppError({
-          code: 'project/not-found',
-          statusCode: 404,
-          message: 'This project no longer exists, so its work cannot be saved.',
-        });
-      }
-      const previousBytes = countField(snapshot.data() ?? {}, 'snapshotBytes', ref.path);
-
-      await this.#metering.setGaugeIn(transaction, {
-        uid: project.ownerUid,
-        entitlements,
-        meterKey: registry.storageMeterKey,
-        previousQuantity: previousBytes,
-        quantity: bytes,
-        now: new Date(),
-      });
-
-      transaction.update(ref, {
-        snapshotBytes: bytes,
-        snapshotUpdatedAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
-      });
-
-      return previousBytes;
-    });
+    return { bytes: uploaded.bytes, committed, cleanupFailure };
   }
 }

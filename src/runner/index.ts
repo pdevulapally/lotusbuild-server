@@ -68,6 +68,14 @@ async function main(): Promise<void> {
   const users = new UserRepository(firebase.firestore);
   const projects = new ProjectRepository(firebase.firestore, users, entitlements);
   const metering = new MeteringService(firebase.firestore, configuration);
+  const sessions = new SessionRepository(
+    firebase.firestore,
+    projects,
+    entitlements,
+    configuration,
+    metering,
+    config.SESSION_LEASE_SECONDS,
+  );
 
   // Which provider serves which platform is in the registry; this map is only
   // what this deployment is able to start. A platform pointing at something
@@ -91,24 +99,14 @@ async function main(): Promise<void> {
       apiKey: config.ANTHROPIC_API_KEY,
       baseURL: config.ANTHROPIC_BASE_URL.toString(),
     }),
-    sessions: new SessionRepository(
-      firebase.firestore,
-      projects,
-      entitlements,
-      configuration,
-      metering,
-      config.SESSION_LEASE_SECONDS,
-    ),
+    sessions,
     projects,
     entitlements,
     configuration,
     metering,
     sandboxes: new SandboxService(configuration, metering, adapters),
     persistence: new ProjectPersistence(
-      firebase.firestore,
-      projects,
-      configuration,
-      metering,
+      sessions,
       snapshots,
       { name: config.GIT_AUTHOR_NAME, email: config.GIT_AUTHOR_EMAIL },
       config.AGENT_COMMAND_TIMEOUT_SECONDS * 1000,
@@ -124,6 +122,8 @@ async function main(): Promise<void> {
       maxSteps: config.AGENT_MAX_STEPS,
       maxOutputTokens: config.ANTHROPIC_MAX_OUTPUT_TOKENS,
       toolOutputMaxChars: config.AGENT_TOOL_OUTPUT_MAX_CHARS,
+      maxSpecialistConsultations: config.AGENT_MAX_SPECIALIST_CONSULTATIONS,
+      specialistMaxSteps: config.AGENT_SPECIALIST_MAX_STEPS,
       commandTimeoutMs: config.AGENT_COMMAND_TIMEOUT_SECONDS * 1000,
       previewReadyTimeoutSeconds: config.PREVIEW_READY_TIMEOUT_SECONDS,
     },

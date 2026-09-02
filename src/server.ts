@@ -89,7 +89,15 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     allowedHeaders: ['Authorization', 'Content-Type'],
   });
 
-  app.get('/health', async () => ({ status: 'ok' }));
+  // Resolves configuration rather than only proving the process is listening.
+  // The registry document went missing once and every route answered 500 while
+  // this endpoint stayed green — so deploy.sh passed its own smoke test and CI
+  // called the release healthy. The store is TTL-cached, so this is a memory
+  // read on all but the first call after expiry.
+  app.get('/health', async () => {
+    await dependencies.configuration.get();
+    return { status: 'ok' };
+  });
 
   app.get('/me', { preHandler: [app.requireAuth, app.enforceRateLimit('read')] }, async (request) => {
     const user = authenticatedUser(request);

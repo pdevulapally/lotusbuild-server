@@ -7,11 +7,19 @@ import {
   type Transaction,
 } from 'firebase-admin/firestore';
 
-import type { EntitlementService } from '../entitlements/service.ts';
+import type { EntitlementService, UserEntitlements } from '../entitlements/service.ts';
 import type { ConfigurationStore } from '../entitlements/store.ts';
 import { AppError } from '../http/errors.ts';
-import type { MeteringService } from '../metering/service.ts';
-import type { ProjectRepository } from '../projects/repository.ts';
+import type { MeteringService, Reservation } from '../metering/service.ts';
+import { randomUUID } from 'node:crypto';
+
+import {
+  type Project,
+  type ProjectRepository,
+  projectSessionActiveError,
+  projectSessionGuardUnmigratedError,
+} from '../projects/repository.ts';
+import type { StoredSnapshot, UploadedSnapshot } from '../storage/snapshots.ts';
 import {
   type Fields,
   enumField,
@@ -35,6 +43,10 @@ export const queuedMessagesCollectionName = 'queued_messages';
 export const buildSessionStatuses = ['QUEUED', 'RUNNING', 'IDLE', 'FAILED'] as const;
 export type BuildSessionStatus = (typeof buildSessionStatuses)[number];
 
+function isActiveSessionStatus(status: BuildSessionStatus): status is 'QUEUED' | 'RUNNING' {
+  return status === 'QUEUED' || status === 'RUNNING';
+}
+
 export const messageRoles = ['user', 'assistant'] as const;
 export type MessageRole = (typeof messageRoles)[number];
 
@@ -53,6 +65,7 @@ export interface BuildSession {
   readonly effort: string;
   readonly sandboxId: string | undefined;
   readonly claimedBy: string | undefined;
+  readonly leaseToken: string | undefined;
   readonly heartbeatAt: Date | undefined;
   readonly error: string | undefined;
   readonly cancelRequested?: boolean | undefined;
@@ -62,8 +75,30 @@ export interface BuildSession {
    * is a concurrency slot the user never gets to use again.
    */
   readonly reservationIds: readonly string[];
+  /**
+   * Open specialist token holds this session has taken out.
+   *
+   * Recorded before the model call they pay for and cleared only once the hold
+   * has reached a terminal accounting outcome, so a runner that dies mid-review
+   * leaves the hold findable by whoever inherits the session. Absent on a
+   * document written before specialists existed, which is the same thing as
+   * none: such a session cannot have consulted anyone.
+   */
+  readonly specialistReservationIds: readonly string[];
   readonly messageCount: number;
   readonly createdAt: Date;
+}
+
+export interface ClaimedSession extends BuildSession {
+  readonly status: 'RUNNING';
+  readonly claimedBy: string;
+  readonly leaseToken: string;
+}
+
+export interface SessionLease {
+  readonly sessionId: string;
+  readonly runnerId: string;
+  readonly token: string;
 }
 
 export interface SessionMessage {
@@ -105,10 +140,12 @@ function parseSession(id: string, fields: Fields, where: string): BuildSession {
     effort: stringField(fields, 'effort', where),
     sandboxId: optionalStringField(fields, 'sandboxId'),
     claimedBy: optionalStringField(fields, 'claimedBy'),
+    leaseToken: optionalStringField(fields, 'leaseToken'),
     heartbeatAt: optionalTimestampField(fields, 'heartbeatAt', where),
     error: optionalStringField(fields, 'error'),
     cancelRequested: fields['cancelRequested'] === true ? true : undefined,
     reservationIds: stringArrayField(fields, 'reservationIds', where),
+    specialistReservationIds: stringArrayField(fields, 'specialistReservationIds', where),
     messageCount: integerField(fields, 'messageCount', where, { min: 1 }),
     createdAt: timestampField(fields, 'createdAt', where),
   };
@@ -178,6 +215,38 @@ export class SessionRepository {
     return Timestamp.fromMillis(now.getTime() + this.#leaseSeconds * 1000);
   }
 
+  #assertProjectGuard(project: Project, session: BuildSession): void {
+    if (project.activeSessionId !== session.id) {
+      throw new AppError({
+        code: 'session/project-guard-lost',
+        statusCode: 409,
+        message: 'This session no longer owns the project workspace.',
+        details: {
+          sessionId: session.id,
+          projectId: session.projectId,
+          status: session.status,
+        },
+      });
+    }
+  }
+
+  #assertProjectCanActivate(project: Project, sessionId?: string): void {
+    if (project.activeSessionId === undefined) {
+      throw projectSessionGuardUnmigratedError();
+    }
+    if (project.activeSessionId !== null) {
+      if (sessionId !== undefined && project.activeSessionId === sessionId) {
+        throw new AppError({
+          code: 'session/project-state-inconsistent',
+          statusCode: 409,
+          message: 'This session and its project are in an inconsistent state.',
+          details: { sessionId, projectId: project.id },
+        });
+      }
+      throw projectSessionActiveError();
+    }
+  }
+
   /**
    * Starts a session against a project the caller owns.
    *
@@ -235,6 +304,9 @@ export class SessionRepository {
     const firstMessage = ref.collection(messagesCollectionName).doc(messageId(0));
 
     await this.#firestore.runTransaction(async (transaction) => {
+      const currentProject = await this.#projects.readOwnedInTransaction(transaction, uid, project.id);
+      this.#assertProjectCanActivate(currentProject);
+
       await this.#metering.consumeIn(transaction, {
         uid,
         entitlements,
@@ -260,6 +332,10 @@ export class SessionRepository {
         content: input.prompt,
         createdAt: FieldValue.serverTimestamp(),
       });
+      transaction.update(this.#projects.refFor(project.id), {
+        activeSessionId: ref.id,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
     });
 
     return {
@@ -271,9 +347,11 @@ export class SessionRepository {
       effort,
       sandboxId: undefined,
       claimedBy: undefined,
+      leaseToken: undefined,
       heartbeatAt: undefined,
       error: undefined,
       reservationIds: [],
+      specialistReservationIds: [],
       messageCount: 1,
       createdAt: now,
     };
@@ -358,6 +436,13 @@ export class SessionRepository {
         });
       }
       const current = parseSession(snapshot.id, snapshot.data() ?? {}, ref.path);
+      if (current.ownerUid !== uid) {
+        throw new AppError({
+          code: 'session/not-found',
+          statusCode: 404,
+          message: 'No such session.',
+        });
+      }
       if (current.status === 'QUEUED' || current.status === 'RUNNING') {
         throw new AppError({
           code: 'session/busy',
@@ -366,6 +451,13 @@ export class SessionRepository {
           details: { status: current.status },
         });
       }
+
+      const project = await this.#projects.readOwnedInTransaction(
+        transaction,
+        uid,
+        current.projectId,
+      );
+      this.#assertProjectCanActivate(project, current.id);
 
       // A follow-up turn is another build, and is charged as one.
       await this.#metering.consumeIn(transaction, {
@@ -387,6 +479,10 @@ export class SessionRepository {
         messageCount: FieldValue.increment(1),
         claimableAt: Timestamp.fromDate(now),
         error: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      transaction.update(this.#projects.refFor(current.projectId), {
+        activeSessionId: current.id,
         updatedAt: FieldValue.serverTimestamp(),
       });
 
@@ -564,6 +660,14 @@ export class SessionRepository {
         });
       }
 
+
+      const project = await this.#projects.readOwnedInTransaction(
+        transaction,
+        uid,
+        current.projectId,
+      );
+      this.#assertProjectGuard(project, current);
+
       if (current.status === 'QUEUED') {
         await this.#metering.refundIn(transaction, {
           uid,
@@ -576,7 +680,12 @@ export class SessionRepository {
         transaction.update(ref, {
           status: 'FAILED',
           error: 'Cancelled by user',
+          leaseToken: FieldValue.delete(),
           claimableAt: FieldValue.delete(),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        transaction.update(this.#projects.refFor(current.projectId), {
+          activeSessionId: null,
           updatedAt: FieldValue.serverTimestamp(),
         });
 
@@ -622,7 +731,7 @@ export class SessionRepository {
    * One clock domain, and skew between machines is absorbed by the lease being
    * far longer than any skew NTP allows.
    */
-  async claim(runnerId: string, now: Date = new Date()): Promise<BuildSession | undefined> {
+  async claim(runnerId: string, now: Date = new Date()): Promise<ClaimedSession | undefined> {
     const candidates = await this.#firestore
       .collection(sessionsCollectionPath)
       .where('claimableAt', '<=', Timestamp.fromDate(now))
@@ -635,6 +744,7 @@ export class SessionRepository {
       return undefined;
     }
     const ref = candidate.ref;
+    const leaseToken = randomUUID();
 
     return this.#firestore.runTransaction(async (transaction) => {
       const snapshot = await transaction.get(ref);
@@ -650,9 +760,24 @@ export class SessionRepository {
 
       // Returned as it was found, holds included: the caller inherits the mess.
       const session = parseSession(snapshot.id, fields, ref.path);
+      if (!isActiveSessionStatus(session.status)) {
+        throw new AppError({
+          code: 'session/project-state-inconsistent',
+          statusCode: 409,
+          message: 'This queued session is in an inconsistent state.',
+          details: { sessionId: session.id, projectId: session.projectId, status: session.status },
+        });
+      }
+      const project = await this.#projects.readOwnedInTransaction(
+        transaction,
+        session.ownerUid,
+        session.projectId,
+      );
+      this.#assertProjectGuard(project, session);
       transaction.update(ref, {
         status: 'RUNNING',
         claimedBy: runnerId,
+        leaseToken,
         heartbeatAt: Timestamp.fromDate(now),
         claimableAt: this.#leaseExpiry(now),
         error: FieldValue.delete(),
@@ -663,9 +788,50 @@ export class SessionRepository {
         ...session,
         status: 'RUNNING' as const,
         claimedBy: runnerId,
+        leaseToken,
         heartbeatAt: now,
         error: undefined,
       };
+    });
+  }
+
+  async assertPersistenceLease(authority: SessionLease): Promise<void> {
+    const ref = this.#ref(authority.sessionId);
+    await this.#firestore.runTransaction(async (transaction) => {
+      await this.#requirePersistenceLease(transaction, ref, authority);
+    });
+  }
+
+  async publishSnapshot(
+    authority: SessionLease,
+    entitlements: UserEntitlements,
+    snapshot: UploadedSnapshot,
+  ): Promise<{ readonly projectId: string; readonly previous: StoredSnapshot }> {
+    const { registry } = await this.#configuration.get();
+    const ref = this.#ref(authority.sessionId);
+
+    return this.#firestore.runTransaction(async (transaction) => {
+      const { session, project } = await this.#requirePersistenceLease(
+        transaction,
+        ref,
+        authority,
+      );
+      await this.#metering.setGaugeIn(transaction, {
+        uid: session.ownerUid,
+        entitlements,
+        meterKey: registry.storageMeterKey,
+        previousQuantity: project.snapshotBytes,
+        quantity: snapshot.bytes,
+        now: new Date(),
+      });
+      transaction.update(this.#projects.refFor(project.id), {
+        snapshotBytes: snapshot.bytes,
+        snapshotObjectName: snapshot.objectName,
+        snapshotObjectGeneration: snapshot.generation,
+        snapshotUpdatedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      return { projectId: project.id, previous: project.snapshot };
     });
   }
 
@@ -732,6 +898,75 @@ export class SessionRepository {
     });
   }
 
+  /**
+   * Takes a specialist token hold and records it on the session, in one commit.
+   *
+   * The two used to be separate transactions, which left a window where a hold
+   * existed and nothing pointed at it: a process that died in between stranded
+   * capacity nobody could find. Here the usage decrement, the reservation
+   * document and the session pointer are one atomic write, so a hold that is
+   * spendable is always a hold that is recoverable.
+   *
+   * The lease is validated inside the same transaction, so a runner that has
+   * already lost the session cannot take a hold against it at all.
+   */
+  async reserveSpecialistTokens(
+    sessionId: string,
+    runnerId: string,
+    input: {
+      readonly entitlements: UserEntitlements;
+      readonly meterKey: string;
+      readonly quantity: number;
+      readonly operationId: string;
+      readonly now: Date;
+    },
+  ): Promise<Reservation> {
+    const ref = this.#ref(sessionId);
+    return this.#firestore.runTransaction(async (transaction) => {
+      // Reads first, and all of them: the lease and project guard, then the
+      // usage document inside reserveIn. Firestore forbids reading after
+      // writing, so nothing may be written before this point.
+      const { session } = await this.#requireLeaseState(transaction, ref, runnerId);
+      const reservation = await this.#metering.reserveIn(transaction, {
+        uid: session.ownerUid,
+        entitlements: input.entitlements,
+        meterKey: input.meterKey,
+        quantity: input.quantity,
+        operationId: input.operationId,
+        now: input.now,
+      });
+      transaction.update(ref, {
+        specialistReservationIds: FieldValue.arrayUnion(reservation.id),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      return reservation;
+    });
+  }
+
+  /**
+   * Forgets one specialist hold, once it has reached a terminal accounting
+   * outcome. Allowed on a cancelled session: the hold is already closed by the
+   * time this runs, and leaving the id behind would strand a record of a
+   * reservation that no longer needs recovering.
+   */
+  async forgetSpecialistReservation(
+    sessionId: string,
+    runnerId: string,
+    reservationId: string,
+  ): Promise<void> {
+    await this.#withLease(
+      sessionId,
+      runnerId,
+      (transaction, ref) => {
+        transaction.update(ref, {
+          specialistReservationIds: FieldValue.arrayRemove(reservationId),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      },
+      true,
+    );
+  }
+
   /** Forgets the sandbox and holds once they have actually been given back. */
   async detachSandbox(sessionId: string, runnerId: string): Promise<void> {
     await this.#withLease(sessionId, runnerId, (transaction, ref) => {
@@ -747,14 +982,51 @@ export class SessionRepository {
    * Releases the session. `claimableAt` is removed rather than pushed far into
    * the future: absent means no runner will ever look at it again, which is the
    * truth until the user says something else.
-   */
-  async finish(sessionId: string, runnerId: string, outcome: SessionOutcome): Promise<void> {
-    await this.#withLease(sessionId, runnerId, (transaction, ref) => {
+  */
+  async finish(
+    sessionId: string,
+    runnerId: string,
+    outcome: SessionOutcome,
+    now: Date = new Date(),
+  ): Promise<void> {
+    const ref = this.#ref(sessionId);
+    await this.#firestore.runTransaction(async (transaction) => {
+      const { session } = await this.#requireLeaseState(transaction, ref, runnerId, true);
+      if (session.cancelRequested === true && outcome.status === 'IDLE') {
+        throw new AppError({
+          code: 'session/cancelled',
+          statusCode: 409,
+          message: 'Cancelled by user',
+          details: { sessionId: session.id },
+        });
+      }
+
+      // Terminal means `claimableAt` is deleted, and a session without it is
+      // never claimed again by anyone — so this is the last moment any hold it
+      // still owns can be given back. Closing them here, in the same commit,
+      // makes "terminal while holding capacity" a state that cannot exist. A
+      // contradictory ledger throws, the whole finalisation is refused, and the
+      // session stays claimable for another runner to try again.
+      if (session.specialistReservationIds.length > 0) {
+        await this.#metering.releaseIn(
+          transaction,
+          session.ownerUid,
+          session.specialistReservationIds,
+          now,
+        );
+      }
+
       transaction.update(ref, {
         status: outcome.status,
         error: outcome.status === 'FAILED' ? outcome.error : FieldValue.delete(),
         claimedBy: FieldValue.delete(),
+        leaseToken: FieldValue.delete(),
         claimableAt: FieldValue.delete(),
+        specialistReservationIds: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      transaction.update(this.#projects.refFor(session.projectId), {
+        activeSessionId: null,
         updatedAt: FieldValue.serverTimestamp(),
       });
     });
@@ -769,7 +1041,17 @@ export class SessionRepository {
     transaction: Transaction,
     ref: DocumentReference,
     runnerId: string,
+    allowCancelled = false,
   ): Promise<BuildSession> {
+    return (await this.#requireLeaseState(transaction, ref, runnerId, allowCancelled)).session;
+  }
+
+  async #requireLeaseState(
+    transaction: Transaction,
+    ref: DocumentReference,
+    runnerId: string,
+    allowCancelled = false,
+  ): Promise<{ readonly session: BuildSession; readonly project: Project }> {
     const snapshot = await transaction.get(ref);
     if (!snapshot.exists) {
       throw new AppError({
@@ -779,7 +1061,7 @@ export class SessionRepository {
       });
     }
     const session = parseSession(snapshot.id, snapshot.data() ?? {}, ref.path);
-    if (session.cancelRequested === true) {
+    if (session.cancelRequested === true && !allowCancelled) {
       throw new AppError({
         code: 'session/cancelled',
         statusCode: 409,
@@ -795,19 +1077,43 @@ export class SessionRepository {
         details: { status: session.status, claimedBy: session.claimedBy },
       });
     }
-    return session;
+    const project = await this.#projects.readOwnedInTransaction(
+      transaction,
+      session.ownerUid,
+      session.projectId,
+    );
+    this.#assertProjectGuard(project, session);
+    return { session, project };
+  }
 
+  async #requirePersistenceLease(
+    transaction: Transaction,
+    ref: DocumentReference,
+    authority: SessionLease,
+  ): Promise<{ readonly session: BuildSession; readonly project: Project }> {
+    const state = await this.#requireLeaseState(transaction, ref, authority.runnerId);
+    const { session } = state;
+    if (session.leaseToken !== authority.token) {
+      throw new AppError({
+        code: 'session/lease-lost',
+        statusCode: 409,
+        message: 'This runner no longer owns the persistence lease for the session.',
+        details: { sessionId: session.id, claimedBy: session.claimedBy },
+      });
+    }
+    return state;
   }
 
   async #withLease(
     sessionId: string,
     runnerId: string,
-    write: (transaction: Transaction, ref: DocumentReference) => void,
+    write: (transaction: Transaction, ref: DocumentReference, session: BuildSession) => void,
+    allowCancelled = false,
   ): Promise<void> {
     const ref = this.#ref(sessionId);
     await this.#firestore.runTransaction(async (transaction) => {
-      await this.#requireLease(transaction, ref, runnerId);
-      write(transaction, ref);
+      const session = await this.#requireLease(transaction, ref, runnerId, allowCancelled);
+      write(transaction, ref, session);
     });
   }
 }

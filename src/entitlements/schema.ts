@@ -49,11 +49,52 @@ export interface SandboxProvider {
   readonly workdir: string;
   readonly idleGraceSeconds: number;
   readonly agentInstructions: string;
+  /**
+   * Trusted validation commands, keyed by operation ("test", "typecheck",
+   * "lint"). The platform owns these; repository content, package scripts and
+   * users never choose them. This is the whole authority the Testing
+   * Specialist's `run_validation` has — it names an operation and the runtime
+   * resolves it here, so the specialist can never supply a command string. May
+   * be empty, which means no validation is offered for this platform.
+   */
+  readonly validationProfiles: ReadonlyMap<string, string>;
 }
 
 export interface EntitlementSource {
   readonly key: string;
   readonly precedence: number;
+}
+
+/**
+ * A specialist the primary coding agent may consult.
+ *
+ * Configuration rather than code for the same reason `agentInstructions` is:
+ * adding a database or billing specialist, or correcting how one is told to
+ * review, must not be a deploy. The runtime offers exactly the specialists
+ * configured here and knows nothing else about them.
+ */
+export interface SpecialistDefinition {
+  readonly key: string;
+  /** Shown to the user, e.g. "Security". Never the instructions. */
+  readonly label: string;
+  /** One line telling the primary agent when this specialist is worth its cost. */
+  readonly purpose: string;
+  readonly instructions: string;
+  /**
+   * Whether this specialist may run concurrently with its siblings. True only
+   * for a strictly read-only role that touches no mutable workspace state, so
+   * the parallel scheduler can group it. Stated in configuration, never
+   * inferred from the key: a specialist that runs project code is not
+   * parallel-safe and must say so.
+   */
+  readonly parallelSafe: boolean;
+  /**
+   * Whether this specialist is granted `run_validation` — the trusted-profile
+   * way to execute project validation without arbitrary shell authority. A
+   * validation-capable specialist must not also be `parallelSafe`, because its
+   * runs checkpoint and restore the workspace.
+   */
+  readonly validation: boolean;
 }
 
 export interface Registry {
@@ -78,6 +119,12 @@ export interface Registry {
   readonly meters: ReadonlyMap<string, MeterDefinition>;
   readonly entitlementSources: ReadonlyMap<string, EntitlementSource>;
   readonly sandboxProviders: ReadonlyMap<Platform, SandboxProvider>;
+  /**
+   * Specialists available for consultation, by key. Empty is a deployment that
+   * configures none, which is a working deployment: the primary agent is simply
+   * never offered the tool. A malformed entry is refused rather than skipped.
+   */
+  readonly specialists: ReadonlyMap<string, SpecialistDefinition>;
 }
 
 export const billingIntervals = ['day', 'week', 'month', 'year'] as const;
@@ -123,6 +170,32 @@ export interface Plan {
   readonly entitlements: ReadonlyMap<string, EntitlementValue>;
   readonly meterLimits: ReadonlyMap<string, MeterLimit>;
   readonly rateLimits: ReadonlyMap<RateLimitClass, RateLimit>;
+}
+
+/**
+ * Reads a provider's trusted validation profiles: an object mapping an
+ * operation to the command that runs it. Required but allowed to be empty; a
+ * value that is not an object, or a command that is not a non-empty string, is
+ * refused rather than quietly dropped, so a broken profile cannot become a
+ * silently missing capability.
+ */
+function parseValidationProfiles(entry: Fields, at: string): ReadonlyMap<string, string> {
+  const value = entry['validationProfiles'];
+  if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new DocumentShapeError(
+      `${at}: field "validationProfiles" must be an object mapping operations to commands.`,
+    );
+  }
+  const profiles = new Map<string, string>();
+  for (const [operation, command] of Object.entries(value)) {
+    if (typeof command !== 'string' || command.trim() === '') {
+      throw new DocumentShapeError(
+        `${at}.validationProfiles.${operation} must be a non-empty command string.`,
+      );
+    }
+    profiles.set(operation, command);
+  }
+  return profiles;
 }
 
 export function parseRegistry(fields: Fields, where: string): Registry {
@@ -206,9 +279,39 @@ export function parseRegistry(fields: Fields, where: string): Registry {
         workdir: stringField(entry, 'workdir', at),
         idleGraceSeconds: integerField(entry, 'idleGraceSeconds', at, { min: 0 }),
         agentInstructions: stringField(entry, 'agentInstructions', at),
+        validationProfiles: parseValidationProfiles(entry, at),
       };
     },
   );
+
+  // Absent means this deployment configures no specialists, which is the state
+  // every registry written before they existed is in. Present but malformed is
+  // refused: a specialist that cannot be read must not silently disappear.
+  const specialistList = Object.prototype.hasOwnProperty.call(fields, 'specialists')
+    ? objectArrayField(fields, 'specialists', where).map(
+        (entry, index): SpecialistDefinition => {
+          const at = `${where}.specialists[${index}]`;
+          const parallelSafe = booleanField(entry, 'parallelSafe', at);
+          const validation = booleanField(entry, 'validation', at);
+          if (parallelSafe && validation) {
+            // A validation run checkpoints and restores the workspace, so it
+            // cannot share a parallel group. Refused here rather than silently
+            // demoted, so a misconfiguration is loud.
+            throw new DocumentShapeError(
+              `${at}: a specialist cannot be both parallelSafe and validation-capable.`,
+            );
+          }
+          return {
+            key: stringField(entry, 'key', at),
+            label: stringField(entry, 'label', at),
+            purpose: stringField(entry, 'purpose', at),
+            instructions: stringField(entry, 'instructions', at),
+            parallelSafe,
+            validation,
+          };
+        },
+      )
+    : [];
 
   const defaultPlanKey = stringField(fields, 'defaultPlanKey', where);
   const sandboxTimeMeterKey = stringField(fields, 'sandboxTimeMeterKey', where);
@@ -285,6 +388,11 @@ export function parseRegistry(fields: Fields, where: string): Registry {
     meters,
     entitlementSources,
     sandboxProviders: indexByKey(providerList, (provider) => provider.platform, `${where}.sandboxProviders`) as ReadonlyMap<Platform, SandboxProvider>,
+    specialists: indexByKey(
+      specialistList,
+      (specialist) => specialist.key,
+      `${where}.specialists`,
+    ),
   };
 }
 

@@ -41,6 +41,75 @@ export const registryDocument = {
     { key: "builds.started", unit: "count", kind: "COUNTER", resetPeriod: "MONTHLY", label: "Builds" },
     { key: "storage.bytes", unit: "bytes", kind: "GAUGE", resetPeriod: "NEVER", label: "Storage" },
   ],
+  specialists: [
+    {
+      key: "architecture",
+      label: "Architecture",
+      purpose:
+        "reviews whether a change fits the codebase - module boundaries, where configuration " +
+        "belongs, dependency direction, duplicated logic and complexity that is not earning its keep",
+      instructions:
+        "You are an architecture reviewer for a codebase another agent is changing.\n\n" +
+        "Judge whether a change fits the project as it already is. Look for logic duplicated from " +
+        "somewhere that already exists, deployment-specific values written into code instead of " +
+        "configuration, dependencies pointing the wrong way, module boundaries being crossed, and " +
+        "abstraction that no current requirement asks for.\n\n" +
+        "Prefer the smallest thing that works. An extra layer, an interface with one implementation " +
+        "or a configuration knob for a value that never changes is a finding, not a virtue.\n\n" +
+        "Read the surrounding code before you judge it. Cite the file you read for every finding. " +
+        "Reserve a blocking verdict for a change that would genuinely damage the codebase - " +
+        "corrupt persisted state, break an existing invariant, or commit the project to something " +
+        "expensive to undo. Everything else is a concern.",
+      parallelSafe: true,
+      validation: false,
+    },
+    {
+      key: "security",
+      label: "Security",
+      purpose:
+        "reviews security-sensitive work - authentication, authorization, user isolation, secrets, " +
+        "injection, IDOR, unsafe defaults, trust boundaries and data leaving the system",
+      instructions:
+        "You are a security reviewer for a codebase another agent is changing.\n\n" +
+        "Look for missing or weakened authentication and authorization, one user reaching another " +
+        "user's data, identifiers that can be enumerated, secrets in code or in logs, values " +
+        "spliced into shell commands or queries, defaults that fail open, trust placed in input " +
+        "from a sandbox or a client, and data sent somewhere it should not go.\n\n" +
+        "Required state must fail closed. A missing credential, owner or limit that is quietly " +
+        "substituted with a default is a finding.\n\n" +
+        "Read the code before you judge it, and cite the file for every finding. Reserve a blocking " +
+        "verdict for something genuinely exploitable or for a real weakening of an existing " +
+        "boundary - not for defence in depth you would like to see added. Say so plainly when you " +
+        "find nothing: an invented finding costs the user a fix they did not need.",
+      parallelSafe: true,
+      validation: false,
+    },
+    {
+      key: "testing",
+      label: "Testing",
+      purpose:
+        "runs the project's own validation - typecheck, tests and lint - and judges whether it " +
+        "actually proves the change works, worth its cost when correctness matters and cheap to " +
+        "check yourself is not enough",
+      instructions:
+        "You are a validation reviewer for a codebase another agent is changing.\n\n" +
+        "You cannot edit the project and you cannot run arbitrary commands. You have one way to " +
+        "exercise it: run_validation, which runs the project's own trusted checks by name - " +
+        "\"typecheck\", \"test\" and \"lint\". Read the code first to decide which checks are worth " +
+        "running and what a passing result would actually prove; a green test that never touches " +
+        "the changed behaviour is not evidence.\n\n" +
+        "Each validation runs the project's real code in the sandbox and then restores the " +
+        "workspace, so your runs never change the project. If a run reports that validation " +
+        "modified the workspace, treat that as a finding in its own right - a check that rewrites " +
+        "the tree it is meant to inspect is not safe to rely on.\n\n" +
+        "Cite the exact command and its result for every finding. Reserve a blocking verdict for " +
+        "validation that actually fails or that proves the requested behaviour is broken or " +
+        "unproven - not for a check you would have liked to see added. Say so plainly when the " +
+        "project validates cleanly.",
+      parallelSafe: false,
+      validation: true,
+    },
+  ],
   sandboxProviders: [
     {
       platform: "mobile",
@@ -52,6 +121,15 @@ export const registryDocument = {
       concurrencyMeterKey: "sandbox.concurrent.mobile",
       workdir: "/home/user/project",
       idleGraceSeconds: 300,
+      // Expo/jest-expo, run in non-mutating modes: tsc emits nothing, jest --ci
+      // fails rather than writing new snapshots, eslint reports without --fix.
+      // These still execute the project's own code; the tool checkpoints and
+      // restores the workspace around every run, which is the actual safety.
+      validationProfiles: {
+        typecheck: "npx --no-install tsc --noEmit",
+        test: "npx --no-install jest --ci",
+        lint: "npx --no-install eslint .",
+      },
       agentInstructions: "This is an Expo (React Native) project. A blank Expo app with web support is already installed at the project root \u2014 edit it rather than scaffolding a new one, and do not run create-expo-app.\n\nWrite screens in App.js (or App.tsx) and files it imports. Use React Native components \u2014 View, Text, Pressable, FlatList, StyleSheet \u2014 never HTML elements like div or span, which do not exist here.\n\nTo show the user their app, run start_preview with:\n  command: npx expo start --web --port 8081 --host 0.0.0.0\n  port: 8081\n\nThat serves the app through react-native-web, which is what the user sees in the preview. The same server also hosts the Expo Go manifest, so one command covers both the browser preview and the QR code for a real phone \u2014 do not start a second server for it.\n\nOnly add a dependency if the app genuinely needs it: installing packages on this sandbox is slow, and every one is time the user spends watching a spinner.",
     },
     {
@@ -64,6 +142,15 @@ export const registryDocument = {
       concurrencyMeterKey: "sandbox.concurrent.web",
       workdir: "/home/user/project",
       idleGraceSeconds: 300,
+      // Vite/React/TS with Vitest, run in non-mutating modes: tsc emits nothing,
+      // vitest run is single-shot (no watch, no snapshot writes), eslint reports
+      // without --fix. The project's own code still runs; the tool checkpoints
+      // and restores the workspace around every run, which is the actual safety.
+      validationProfiles: {
+        typecheck: "npx --no-install tsc --noEmit",
+        test: "npx --no-install vitest run",
+        lint: "npx --no-install eslint .",
+      },
       agentInstructions: "This is a web project. Scaffold with Vite unless the user asks for something else, and prefer React with TypeScript.\n\nTo show the user their app, run start_preview with the dev server command and its port, for example:\n  command: npm run dev -- --host 0.0.0.0 --port 5173\n  port: 5173\n\nThe --host flag is required. A dev server bound only to localhost cannot be reached from outside the sandbox, so the preview will time out even though the server is running.",
     },
   ],
