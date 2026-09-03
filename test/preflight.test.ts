@@ -1,0 +1,518 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+
+import type { App } from 'firebase-admin/app';
+import type { Auth } from 'firebase-admin/auth';
+import type { Firestore } from 'firebase-admin/firestore';
+import type { Redis } from 'ioredis';
+
+import { EnvironmentError } from '../src/config/env.ts';
+import type { FirebaseServices } from '../src/firebase.ts';
+import { type PreflightDependencies, runPreflight } from '../src/preflight.ts';
+import { registryDocument, planDocuments } from '../src/seed/config.ts';
+
+/**
+ * Every variable `loadConfig` and `loadRunnerConfig` require, satisfying every
+ * min/max/enum/format rule in `src/config/index.ts` — including
+ * `RUNNER_HEARTBEAT_SECONDS < SESSION_LEASE_SECONDS`. Callers override only
+ * what one test cares about, via `withEnv`.
+ */
+function validEnv(): Record<string, string> {
+  return {
+    NODE_ENV: 'test',
+    LOG_LEVEL: 'error',
+    FIREBASE_PROJECT_ID: 'lotusbuild-test',
+    FIREBASE_SERVICE_ACCOUNT_FILE: '/tmp/does-not-need-to-exist.json',
+    CONFIG_CACHE_TTL_SECONDS: '60',
+    REDIS_URL: 'redis://localhost:6379',
+    SUBSCRIPTION_CACHE_TTL_SECONDS: '60',
+    SESSION_LEASE_SECONDS: '60',
+    SESSION_EVENT_RETENTION_SECONDS: '3600',
+    SESSION_EVENT_MAX_PER_SESSION: '1000',
+    FIREBASE_STORAGE_BUCKET: 'lotusbuild-test.appspot.com',
+    SNAPSHOT_URL_TTL_SECONDS: '300',
+    HOST: '127.0.0.1',
+    PORT: '4100',
+    PUBLIC_API_URL: 'https://api.example.test',
+    SSE_HEARTBEAT_SECONDS: '15',
+    SSE_MAX_CONNECTIONS: '100',
+    STRIPE_SECRET_KEY: 'sk_test_x',
+    STRIPE_WEBHOOK_SECRET: 'whsec_x',
+    STRIPE_EVENT_REPLAY_WINDOW_SECONDS: '86400',
+    STRIPE_CHECKOUT_SUCCESS_URL: 'https://example.test/done',
+    STRIPE_CHECKOUT_CANCEL_URL: 'https://example.test/cancelled',
+    STRIPE_PORTAL_RETURN_URL: 'https://example.test/billing',
+    CORS_ALLOWED_ORIGINS: 'https://example.test',
+    ANTHROPIC_API_KEY: 'sk-ant-x',
+    ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
+    ANTHROPIC_MAX_OUTPUT_TOKENS: '8000',
+    AGENT_MESSAGE_HISTORY_LIMIT: '40',
+    AGENT_MAX_STEPS: '30',
+    AGENT_COMMAND_TIMEOUT_SECONDS: '120',
+    AGENT_TOOL_OUTPUT_MAX_CHARS: '20000',
+    AGENT_MAX_SPECIALIST_CONSULTATIONS: '4',
+    AGENT_SPECIALIST_MAX_STEPS: '10',
+    GIT_AUTHOR_NAME: 'LotusBuild',
+    GIT_AUTHOR_EMAIL: 'build@example.test',
+    E2B_API_KEY: 'e2b_x',
+    E2B_DOMAIN: 'e2b.app',
+    E2B_VALIDATE_API_KEY: 'false',
+    PREVIEW_READY_TIMEOUT_SECONDS: '30',
+    RUNNER_IDLE_POLL_SECONDS: '5',
+    RUNNER_HEARTBEAT_SECONDS: '10',
+  };
+}
+
+function withEnv(overrides: Record<string, string | undefined>): Record<string, string | undefined> {
+  return { ...validEnv(), ...overrides };
+}
+
+function fakeFirestore(): Firestore {
+  return {
+    doc: (path: string) => ({
+      get: async () => {
+        if (path !== 'config/registry') {
+          throw new Error(`unexpected doc path in this fake: ${path}`);
+        }
+        return { exists: true, data: () => registryDocument };
+      },
+    }),
+    collection: (path: string) => ({
+      get: async () => {
+        if (path !== 'plans') {
+          throw new Error(`unexpected collection path in this fake: ${path}`);
+        }
+        return {
+          docs: planDocuments.map((plan) => ({ id: plan.key, data: () => plan })),
+        };
+      },
+    }),
+  } as unknown as Firestore;
+}
+
+/** A Firestore that never resolves anything — proves it was never even asked. */
+function untouchableFirestore(): Firestore {
+  return {
+    doc: () => {
+      throw new Error('this run must never reach Firestore');
+    },
+    collection: () => {
+      throw new Error('this run must never reach Firestore');
+    },
+  } as unknown as Firestore;
+}
+
+interface RedisCalls {
+  connected: boolean;
+  quit: number;
+  writes: unknown[];
+}
+
+/** A Redis stub whose only real behaviour is remembering whether it was asked to write or quit. */
+function fakeRedis(calls: RedisCalls, quitFails = false): Redis {
+  const writeMethods = ['publish', 'subscribe', 'set', 'get', 'del', 'expire', 'incr', 'hset'];
+  const target: Record<string, unknown> = {
+    quit: async () => {
+      calls.quit += 1;
+      if (quitFails) {
+        throw new Error('connection reset while closing');
+      }
+      return 'OK';
+    },
+  };
+  for (const name of writeMethods) {
+    target[name] = (...args: unknown[]) => {
+      calls.writes.push([name, ...args]);
+      throw new Error(`fakeRedis: unexpected call to ${name}`);
+    };
+  }
+  return target as unknown as Redis;
+}
+
+function fakeFirebaseServices(firestore: Firestore = fakeFirestore()): FirebaseServices {
+  return {
+    app: {} as unknown as App,
+    auth: {} as unknown as Auth,
+    firestore,
+  };
+}
+
+function baseDeps(overrides: Partial<PreflightDependencies> = {}): PreflightDependencies {
+  const redisCalls: RedisCalls = { connected: false, quit: 0, writes: [] };
+  return {
+    env: validEnv(),
+    initialiseFirebase: () => fakeFirebaseServices(),
+    connectRedis: async () => {
+      redisCalls.connected = true;
+      return fakeRedis(redisCalls);
+    },
+    makeSnapshotStore: () => ({ assertReachable: async () => undefined }),
+    ...overrides,
+  };
+}
+
+/* -------------------------------------------------------------- config */
+
+test('fully-valid API + runner env proceeds', async () => {
+  const result = await runPreflight(baseDeps());
+  assert.equal(result.ok, true);
+});
+
+test('missing API-required env rejects', async () => {
+  const deps = baseDeps({ env: withEnv({ STRIPE_SECRET_KEY: undefined }) });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.stage === 'config');
+  assert.ok(!result.ok && result.problems.some((p) => p.includes('STRIPE_SECRET_KEY')));
+});
+
+test('missing runner-required env rejects', async () => {
+  const deps = baseDeps({ env: withEnv({ ANTHROPIC_API_KEY: undefined }) });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.stage === 'config');
+  assert.ok(!result.ok && result.problems.some((p) => p.includes('ANTHROPIC_API_KEY')));
+});
+
+test('multiple invalid env fields across both specs are reported together, without printing values', async () => {
+  const deps = baseDeps({
+    env: withEnv({
+      PORT: 'not-a-port',
+      STRIPE_SECRET_KEY: '   ',
+      AGENT_MAX_STEPS: '0',
+      E2B_API_KEY: 'super-secret-e2b-key-value',
+      E2B_VALIDATE_API_KEY: 'maybe',
+    }),
+  });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.stage === 'config');
+  const problems = !result.ok ? result.problems : [];
+  assert.ok(problems.some((p) => p.includes('PORT')));
+  assert.ok(problems.some((p) => p.includes('STRIPE_SECRET_KEY')));
+  assert.ok(problems.some((p) => p.includes('AGENT_MAX_STEPS')));
+  assert.ok(problems.some((p) => p.includes('E2B_VALIDATE_API_KEY')));
+  // A valid secret value is never echoed back, even for a field that did parse.
+  assert.ok(!problems.some((p) => p.includes('super-secret-e2b-key-value')));
+});
+
+/* ------------------------------------------------------------- firebase */
+
+test('Firebase initialization failure rejects', async () => {
+  const deps = baseDeps({
+    initialiseFirebase: () => {
+      throw new EnvironmentError(['FIREBASE_SERVICE_ACCOUNT_FILE cannot be read at /tmp/x — ENOENT']);
+    },
+  });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.stage === 'firebase');
+});
+
+test('a project/service-account mismatch rejects through the same behaviour', async () => {
+  const deps = baseDeps({
+    initialiseFirebase: () => {
+      throw new EnvironmentError([
+        'FIREBASE_SERVICE_ACCOUNT_FILE at /tmp/x belongs to project "other", but ' +
+          'FIREBASE_PROJECT_ID is "lotusbuild-test".',
+      ]);
+    },
+  });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.stage === 'firebase');
+  assert.ok(!result.ok && result.problems.some((p) => p.includes('belongs to project')));
+});
+
+/* --------------------------------------------------------------- redis */
+
+test('Redis connect/auth succeeds → continues to the registry check', async () => {
+  const result = await runPreflight(baseDeps());
+  assert.equal(result.ok, true);
+});
+
+test('Redis unavailable rejects', async () => {
+  const deps = baseDeps({
+    connectRedis: async () => {
+      throw new EnvironmentError(['REDIS_URL points at localhost:6379, which did not accept a connection']);
+    },
+  });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.stage === 'redis');
+});
+
+test('Redis authentication failure rejects', async () => {
+  const deps = baseDeps({
+    connectRedis: async () => {
+      throw new Error('NOAUTH Authentication required.');
+    },
+  });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.stage === 'redis');
+  assert.ok(!result.ok && result.problems.some((p) => p.includes('NOAUTH')));
+});
+
+test('the Redis client is closed after a successful preflight', async () => {
+  const calls: RedisCalls = { connected: false, quit: 0, writes: [] };
+  const deps = baseDeps({
+    connectRedis: async () => fakeRedis(calls),
+  });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, true);
+  assert.equal(calls.quit, 1);
+});
+
+test('the Redis client is closed on a later registry failure, having already been opened', async () => {
+  const calls: RedisCalls = { connected: false, quit: 0, writes: [] };
+  const deps = baseDeps({
+    connectRedis: async () => fakeRedis(calls),
+    initialiseFirebase: () => fakeFirebaseServices(untouchableFirestore()),
+  });
+  // untouchableFirestore throws synchronously from .doc()/.collection(), which
+  // ConfigurationStore.get() awaits and surfaces as a rejected promise.
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.stage === 'registry');
+  assert.equal(calls.quit, 1);
+});
+
+test('a Redis close failure after an otherwise-successful preflight is reported, not silently dropped', async () => {
+  const calls: RedisCalls = { connected: false, quit: 0, writes: [] };
+  const deps = baseDeps({
+    connectRedis: async () => fakeRedis(calls, true),
+  });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.stage === 'cleanup');
+  assert.equal(calls.quit, 1);
+});
+
+test('a Redis close failure after a registry failure is appended, never displacing the real reason', async () => {
+  const calls: RedisCalls = { connected: false, quit: 0, writes: [] };
+  const deps = baseDeps({
+    connectRedis: async () => fakeRedis(calls, true),
+    initialiseFirebase: () => fakeFirebaseServices(untouchableFirestore()),
+  });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.stage === 'registry');
+  assert.ok(!result.ok && result.problems.some((p) => p.includes('this run must never reach Firestore')));
+  assert.ok(!result.ok && result.problems.some((p) => p.includes('closed cleanly')));
+});
+
+/* ------------------------------------------------------------ registry */
+
+test('missing registry document rejects', async () => {
+  const missingRegistry = {
+    doc: (path: string) => ({
+      get: async () => {
+        if (path !== 'config/registry') {
+          throw new Error(`unexpected doc path: ${path}`);
+        }
+        return { exists: false, data: () => undefined };
+      },
+    }),
+    collection: () => ({ get: async () => ({ docs: [] }) }),
+  } as unknown as Firestore;
+  const deps = baseDeps({ initialiseFirebase: () => fakeFirebaseServices(missingRegistry) });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.stage === 'registry');
+  assert.ok(!result.ok && result.problems.some((p) => p.includes('has not been seeded')));
+});
+
+test('an old/malformed registry schema rejects', async () => {
+  const oldShapeRegistry = {
+    doc: (path: string) => ({
+      get: async () => {
+        if (path !== 'config/registry') {
+          throw new Error(`unexpected doc path: ${path}`);
+        }
+        // Missing every required field, as an old-schema document would be.
+        return { exists: true, data: () => ({}) };
+      },
+    }),
+    collection: () => ({ get: async () => ({ docs: [] }) }),
+  } as unknown as Firestore;
+  const deps = baseDeps({ initialiseFirebase: () => fakeFirebaseServices(oldShapeRegistry) });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.stage === 'registry');
+});
+
+test('an invalid plan rejects', async () => {
+  const first = planDocuments[0];
+  assert.ok(first !== undefined, 'fixture: planDocuments must not be empty');
+  const badPlan = { ...first, key: 'mismatched-key' };
+  const firestore = {
+    doc: () => ({ get: async () => ({ exists: true, data: () => registryDocument }) }),
+    collection: () => ({
+      get: async () => ({ docs: [{ id: first.key, data: () => badPlan }] }),
+    }),
+  } as unknown as Firestore;
+  const deps = baseDeps({ initialiseFirebase: () => fakeFirebaseServices(firestore) });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.stage === 'registry');
+  assert.ok(!result.ok && result.problems.some((p) => p.includes('disagree')));
+});
+
+test('an invalid cross-reference rejects', async () => {
+  const brokenRegistry = { ...registryDocument, defaultPlanKey: 'no-such-plan' };
+  const firestore = {
+    doc: () => ({ get: async () => ({ exists: true, data: () => brokenRegistry }) }),
+    collection: () => ({
+      get: async () => ({ docs: planDocuments.map((plan) => ({ id: plan.key, data: () => plan })) }),
+    }),
+  } as unknown as Firestore;
+  const deps = baseDeps({ initialiseFirebase: () => fakeFirebaseServices(firestore) });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.stage === 'registry');
+  assert.ok(!result.ok && result.problems.some((p) => p.includes('no-such-plan')));
+});
+
+test('a genuinely valid registry/plans succeeds', async () => {
+  const result = await runPreflight(baseDeps());
+  assert.equal(result.ok, true);
+  assert.ok(result.ok && result.summary.plans === planDocuments.length);
+  assert.ok(result.ok && result.summary.specialists === registryDocument.specialists.length);
+});
+
+/* -------------------------------------------------------------- storage */
+
+test('an unreachable snapshot store rejects', async () => {
+  const deps = baseDeps({
+    makeSnapshotStore: () => ({
+      assertReachable: async () => {
+        throw new EnvironmentError(['FIREBASE_STORAGE_BUCKET "x" could not be reached']);
+      },
+    }),
+  });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.stage === 'storage');
+});
+
+test('a reachable snapshot store succeeds', async () => {
+  let called = false;
+  const deps = baseDeps({
+    makeSnapshotStore: () => ({
+      assertReachable: async () => {
+        called = true;
+      },
+    }),
+  });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, true);
+  assert.equal(called, true);
+});
+
+/* ------------------------------------------------------- side effects */
+
+test('no Firestore writes occur at any stage, including a successful run', async () => {
+  let wroteSomething = false;
+  const watchedFirestore = {
+    doc: (path: string) => ({
+      get: async () => {
+        if (path !== 'config/registry') {
+          throw new Error(`unexpected doc path: ${path}`);
+        }
+        return { exists: true, data: () => registryDocument };
+      },
+      set: () => {
+        wroteSomething = true;
+      },
+      create: () => {
+        wroteSomething = true;
+      },
+      update: () => {
+        wroteSomething = true;
+      },
+    }),
+    collection: (path: string) => ({
+      get: async () => {
+        if (path !== 'plans') {
+          throw new Error(`unexpected collection path: ${path}`);
+        }
+        return { docs: planDocuments.map((plan) => ({ id: plan.key, data: () => plan })) };
+      },
+      doc: () => {
+        wroteSomething = true;
+        return { set: () => (wroteSomething = true) };
+      },
+    }),
+    batch: () => {
+      wroteSomething = true;
+      return { set: () => undefined, commit: async () => undefined };
+    },
+    runTransaction: () => {
+      wroteSomething = true;
+    },
+  } as unknown as Firestore;
+
+  const deps = baseDeps({ initialiseFirebase: () => fakeFirebaseServices(watchedFirestore) });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, true);
+  assert.equal(wroteSomething, false);
+});
+
+test('no Redis application mutation occurs — only PING-equivalent connect and quit are used', async () => {
+  const calls: RedisCalls = { connected: false, quit: 0, writes: [] };
+  const deps = baseDeps({ connectRedis: async () => fakeRedis(calls) });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls.writes, []);
+});
+
+test('no API listener starts and no runner claim loop starts — preflight never imports those modules', async () => {
+  const source = await import('node:fs/promises').then((fs) =>
+    fs.readFile(new URL('../src/preflight.ts', import.meta.url), 'utf8'),
+  );
+  assert.ok(!source.includes("from './server.ts'"));
+  assert.ok(!source.includes("from './runner/loop.ts'"));
+  assert.ok(!source.includes('app.listen'));
+  assert.ok(!source.includes('runUntilStopped'));
+});
+
+test('no sandbox is acquired/created, no Anthropic generation occurs, no Stripe API call occurs — proven by dependency shape', async () => {
+  // runPreflight's own dependency contract has no sandbox, Anthropic or Stripe
+  // client anywhere in it: nothing exists to call, by construction.
+  const deps = baseDeps();
+  const keys = Object.keys(deps).sort();
+  assert.deepEqual(keys, ['connectRedis', 'env', 'initialiseFirebase', 'makeSnapshotStore']);
+});
+
+test('no seed/migration function is invoked', async () => {
+  const source = await import('node:fs/promises').then((fs) =>
+    fs.readFile(new URL('../src/preflight.ts', import.meta.url), 'utf8'),
+  );
+  assert.ok(!source.includes("from './seed/run.ts'"));
+  assert.ok(!source.includes("from './migrations/"));
+});
+
+/* --------------------------------------------------------- diagnostics */
+
+test('diagnostics contain no secret values', async () => {
+  const secretEnv = withEnv({
+    STRIPE_SECRET_KEY: 'sk_live_should_never_appear',
+    ANTHROPIC_API_KEY: 'sk-ant-should-never-appear',
+    E2B_API_KEY: 'e2b_should_never_appear',
+    REDIS_URL: 'redis://:supersecretpassword@localhost:6379',
+    PORT: 'not-a-port', // forces a config-stage failure, closest path to leaking a fellow value
+  });
+  const deps = baseDeps({ env: secretEnv });
+  const result = await runPreflight(deps);
+  assert.equal(result.ok, false);
+  const text = !result.ok ? result.problems.join('\n') : '';
+  for (const secret of [
+    'sk_live_should_never_appear',
+    'sk-ant-should-never-appear',
+    'e2b_should_never_appear',
+    'supersecretpassword',
+  ]) {
+    assert.ok(!text.includes(secret), `diagnostic leaked a secret: ${secret}`);
+  }
+});

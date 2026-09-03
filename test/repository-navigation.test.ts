@@ -24,21 +24,48 @@ import {
  *
  * Path plumbing, test-only: `resolveInWorkdir` does pure POSIX string math
  * (`node:path`'s `posix`), so it only treats a path as absolute if it starts
- * with "/". A Windows temp directory does not. `toMsysPath` turns
- * `C:\Users\...\x` into `/c/Users/.../x`, which both `posix.resolve` accepts
- * as absolute AND Git Bash's own `cd` accepts natively (MSYS's own path
- * form) — confirmed empirically before writing this file. `execFileSync`'s
+ * with "/". `mkdtempSync`/`tmpdir()` hand back whatever the platform's own
+ * native temp path looks like — on Windows that is `C:\Users\...\x`, which
+ * does not start with "/"; on POSIX (this suite's own CI, and E2B's actual
+ * sandbox) it already does, e.g. `/tmp/lotus-nav-xxxxxx`.
+ *
+ * `toShellPath`/`fromShellPath` branch on `process.platform` — an explicit,
+ * deterministic runtime fact, never inferred from a path string's own shape —
+ * so the same test file proves the tools correctly on both. On Windows,
+ * `toShellPath` turns `C:\Users\...\x` into `/c/Users/.../x`, which both
+ * `posix.resolve` accepts as absolute AND Git Bash's own `cd` accepts
+ * natively (MSYS's own path form) — confirmed empirically. `execFileSync`'s
  * `cwd` option, by contrast, is a Windows API and does NOT accept that form,
  * so `RealSandbox` never passes one; every script instead starts with its own
  * `cd "<root>"`, exactly mirroring how the tools under test already `cd` via
- * `LOTUSBUILD_SCOPE_PATH`. None of this exists on the real runtime: E2B's
- * sandbox is Linux, where `provider.workdir` is already a real POSIX path
- * and this whole conversion is unnecessary.
+ * `LOTUSBUILD_SCOPE_PATH`. On POSIX, the native path already *is* that form,
+ * so `toShellPath` only asserts it looks absolute and returns it unchanged —
+ * this is exactly what runs on the real target, since E2B's own sandbox is
+ * Linux, where `provider.workdir` is already a real POSIX path and no
+ * conversion is needed at all. `fromShellPath` is the inverse, for handing a
+ * path back to Node's own `fs` functions (`mkdirSync`, `writeFileSync`,
+ * `symlinkSync`, `rmSync`), which need a genuine native path — Git Bash's
+ * MSYS form is foreign to them on Windows; on POSIX there is no difference to
+ * invert.
+ *
+ * Neither function silently accepts a malformed path on its own platform: a
+ * Windows-run `toShellPath` given something that isn't drive-letter-shaped
+ * still throws, and a POSIX-run one given something that isn't already
+ * absolute still throws — the fail-fast contract this suite always had is
+ * unchanged, just no longer forced to assume Windows.
  */
-function toMsysPath(windowsPath: string): string {
-  const match = /^([A-Za-z]):[\\/](.*)$/.exec(windowsPath);
+const isWindows = process.platform === 'win32';
+
+function toShellPath(nativePath: string): string {
+  if (!isWindows) {
+    if (!nativePath.startsWith('/')) {
+      throw new Error(`not an absolute POSIX path: ${nativePath}`);
+    }
+    return nativePath;
+  }
+  const match = /^([A-Za-z]):[\\/](.*)$/.exec(nativePath);
   if (match === null) {
-    throw new Error(`not an absolute Windows path: ${windowsPath}`);
+    throw new Error(`not an absolute Windows path: ${nativePath}`);
   }
   const drive = match[1];
   const rest = match[2];
@@ -46,6 +73,22 @@ function toMsysPath(windowsPath: string): string {
     throw new Error(`unreachable: the regex above guarantees both groups`);
   }
   return `/${drive.toLowerCase()}/${rest.replace(/\\/g, '/')}`;
+}
+
+function fromShellPath(shellPath: string): string {
+  if (!isWindows) {
+    return shellPath;
+  }
+  const match = /^\/([A-Za-z])\/(.*)$/.exec(shellPath);
+  if (match === null) {
+    throw new Error(`not an MSYS path produced by toShellPath: ${shellPath}`);
+  }
+  const drive = match[1];
+  const rest = match[2];
+  if (drive === undefined || rest === undefined) {
+    throw new Error(`unreachable: the regex above guarantees both groups`);
+  }
+  return `${drive.toLowerCase()}:/${rest}`;
 }
 
 class RealSandbox implements RunningSandbox {
@@ -98,8 +141,8 @@ function sh(root: string, script: string): void {
 
 /** A fresh Git repository: one tracked file, node_modules and ignored.txt gitignored. */
 function newGitRepo(): string {
-  const root = toMsysPath(mkdtempSync(join(tmpdir(), 'lotus-nav-')));
-  roots.push(root.replace(/^\/([a-z])\//, '$1:/'));
+  const root = toShellPath(mkdtempSync(join(tmpdir(), 'lotus-nav-')));
+  roots.push(fromShellPath(root));
   sh(
     root,
     [
@@ -119,9 +162,10 @@ function newGitRepo(): string {
 
 /** A plain directory that is never `git init`'d. */
 function newPlainDir(): string {
-  const root = toMsysPath(mkdtempSync(join(tmpdir(), 'lotus-nav-plain-')));
-  roots.push(root.replace(/^\/([a-z])\//, '$1:/'));
-  mkdirSync(join(root.replace(/^\/([a-z])\//, '$1:/'), 'src'), { recursive: true });
+  const root = toShellPath(mkdtempSync(join(tmpdir(), 'lotus-nav-plain-')));
+  const native = fromShellPath(root);
+  roots.push(native);
+  mkdirSync(join(native, 'src'), { recursive: true });
   return root;
 }
 
@@ -392,7 +436,7 @@ test('search_files: symlink content is not read (best-effort on this platform)',
   const outsideWin = mkdtempSync(join(tmpdir(), 'lotus-nav-outside-'));
   roots.push(outsideWin);
   writeFileSync(join(outsideWin, 'secret.txt'), 'NEEDLE_OUTSIDE\n', 'utf8');
-  const rootWin = root.replace(/^\/([a-z])\//, '$1:/');
+  const rootWin = fromShellPath(root);
   let created = true;
   try {
     symlinkSync(join(outsideWin, 'secret.txt'), join(rootWin, 'src', 'link.ts'), 'file');
@@ -504,7 +548,7 @@ function runSearchOverFiles(
 
 test('searchOverFilesScript: a genuine zero-match search succeeds with empty output', () => {
   const root = newGitRepo();
-  const rootWin = root.replace(/^\/([a-z])\//, '$1:/');
+  const rootWin = fromShellPath(root);
   const filePath = join(rootWin, 'src', 'tracked.ts');
   const listPath = join(rootWin, 'files.list');
   writeFileSync(listPath, nulJoin([filePath]), 'utf8');
@@ -517,7 +561,7 @@ test('searchOverFilesScript: a genuine zero-match search succeeds with empty out
 
 test('searchOverFilesScript: a directory in the file list fails the whole search, not zero matches', () => {
   const root = newGitRepo();
-  const rootWin = root.replace(/^\/([a-z])\//, '$1:/');
+  const rootWin = fromShellPath(root);
   const badDir = join(rootWin, 'a-directory');
   mkdirSync(badDir);
   const listPath = join(rootWin, 'files.list');
@@ -531,7 +575,7 @@ test('searchOverFilesScript: a directory in the file list fails the whole search
 
 test('searchOverFilesScript: a missing file in the file list fails the whole search', () => {
   const root = newGitRepo();
-  const rootWin = root.replace(/^\/([a-z])\//, '$1:/');
+  const rootWin = fromShellPath(root);
   const missing = join(rootWin, 'does-not-exist.ts');
   const listPath = join(rootWin, 'files.list');
   writeFileSync(listPath, nulJoin([missing]), 'utf8');
@@ -544,7 +588,7 @@ test('searchOverFilesScript: a missing file in the file list fails the whole sea
 
 test('searchOverFilesScript: an earlier match does not survive a later failure — the whole search fails', () => {
   const root = newGitRepo();
-  const rootWin = root.replace(/^\/([a-z])\//, '$1:/');
+  const rootWin = fromShellPath(root);
   const goodFile = join(rootWin, 'src', 'tracked.ts'); // contains "const tracked = 1;"
   const badDir = join(rootWin, 'a-directory');
   mkdirSync(badDir);
@@ -683,7 +727,7 @@ test('search_files: a page shrinks truthfully to fit a tight output budget', asy
 
 test('search_files: matches non-BMP Unicode content correctly', async () => {
   const root = newGitRepo();
-  writeFileSync(join(root.replace(/^\/([a-z])\//, '$1:/'), 'src', 'emoji.ts'), 'const s = "NEEDLE \u{1F600}";\n', 'utf8');
+  writeFileSync(join(fromShellPath(root), 'src', 'emoji.ts'), 'const s = "NEEDLE \u{1F600}";\n', 'utf8');
   const result = await runTool('search_files', { query: 'NEEDLE \u{1F600}' }, contextOf(root), workspaceTools);
   assert.equal(result.isError, false);
   const page = parsePage(result.text);

@@ -13,6 +13,7 @@
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "node --test --experimental-strip-types \"test/**/*.test.ts\"",
     "migrate:project-session-guard": "node --experimental-strip-types src/migrations/run-project-active-sessions.ts",
+    "preflight": "node --experimental-strip-types src/preflight.ts",
     "runner": "node --experimental-strip-types src/runner/index.ts",
     "runner:dev": "node --watch --experimental-strip-types src/runner/index.ts"
   },
