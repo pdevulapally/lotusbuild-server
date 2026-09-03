@@ -36,8 +36,13 @@ function validEnv(): Record<string, string> {
     PUBLIC_API_URL: 'https://api.example.test',
     SSE_HEARTBEAT_SECONDS: '15',
     SSE_MAX_CONNECTIONS: '100',
-    STRIPE_SECRET_KEY: 'sk_test_x',
-    STRIPE_WEBHOOK_SECRET: 'whsec_x',
+    // Deliberately not shaped like a real Stripe secret key or webhook
+    // signing secret — CI's own secret scanner greps for those exact
+    // prefixes, correctly, since it cannot tell a fixture from the real
+    // thing. `asString` only requires non-empty, so a plainly-fake
+    // placeholder proves the same thing without tripping it.
+    STRIPE_SECRET_KEY: 'stripe-secret-key-fixture',
+    STRIPE_WEBHOOK_SECRET: 'stripe-webhook-secret-fixture',
     STRIPE_EVENT_REPLAY_WINDOW_SECONDS: '86400',
     STRIPE_CHECKOUT_SUCCESS_URL: 'https://example.test/done',
     STRIPE_CHECKOUT_CANCEL_URL: 'https://example.test/cancelled',
@@ -496,10 +501,13 @@ test('no seed/migration function is invoked', async () => {
 /* --------------------------------------------------------- diagnostics */
 
 test('diagnostics contain no secret values', async () => {
+  // Deliberately not shaped like a real Stripe/Anthropic/E2B credential — see
+  // the comment on `validEnv`'s own fixtures for why: this is exactly the
+  // kind of string CI's secret scanner is right to flag, fixture or not.
   const secretEnv = withEnv({
-    STRIPE_SECRET_KEY: 'sk_live_should_never_appear',
-    ANTHROPIC_API_KEY: 'sk-ant-should-never-appear',
-    E2B_API_KEY: 'e2b_should_never_appear',
+    STRIPE_SECRET_KEY: 'unique-stripe-value-should-never-appear',
+    ANTHROPIC_API_KEY: 'unique-anthropic-value-should-never-appear',
+    E2B_API_KEY: 'unique-e2b-value-should-never-appear',
     REDIS_URL: 'redis://:supersecretpassword@localhost:6379',
     PORT: 'not-a-port', // forces a config-stage failure, closest path to leaking a fellow value
   });
@@ -508,9 +516,9 @@ test('diagnostics contain no secret values', async () => {
   assert.equal(result.ok, false);
   const text = !result.ok ? result.problems.join('\n') : '';
   for (const secret of [
-    'sk_live_should_never_appear',
-    'sk-ant-should-never-appear',
-    'e2b_should_never_appear',
+    'unique-stripe-value-should-never-appear',
+    'unique-anthropic-value-should-never-appear',
+    'unique-e2b-value-should-never-appear',
     'supersecretpassword',
   ]) {
     assert.ok(!text.includes(secret), `diagnostic leaked a secret: ${secret}`);
