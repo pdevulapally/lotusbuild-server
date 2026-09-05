@@ -6,6 +6,8 @@ import type { SandboxProvider } from '../entitlements/schema.ts';
 import type { CommandOutcome, RunningSandbox } from '../sandboxes/provider.ts';
 
 export interface ToolContext {
+  readonly publicPreviewEnabled?: boolean;
+  readonly withValidationSandbox?: (run: (sandbox: RunningSandbox) => Promise<CommandOutcome>) => Promise<CommandOutcome>;
   readonly sandbox: RunningSandbox;
   readonly provider: SandboxProvider;
   readonly commandTimeoutMs: number;
@@ -19,6 +21,25 @@ export interface ToolContext {
   readonly toolOutputMaxChars: number;
   /** Told when a preview comes up, so the session can show it. */
   readonly onPreview: (preview: { readonly url: string; readonly port: number }) => Promise<void>;
+}
+
+async function projectRead(context: ToolContext, path: string): Promise<string> {
+  if (context.sandbox.projectFileOperation === undefined) return context.sandbox.readFile(path);
+  const result = await context.sandbox.projectFileOperation(context.provider.workdir, { op: 'read', path }, context.commandTimeoutMs);
+  if (result.exitCode !== 0) throw new Error('Confined file read failed: ' + result.stderr);
+  return (JSON.parse(result.stdout) as { text: string }).text;
+}
+async function projectWrite(context: ToolContext, path: string, content: string): Promise<void> {
+  if (context.sandbox.projectFileOperation === undefined) return context.sandbox.writeFile(path, content);
+  const result = await context.sandbox.projectFileOperation(context.provider.workdir,
+    { op: 'write', path, data: Buffer.from(content).toString('base64') }, context.commandTimeoutMs);
+  if (result.exitCode !== 0) throw new Error('Confined file write failed: ' + result.stderr);
+}
+async function projectWindow(context: ToolContext, path: string, offset: number, limit: number): Promise<{ text: string; start: number; total: number }> {
+  const result = await context.sandbox.projectFileOperation!(context.provider.workdir,
+    { op: 'range', path, offset, limit: Math.min(limit, Math.max(1, Math.floor(context.toolOutputMaxChars / 6))) }, context.commandTimeoutMs);
+  if (result.exitCode !== 0) throw new Error('Confined ranged read failed: ' + result.stderr);
+  return JSON.parse(result.stdout) as { text: string; start: number; total: number };
 }
 
 export interface ToolResult {
@@ -62,6 +83,9 @@ function resolveInWorkdir(provider: SandboxProvider, candidate: string): string 
   const resolved = posix.resolve(workdir, candidate);
   if (resolved !== workdir && !resolved.startsWith(`${workdir}/`)) {
     throw new Error(`"${candidate}" resolves outside the project directory ${workdir}.`);
+  }
+  if (posix.relative(workdir, resolved).split('/').some((part) => part.toLowerCase() === '.git')) {
+    throw new Error('Git internals are not accessible through project file tools.');
   }
   return resolved;
 }
@@ -267,7 +291,7 @@ function paginateEntries<T>(input: {
 const eligibleFilesFunction = [
   'lotusbuild_eligible_files() {',
   '  is_git=0',
-  '  git rev-parse --git-dir >/dev/null 2>&1 && is_git=1',
+  '  git -c core.fsmonitor=false -c core.hooksPath=/dev/null rev-parse --git-dir >/dev/null 2>&1 && is_git=1',
   '  if [ "$is_git" = 0 ] && [ -n "${LOTUSBUILD_PATHSPEC:-}" ]; then',
   '    echo LOTUSBUILD_ERROR=glob-requires-git',
   '    return 1',
@@ -275,9 +299,9 @@ const eligibleFilesFunction = [
   '  raw=$(mktemp)',
   '  if [ "$is_git" = 1 ]; then',
   '    if [ -n "${LOTUSBUILD_PATHSPEC:-}" ]; then',
-  '      git ls-files -z --cached --others --exclude-standard -- "$LOTUSBUILD_PATHSPEC" > "$raw"',
+  '      git -c core.fsmonitor=false -c core.hooksPath=/dev/null ls-files -z --cached --others --exclude-standard -- "$LOTUSBUILD_PATHSPEC" > "$raw"',
   '    else',
-  '      git ls-files -z --cached --others --exclude-standard > "$raw"',
+  '      git -c core.fsmonitor=false -c core.hooksPath=/dev/null ls-files -z --cached --others --exclude-standard > "$raw"',
   '    fi',
   '  else',
   '    find . -mindepth 1 -not -path "./.git" -not -path "./.git/*" -type f -print0 > "$raw"',
@@ -470,23 +494,26 @@ interface SearchMatch {
   readonly content: string;
 }
 
-/** Parses one line of `grep --null -H -n -I` output. `undefined` only for a stray blank line. */
-function parseMatchLine(raw: string): SearchMatch | undefined {
-  const nul = raw.indexOf('\u0000');
-  if (nul === -1) {
-    return undefined;
+/** Read the NUL-terminated filename before parsing a matching line: filenames can contain newlines. */
+function parseSearchMatches(raw: string): SearchMatch[] {
+  const matches: SearchMatch[] = [];
+  let offset = 0;
+  while (offset < raw.length) {
+    const nul = raw.indexOf('\u0000', offset);
+    const end = nul < 0 ? -1 : raw.indexOf('\n', nul + 1);
+    const colon = nul < 0 ? -1 : raw.indexOf(':', nul + 1);
+    if (nul <= offset || end < 0 || colon < nul || colon > end) {
+      throw new Error('Search returned malformed or incomplete match data.');
+    }
+    const number = raw.slice(nul + 1, colon);
+    const line = Number(number);
+    if (!/^[1-9]\d*$/.test(number) || !Number.isSafeInteger(line)) {
+      throw new Error('Search returned an invalid line number.');
+    }
+    matches.push({ path: raw.slice(offset, nul), line, content: raw.slice(colon + 1, end) });
+    offset = end + 1;
   }
-  const path = raw.slice(0, nul);
-  const rest = raw.slice(nul + 1);
-  const colon = rest.indexOf(':');
-  if (colon === -1) {
-    return undefined;
-  }
-  const line = Number(rest.slice(0, colon));
-  if (!Number.isInteger(line)) {
-    return undefined;
-  }
-  return { path, line, content: rest.slice(colon + 1) };
+  return matches;
 }
 
 /**
@@ -543,7 +570,7 @@ const definitions: readonly ToolDefinition[] = [
       if (typeof content !== 'string') {
         throw new Error('"content" must be a string.');
       }
-      await context.sandbox.writeFile(path, content);
+      await projectWrite(context, path, content);
       return { text: `Wrote ${content.length} characters to ${path}.`, isError: false };
     },
   },
@@ -590,7 +617,7 @@ const definitions: readonly ToolDefinition[] = [
       // longer holds fails exactly like a match that never held — there is no
       // separate staleness check to write, because there is nothing cached to
       // go stale.
-      const content = await context.sandbox.readFile(path);
+      const content = await projectRead(context, path);
       // Every starting position old_string could match, not just a
       // non-overlapping tiling of them: "aaa" in "aaaa" matches at both index
       // 0 and index 1, and replacing one or the other produces a different
@@ -627,7 +654,7 @@ const definitions: readonly ToolDefinition[] = [
       const startLine = content.slice(0, at).split('\n').length;
       const endLine = startLine + oldString.split('\n').length - 1;
       const updated = content.slice(0, at) + newString + content.slice(at + oldString.length);
-      await context.sandbox.writeFile(path, updated);
+      await projectWrite(context, path, updated);
 
       const where = endLine === startLine ? `line ${startLine}` : `lines ${startLine}-${endLine}`;
       return { text: `Replaced 1 occurrence in ${path} (${where}).`, isError: false };
@@ -674,8 +701,14 @@ const definitions: readonly ToolDefinition[] = [
       // enforcing regardless of what was asked for.
       const limit = optionalPositiveInteger(input, 'limit') ?? context.toolOutputMaxChars;
 
-      const content = await context.sandbox.readFile(path);
-      const total = content.length;
+      const window = context.sandbox.projectFileOperation !== undefined
+        ? await projectWindow(context, path, requestedOffset, limit)
+        : context.sandbox.readFileRange === undefined
+        ? { text: await projectRead(context, path), start: 0 }
+        : await context.sandbox.readFileRange(path, requestedOffset, Math.min(limit, context.toolOutputMaxChars), context.commandTimeoutMs);
+      const content = window.text;
+      const start = window.start;
+      const total = 'total' in window ? window.total : content.length;
       if (requestedOffset > total) {
         return {
           text:
@@ -688,10 +721,10 @@ const definitions: readonly ToolDefinition[] = [
       // back from a previous read, could land inside a surrogate pair; a
       // previous `end` never does, because every `end` below is snapped the
       // same way before it is returned.
-      const offset = snapBeforeSurrogatePair(content, requestedOffset);
+      const offset = start + snapBeforeSurrogatePair(content, requestedOffset - start);
 
-      let end = snapBeforeSurrogatePair(content, Math.min(offset + limit, total));
-      let rendered = renderFileRange(path, offset, end, total, content.slice(offset, end));
+      let end = start + snapBeforeSurrogatePair(content, Math.min(offset + limit, total, start + content.length - ('total' in window && start + content.length < total ? 1 : 0)) - start);
+      let rendered = renderFileRange(path, offset, end, total, content.slice(offset - start, end - start));
       // The generic tool-output truncation in the outer loop would otherwise
       // cut this reply after it has already claimed a larger range as
       // delivered. Shrinking the range here, before returning, is what keeps
@@ -701,8 +734,8 @@ const definitions: readonly ToolDefinition[] = [
       // ever moves it one further back), so this always terminates.
       while (rendered.length > context.toolOutputMaxChars && end > offset) {
         const overshoot = rendered.length - context.toolOutputMaxChars;
-        end = snapBeforeSurrogatePair(content, Math.max(offset, end - overshoot));
-        rendered = renderFileRange(path, offset, end, total, content.slice(offset, end));
+        end = start + snapBeforeSurrogatePair(content, Math.max(offset, end - overshoot) - start);
+        rendered = renderFileRange(path, offset, end, total, content.slice(offset - start, end - start));
       }
       if (rendered.length > context.toolOutputMaxChars) {
         // Only reachable if even an empty range plus this path's own name
@@ -772,7 +805,9 @@ const definitions: readonly ToolDefinition[] = [
       const offset = optionalNonNegativeInteger(input, 'offset') ?? 0;
       const limit = optionalPositiveInteger(input, 'limit') ?? defaultEntryPageSize;
 
-      const outcome = await context.sandbox.runCommand(listFilesScript, {
+      const outcome = context.sandbox.projectFileOperation !== undefined
+        ? await context.sandbox.projectFileOperation(context.provider.workdir, { op: 'list', path: scopePath, glob: rawGlob ?? '' }, context.commandTimeoutMs)
+        : await context.sandbox.runCommand(listFilesScript, {
         cwd: context.provider.workdir,
         timeoutMs: context.commandTimeoutMs,
         envs: { LOTUSBUILD_SCOPE_PATH: scopePath, LOTUSBUILD_PATHSPEC: rawGlob ?? '' },
@@ -892,7 +927,9 @@ const definitions: readonly ToolDefinition[] = [
       const offset = optionalNonNegativeInteger(input, 'offset') ?? 0;
       const limit = optionalPositiveInteger(input, 'limit') ?? defaultEntryPageSize;
 
-      const outcome = await context.sandbox.runCommand(searchFilesScript, {
+      const outcome = context.sandbox.projectFileOperation !== undefined
+        ? await context.sandbox.projectFileOperation(context.provider.workdir, { op: 'search', path: scopePath, glob: rawGlob ?? '', query }, context.commandTimeoutMs)
+        : await context.sandbox.runCommand(searchFilesScript, {
         cwd: context.provider.workdir,
         timeoutMs: context.commandTimeoutMs,
         envs: {
@@ -902,7 +939,7 @@ const definitions: readonly ToolDefinition[] = [
         },
       });
 
-      if (outcome.stdout.includes('LOTUSBUILD_ERROR=glob-requires-git')) {
+      if (outcome.exitCode !== 0 && outcome.stdout.startsWith('LOTUSBUILD_ERROR=glob-requires-git\n')) {
         return {
           text: '"glob" requires the project to be a Git working tree, which it is not right now.',
           isError: true,
@@ -910,12 +947,11 @@ const definitions: readonly ToolDefinition[] = [
       }
 
       const failedMarker = 'LOTUSBUILD_SEARCH_FAILED\n';
-      const failedAt = outcome.stdout.indexOf(failedMarker);
-      if (failedAt !== -1) {
+      if (outcome.exitCode !== 0 && outcome.stdout.startsWith(failedMarker)) {
         // Listing succeeded, but the search over those files did not — never
         // reported as zero matches, which would tell the model source text
         // is absent when the truth is that it was never actually searched.
-        const diagnostic = outcome.stdout.slice(failedAt + failedMarker.length).trim();
+        const diagnostic = outcome.stdout.slice(failedMarker.length).trim();
         return {
           text:
             'search_files could not complete: the search itself failed partway through, so its ' +
@@ -925,18 +961,13 @@ const definitions: readonly ToolDefinition[] = [
       }
 
       const marker = 'LOTUSBUILD_MATCHES_START\n';
-      const markerAt = outcome.stdout.indexOf(marker);
-      if (outcome.exitCode !== 0 || markerAt === -1) {
+      if (outcome.exitCode !== 0) {
         return describe(outcome);
       }
-
-      const matches: SearchMatch[] = [];
-      for (const raw of outcome.stdout.slice(markerAt + marker.length).split('\n')) {
-        const match = parseMatchLine(raw);
-        if (match !== undefined) {
-          matches.push(match);
-        }
+      if (!outcome.stdout.startsWith(marker)) {
+        throw new Error('Search returned no valid completion header.');
       }
+      const matches = parseSearchMatches(outcome.stdout.slice(marker.length));
 
       return paginateEntries({
         entries: matches,
@@ -975,6 +1006,8 @@ const definitions: readonly ToolDefinition[] = [
     async run(input, context) {
       const command = requireString(input, 'command');
       const port = requirePort(input, 'port');
+      if (context.publicPreviewEnabled !== true) return { isError: true,
+        text: 'Public previews are disabled for this project. Only the project owner can enable them outside this build. Do not expose another public port or tunnel.' };
 
       await context.sandbox.runCommand(command, {
         cwd: context.provider.workdir,
@@ -1263,7 +1296,7 @@ const runValidationSpec: Tool = {
     "Run one of the project's trusted validation checks and get its result. You choose the " +
     'operation by name — typically "typecheck", "test" or "lint"; the platform decides the ' +
     'actual command, so you cannot pass one. The check runs the project\'s own code and the ' +
-    'workspace is restored afterwards, so your run never changes the project. Returns the exit ' +
+    'check runs in a disposable VM copy, which is stopped afterwards. Returns the exit ' +
     'status and output. A non-zero exit is the check failing, which is evidence to act on, not a ' +
     'tool error.',
   input_schema: {
@@ -1278,29 +1311,7 @@ const runValidationSpec: Tool = {
   },
 };
 
-/**
- * Builds the `run_validation` tool for one consultation.
- *
- * The tool has no command field: it resolves the operation against the
- * platform's trusted profiles and runs nothing else, which is what keeps a
- * validation-capable specialist off arbitrary shell authority. Around the
- * profile command it checkpoints the workspace, restores it to that exact
- * state afterwards, and verifies the restore — so the authoritative tree the
- * primary agent is building is protected from anything validation touches.
- *
- * This restores the *workspace*; it does not make the project's code trusted,
- * and it is not a network boundary. The validation command runs real project
- * code in a sandbox that still has outbound network access, and can still cause
- * external side effects. What is guaranteed is that the project tree comes back
- * unchanged, or the tool fails loudly.
- *
- * The signal and lease check are captured here rather than read from the tool
- * context because they are per-consultation. Foreground sandbox commands cannot
- * be aborted mid-flight by the installed SDK — the signal only cancels the
- * request, not the remote process — so cancellation is enforced at the one
- * point it can be: no new validation command is started once the session is
- * stopping or the lease is gone.
- */
+/** Trusted profile command in a provider VM copy. Never runs project tests in the primary VM. */
 export function makeRunValidation(guard: {
   readonly signal: AbortSignal;
   readonly assertStillOurs: () => void;
@@ -1332,59 +1343,18 @@ export function makeRunValidation(guard: {
         };
       }
 
-      const run = (
-        script: string,
-        envs?: Readonly<Record<string, string>>,
-      ): Promise<CommandOutcome> =>
-        context.sandbox.runCommand(script, {
-          cwd: context.provider.workdir,
-          timeoutMs: context.commandTimeoutMs,
-          ...(envs === undefined ? {} : { envs }),
+      if (context.withValidationSandbox === undefined) {
+        return { text: 'Isolated validation is unavailable. No validation command was run.', isError: true };
+      }
+      const outcome = await context.withValidationSandbox(async (sandbox) => {
+        // Provisioning is asynchronous. Cancellation and ownership are checked
+        // again immediately before dispatch inside the disposable VM.
+        guard.assertStillOurs();
+        guard.signal.throwIfAborted();
+        return sandbox.runCommand(command, {
+          cwd: context.provider.workdir, timeoutMs: context.commandTimeoutMs, envs: {},
         });
-
-      const checkpointResult = await run(validationCheckpointScript);
-      const checkpoint =
-        checkpointResult.exitCode === 0 ? parseCheckpoint(checkpointResult.stdout) : undefined;
-      if (checkpoint === undefined) {
-        return {
-          text:
-            'Validation could not checkpoint the workspace and was not run, so nothing was ' +
-            'changed.',
-          isError: true,
-        };
-      }
-
-      // The profile command runs with no environment of ours: backend
-      // credentials are never propagated, and nothing from the runner process
-      // is inherited. Only the sandbox's own default environment applies.
-      const outcome = await run(command, {});
-
-      const restore = await run(validationRestoreScript, {
-        LOTUSBUILD_INDEX_TREE: checkpoint.indexTree,
-        LOTUSBUILD_WORKING_TREE: checkpoint.workingTree,
-        LOTUSBUILD_HEAD_REF: checkpoint.headRef,
-        LOTUSBUILD_HEAD_COMMIT: checkpoint.headCommit,
       });
-      const report = parseRestoreReport(restore.stdout);
-      if (restore.exitCode !== 0 || report === undefined) {
-        // Restoration did not complete. The authoritative tree may now hold
-        // validation's changes, so this is a hard failure, not a warning.
-        return {
-          text:
-            'Validation ran but the workspace could not be restored. The project may now contain ' +
-            'changes made by the validation run and must be treated as unsafe until checked.',
-          isError: true,
-        };
-      }
-      if (!report.verified) {
-        return {
-          text:
-            'Validation ran but restoration could not be verified: the workspace does not match ' +
-            'its pre-validation state. Treat the project tree as unsafe.',
-          isError: true,
-        };
-      }
-
       const passed = outcome.exitCode === 0;
       const lines = [
         `Validation "${operation}" ran.`,
@@ -1398,20 +1368,7 @@ export function makeRunValidation(guard: {
       if (err !== '') {
         lines.push('stderr:', err);
       }
-      if (report.mutated) {
-        lines.push(
-          '',
-          'Note: this validation modified the project git state — its files, staged state or ' +
-            'HEAD. The changes were discarded and the pre-validation state was restored.',
-          ...(report.changed.length === 0
-            ? []
-            : [`Changed: ${report.changed.slice(0, 20).join('; ')}`]),
-        );
-      } else {
-        lines.push('', 'The validation did not modify the workspace.');
-      }
-      // isError stays false: validation ran and the tree is safe. A failing
-      // check is reported in the exit status above, for the specialist to judge.
+      lines.push('', 'Validation ran in a disposable sandbox copy, which has been stopped. The primary workspace was not changed by this validation command.');
       return { text: lines.join('\n'), isError: false };
     },
   };

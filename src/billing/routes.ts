@@ -7,7 +7,7 @@ import { AppError } from '../http/errors.ts';
 import { cached } from '../support/cache.ts';
 import type { UserRepository } from '../users/repository.ts';
 import type { BillingRepository } from './repository.ts';
-import { ensurePriceId, readSubscription, throughStripe } from './stripe.ts';
+import { currentSubscription, ensurePriceId, readSubscription, throughStripe } from './stripe.ts';
 
 export interface BillingUrls {
   readonly checkoutSuccess: URL;
@@ -46,13 +46,22 @@ export function registerBillingRoutes(
 ): void {
   const { stripe, billing, users, configuration, urls } = deps;
 
+  const subscriptionFor = async (customer: string): Promise<Stripe.Subscription | undefined> => {
+    const page = await stripe.subscriptions.list({ customer, status: 'all', limit: 100 });
+    if (page.has_more) {
+      throw new AppError({ code: 'billing/history-too-large', statusCode: 503,
+        message: 'Subscription history requires reconciliation before this operation can complete.' });
+    }
+    return currentSubscription(page.data);
+  };
+
   /** The Stripe customer for this account, made once and remembered. */
   const customerFor = async (uid: string, onError: (error: Error) => void): Promise<string> => {
+    const stored = await users.read(uid);
     const existing = await billing.customerIdFor(uid);
     if (existing !== undefined) {
       return existing;
     }
-    const stored = await users.read(uid);
     const customer = await throughStripe(
       'open an account',
       () =>
@@ -183,23 +192,29 @@ export function registerBillingRoutes(
         request.log.error({ err: error, uid: user.uid }, 'stripe rejected a billing call');
       };
       const customer = await customerFor(user.uid, onError);
+      if (await throughStripe('check existing subscriptions', () => subscriptionFor(customer), onError)) {
+        throw new AppError({ code: 'billing/already-subscribed', statusCode: 409,
+          message: 'This account already has a subscription. Use the billing portal to change it.' });
+      }
       // Published from the plan document if Stripe has not seen this amount yet,
       // so a price change is a configuration edit and nothing else.
       const priceId = await ensurePriceId(stripe, plan, onError);
+      const operation = await billing.checkoutOperation(user.uid, plan.key, priceId);
       const session = await throughStripe(
         'start checkout',
         () =>
           stripe.checkout.sessions.create({
             mode: 'subscription',
             customer,
-            line_items: [{ price: priceId, quantity: 1 }],
+            line_items: [{ price: operation.priceId, quantity: 1 }],
+            expires_at: operation.expiresAt,
             success_url: urls.checkoutSuccess.toString(),
             cancel_url: urls.checkoutCancel.toString(),
             client_reference_id: user.uid,
             // Carried onto the subscription itself, so an event about it can be
             // traced back to an account even from Stripe's dashboard.
             subscription_data: { metadata: { uid: user.uid, planKey: plan.key } },
-          }),
+          }, { idempotencyKey: `checkout:${user.uid}:${operation.id}` }),
         onError,
       );
 
@@ -225,6 +240,7 @@ export function registerBillingRoutes(
     async (request) => {
       const user = authenticatedUser(request);
       const customerId = await billing.customerIdFor(user.uid);
+      await users.read(user.uid);
       if (customerId === undefined) {
         throw new AppError({
           code: 'billing/no-customer',
@@ -303,20 +319,26 @@ export function registerBillingRoutes(
           });
         }
 
-        if (!(await billing.claimEvent(event.id))) {
+        const claim = await billing.claimEvent(event.id);
+        if (claim.kind === 'completed') {
           // Already handled. Acknowledged so Stripe stops resending it.
           return reply.code(200).send({ received: true, duplicate: true });
         }
 
         try {
           const handled = await handleEvent(event);
+          await billing.completeEvent(event.id, claim.token);
           request.log.info({ eventId: event.id, type: event.type, handled }, 'stripe event');
           return reply.code(200).send({ received: true });
         } catch (error) {
           // The claim is given back so Stripe's next retry is allowed to try
           // again; keeping it would turn one transient failure into a
           // subscription change that is never applied.
-          await billing.releaseEvent(event.id);
+          try {
+            await billing.releaseEvent(event.id, claim.token);
+          } catch (cleanup) {
+            throw new AggregateError([error, cleanup], 'Webhook processing and claim cleanup failed.');
+          }
           throw error;
         }
       },
@@ -339,17 +361,11 @@ export function registerBillingRoutes(
       return 'unknown-customer';
     }
 
-    if (deletionEvents.has(event.type)) {
-      await billing.removeSubscription(uid);
-      return 'removed';
-    }
-
     const { plans } = await configuration.get();
-    const state = readSubscription(subscription, plans);
-    return billing.applySubscription({
-      uid,
-      state,
-      eventCreatedAt: new Date(event.created * 1000),
+    await billing.synchronizeSubscription(uid, async () => {
+      const current = await subscriptionFor(customerId);
+      return current === undefined ? null : readSubscription(current, plans);
     });
+    return 'synchronized';
   }
 }

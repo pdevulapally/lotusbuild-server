@@ -11,6 +11,7 @@ export interface AuthenticatedUser {
   readonly photoUrl: string | undefined;
   /** Seconds since the epoch, from the token. Used to reject stale sessions. */
   readonly authTime: number;
+  readonly expiresAt?: number;
 }
 
 declare module 'fastify' {
@@ -75,15 +76,14 @@ const tokenFailureCodes: ReadonlyMap<string, string> = new Map([
 export function registerAuth(app: FastifyInstance, firebaseAuth: Auth): void {
   const requireAuth: preHandlerHookHandler = async (
     request: FastifyRequest,
-    _reply: FastifyReply,
+    reply: FastifyReply,
   ): Promise<void> => {
     const token = bearerToken(request.headers.authorization);
 
     let decoded;
     try {
-      // `checkRevoked` is off: it costs a round trip to Google on every single
-      // request. Revocation is handled by the token's own one-hour lifetime.
-      decoded = await firebaseAuth.verifyIdToken(token);
+      // Lockdown must invalidate a stolen token before its normal expiry.
+      decoded = await firebaseAuth.verifyIdToken(token, true);
     } catch (cause) {
       const firebaseCode =
         typeof cause === 'object' && cause !== null && 'code' in cause
@@ -104,6 +104,7 @@ export function registerAuth(app: FastifyInstance, firebaseAuth: Auth): void {
     }
 
     request.auth = Object.freeze({
+      expiresAt: decoded.exp,
       uid: decoded.uid,
       email: decoded.email,
       emailVerified: decoded.email_verified === true,
@@ -113,6 +114,7 @@ export function registerAuth(app: FastifyInstance, firebaseAuth: Auth): void {
       photoUrl: nonEmptyString(decoded.picture),
       authTime: decoded.auth_time,
     });
+    reply.header('Cache-Control', 'no-store');
   };
 
   app.decorate('requireAuth', requireAuth);

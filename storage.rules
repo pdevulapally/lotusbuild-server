@@ -1,0 +1,7 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Backend-issued GCS signed URLs are separately controlled by IAM and signatures.
+    match /{object=**} { allow read, write: if false; }
+  }
+}

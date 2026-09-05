@@ -46,7 +46,8 @@ export interface UploadedSnapshot {
 
 export interface SnapshotStorage {
   readUrl(projectId: string, snapshot: PersistedSnapshot): Promise<string>;
-  createUpload(projectId: string, leaseToken: string): Promise<SnapshotUpload>;
+  createUpload(projectId: string, leaseToken: string, bytes: number,
+    beforeSign: (objectName: string, expiresAt: Date) => Promise<void>): Promise<SnapshotUpload>;
   inspectUpload(objectName: string): Promise<UploadedSnapshot>;
   removeStored(projectId: string, snapshot: StoredSnapshot): Promise<void>;
 }
@@ -134,6 +135,15 @@ export class SnapshotStore implements SnapshotStorage {
           'saved.',
       ]);
     }
+    const [metadata] = await bucket.getMetadata();
+    if (metadata.iamConfiguration?.uniformBucketLevelAccess?.enabled !== true
+      || metadata.iamConfiguration?.publicAccessPrevention !== 'enforced') {
+      throw new EnvironmentError(['Snapshot storage requires uniform bucket-level access and explicitly enforced public access prevention.']);
+    }
+    const [policy] = await bucket.iam.getPolicy({ requestedPolicyVersion: 3 });
+    if (policy.bindings?.some((binding) => binding.members?.some((member) => member === 'allUsers' || member === 'allAuthenticatedUsers'))) {
+      throw new EnvironmentError(['Snapshot storage has a public IAM binding; remove it before starting the runner.']);
+    }
   }
 
   /**
@@ -173,15 +183,21 @@ export class SnapshotStore implements SnapshotStorage {
    * header or the bucket refuses it — which is what stops a leaked URL being
    * used to store something else.
    */
-  async createUpload(projectId: string, leaseToken: string): Promise<SnapshotUpload> {
+  async createUpload(projectId: string, leaseToken: string, bytes: number,
+    beforeSign: (objectName: string, expiresAt: Date) => Promise<void>): Promise<SnapshotUpload> {
+    if (!Number.isSafeInteger(bytes) || bytes <= 0) throw new Error('A snapshot upload needs an exact positive byte count.');
     const objectName = this.#candidateName(projectId, leaseToken);
+    const expiresAt = new Date(this.#expiry());
+    await beforeSign(objectName, expiresAt);
+    if (expiresAt.getTime() <= Date.now()) throw new Error('Snapshot upload admission expired.');
     const [url] = await this.#bucket().file(objectName).getSignedUrl({
       version: 'v4',
       action: 'write',
-      expires: this.#expiry(),
+      expires: expiresAt,
       contentType: snapshotContentType,
       extensionHeaders: {
         'x-goog-if-generation-match': '0',
+        'content-length': String(bytes),
       },
     });
     return { objectName, url };
@@ -214,6 +230,45 @@ export class SnapshotStore implements SnapshotStorage {
       );
     }
     return { objectName, generation: generationText, bytes };
+  }
+
+  /** Keep a zero-byte generation so a previously issued create-only URL cannot recreate deleted content. */
+  async retireUpload(objectName: string): Promise<void> {
+    const file = this.#bucket().file(objectName);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let generation: string | number = 0;
+      try { const [metadata] = await file.getMetadata(); generation = metadata.generation!; }
+      catch (error) { if ((error as { code?: number }).code !== 404) throw error; }
+      if (generation !== 0 && !/^[1-9]\d*$/.test(String(generation))) throw new Error('Missing generation during snapshot retirement.');
+      try {
+        await file.save(Buffer.alloc(0), { resumable: false, preconditionOpts: { ifGenerationMatch: generation },
+          metadata: { contentType: 'application/octet-stream', cacheControl: 'no-store' } });
+        return;
+      } catch (error) { if ((error as { code?: number }).code !== 412) throw error; }
+    }
+    throw new Error('Snapshot retirement raced an upload; cleanup remains pending.');
+  }
+
+  /** Also covers archives created before the durable upload ledger existed. */
+  async eraseProjectContent(projectId: string): Promise<void> {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(projectId)) throw new Error('Invalid project id.');
+    let pageToken: string | undefined;
+    do {
+      const [files, next] = await this.#bucket().getFiles({ prefix: `projects/${projectId}/`, versions: true,
+        autoPaginate: false, maxResults: 100, ...(pageToken === undefined ? {} : { pageToken }) });
+      for (const file of files) {
+        const bytes = Number(file.metadata.size);
+        if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error('Invalid stored object size during erasure.');
+        if (bytes === 0) continue; // Keep the replay barrier; it contains no project content.
+        const generation = String(file.metadata.generation ?? '');
+        if (!/^[1-9]\d*$/.test(generation)) throw new Error('Missing object generation during erasure.');
+        await this.retireUpload(file.name);
+        // With versioning enabled, replacing the live object leaves the old
+        // generation readable. Delete the exact content generation as well.
+        await this.#bucket().file(file.name, { generation }).delete({ ignoreNotFound: true, ifGenerationMatch: generation });
+      }
+      pageToken = next?.pageToken;
+    } while (pageToken !== undefined);
   }
 
   async removeStored(projectId: string, snapshot: StoredSnapshot): Promise<void> {

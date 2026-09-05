@@ -1,25 +1,38 @@
 import { FieldValue, type Firestore, Timestamp } from 'firebase-admin/firestore';
-import type { Redis } from 'ioredis';
+import { randomUUID } from 'node:crypto';
 
 import { subscriptionsCollectionPath } from '../entitlements/service.ts';
 import type { SubscriptionCache } from '../entitlements/subscription-cache.ts';
-import { redisKeyPrefixes } from '../redis/client.ts';
-import { countField, stringField } from '../support/documents.ts';
+import { stringField, timestampField } from '../support/documents.ts';
+import { AppError } from '../http/errors.ts';
 import { usersCollectionPath } from '../users/repository.ts';
 import type { StripeSubscriptionState } from './stripe.ts';
 
 /** `stripeCustomers/{customerId}` — which account a Stripe customer belongs to. */
 export const stripeCustomersCollectionPath = 'stripeCustomers';
 
+// Longer than the bounded Stripe API operation; expiry enables crash recovery.
+const processingLeaseMs = 5 * 60 * 1000;
+export type EventClaim = { readonly kind: 'completed' } | { readonly kind: 'claimed'; readonly token: string };
+export interface CheckoutOperation {
+  readonly id: string;
+  readonly planKey: string;
+  readonly priceId: string;
+  readonly expiresAt: number;
+}
+
+function busy(): AppError {
+  return new AppError({ code: 'billing/processing', statusCode: 503,
+    message: 'A billing operation is still processing. Retry shortly.' });
+}
+
 export class BillingRepository {
   readonly #firestore: Firestore;
-  readonly #redis: Redis;
   readonly #cache: SubscriptionCache;
   readonly #eventRetentionSeconds: number;
 
   constructor(
     firestore: Firestore,
-    redis: Redis,
     cache: SubscriptionCache,
     eventRetentionSeconds: number,
   ) {
@@ -27,33 +40,44 @@ export class BillingRepository {
       throw new Error('The webhook replay window must be a positive number of seconds.');
     }
     this.#firestore = firestore;
-    this.#redis = redis;
     this.#cache = cache;
     this.#eventRetentionSeconds = eventRetentionSeconds;
   }
 
-  /**
-   * Claims a webhook event, returning false if it has already been handled.
-   *
-   * Stripe delivers at least once, so the same event arrives again after any
-   * timeout — including one where we did the work and the acknowledgement was
-   * lost. Redis is the right home for this: it is replay protection with a
-   * horizon, not a record anybody needs to keep.
-   */
-  async claimEvent(eventId: string): Promise<boolean> {
-    const claimed = await this.#redis.set(
-      `${redisKeyPrefixes.stripeEvent}${eventId}`,
-      '1',
-      'EX',
-      this.#eventRetentionSeconds,
-      'NX',
-    );
-    return claimed === 'OK';
+  /** Only completed events are acknowledged as duplicates. A live claim must be retried. */
+  async claimEvent(eventId: string): Promise<EventClaim> {
+    const ref = this.#firestore.doc(`stripeEvents/${eventId}`);
+    const token = randomUUID();
+    return this.#firestore.runTransaction(async (tx) => {
+      const snapshot = await tx.get(ref);
+      if (snapshot.exists) {
+        const fields = snapshot.data() ?? {};
+        if (fields['status'] === 'COMPLETED') return { kind: 'completed' as const };
+        if (timestampField(fields, 'leaseUntil', ref.path).getTime() > Date.now()) throw busy();
+      }
+      tx.set(ref, { status: 'PROCESSING', token,
+        leaseUntil: Timestamp.fromMillis(Date.now() + processingLeaseMs) });
+      return { kind: 'claimed' as const, token };
+    });
   }
 
-  /** Releases the claim so a failed event is retried rather than swallowed. */
-  async releaseEvent(eventId: string): Promise<void> {
-    await this.#redis.del(`${redisKeyPrefixes.stripeEvent}${eventId}`);
+  async completeEvent(eventId: string, token: string): Promise<void> {
+    const ref = this.#firestore.doc(`stripeEvents/${eventId}`);
+    await this.#firestore.runTransaction(async (tx) => {
+      const snapshot = await tx.get(ref);
+      const fields = snapshot.data() ?? {};
+      if (fields['token'] !== token || timestampField(fields, 'leaseUntil', ref.path).getTime() <= Date.now()) throw busy();
+      tx.set(ref, { status: 'COMPLETED', completedAt: FieldValue.serverTimestamp(),
+        expiresAt: Timestamp.fromMillis(Date.now() + this.#eventRetentionSeconds * 1000) });
+    });
+  }
+
+  async releaseEvent(eventId: string, token: string): Promise<void> {
+    const ref = this.#firestore.doc(`stripeEvents/${eventId}`);
+    await this.#firestore.runTransaction(async (tx) => {
+      const snapshot = await tx.get(ref);
+      if (snapshot.data()?.['token'] === token) tx.delete(ref);
+    });
   }
 
   async uidForCustomer(customerId: string): Promise<string | undefined> {
@@ -65,6 +89,9 @@ export class BillingRepository {
   /** Records the mapping both ways, so either side can find the other. */
   async linkCustomer(uid: string, customerId: string): Promise<void> {
     await this.#firestore.runTransaction(async (transaction) => {
+      const child = await transaction.get(this.#firestore.doc(`familyLinks/${uid}`));
+      const erasure = await transaction.get(this.#firestore.doc(`accountErasures/${uid}`));
+      if (child.exists || erasure.exists) throw new AppError({ code: 'billing/account-restricted', statusCode: 403, message: 'This account cannot manage billing.' });
       transaction.set(this.#firestore.doc(`${stripeCustomersCollectionPath}/${customerId}`), {
         uid,
         createdAt: FieldValue.serverTimestamp(),
@@ -84,61 +111,68 @@ export class BillingRepository {
   }
 
   /**
-   * Writes what Stripe says the subscription now is.
-   *
-   * Fenced on the event's own timestamp. Stripe does not promise order, so an
-   * upgrade and the cancellation that followed it can arrive the wrong way
-   * round — and applying the older one last would leave a customer entitled to
-   * something they no longer pay for, or cut off from something they do. An
-   * event older than what is already recorded is dropped.
+   * Serialize authoritative Stripe reads per account. Event snapshots/timestamps
+   * are never applied: even a delayed deletion reads the customer's current state.
+   * The token and expiry fence a process that resumes after its lease was taken.
    */
-  async applySubscription(input: {
-    readonly uid: string;
-    readonly state: StripeSubscriptionState;
-    readonly eventCreatedAt: Date;
-  }): Promise<'applied' | 'superseded'> {
-    const ref = this.#firestore.doc(`${subscriptionsCollectionPath}/${input.uid}`);
-
-    const outcome = await this.#firestore.runTransaction(async (transaction) => {
-      const snapshot = await transaction.get(ref);
-      const appliedAt = snapshot.exists
-        ? countField(snapshot.data() ?? {}, 'eventCreatedAt', ref.path)
-        : 0;
-      const incoming = Math.floor(input.eventCreatedAt.getTime() / 1000);
-      if (incoming < appliedAt) {
-        return 'superseded' as const;
-      }
-
-      transaction.set(ref, {
-        planKey: input.state.planKey,
-        status: input.state.status,
-        currentPeriodStart: Timestamp.fromDate(input.state.currentPeriodStart),
-        currentPeriodEnd: Timestamp.fromDate(input.state.currentPeriodEnd),
-        stripeCustomerId: input.state.customerId,
-        // Seconds, matching the units Stripe stamps events with.
-        eventCreatedAt: incoming,
-        updatedAt: FieldValue.serverTimestamp(),
-      });
-      return 'applied' as const;
+  async synchronizeSubscription(uid: string, read: () => Promise<StripeSubscriptionState | null>): Promise<void> {
+    const lock = this.#firestore.doc(`billingSynchronization/${uid}`);
+    const token = randomUUID();
+    await this.#firestore.runTransaction(async (tx) => {
+      const snapshot = await tx.get(lock);
+      if (snapshot.exists && timestampField(snapshot.data() ?? {}, 'leaseUntil', lock.path).getTime() > Date.now()) throw busy();
+      tx.set(lock, { token, leaseUntil: Timestamp.fromMillis(Date.now() + processingLeaseMs) });
     });
-
-    if (outcome === 'applied') {
-      // The cached copy would otherwise keep the old plan alive for its whole
-      // TTL, which is the one moment a customer is watching for the change.
-      await this.#cache.invalidate(input.uid);
+    try {
+      const state = await read();
+      await this.#firestore.runTransaction(async (tx) => {
+        const snapshot = await tx.get(lock);
+        const fields = snapshot.data() ?? {};
+        if (fields['token'] !== token || timestampField(fields, 'leaseUntil', lock.path).getTime() <= Date.now()) throw busy();
+        const ref = this.#firestore.doc(`${subscriptionsCollectionPath}/${uid}`);
+        if (state === null) tx.delete(ref);
+        else tx.set(ref, {
+          planKey: state.planKey, status: state.status, stripeCustomerId: state.customerId,
+          currentPeriodStart: Timestamp.fromDate(state.currentPeriodStart),
+          currentPeriodEnd: Timestamp.fromDate(state.currentPeriodEnd), updatedAt: FieldValue.serverTimestamp(),
+        });
+        tx.delete(lock);
+      });
+      await this.#cache.invalidate(uid);
+    } catch (cause) {
+      try {
+        await this.#firestore.runTransaction(async (tx) => {
+          const snapshot = await tx.get(lock);
+          if (snapshot.data()?.['token'] === token) tx.delete(lock);
+        });
+      } catch (cleanup) {
+        throw new AggregateError([cause, cleanup], 'Subscription synchronization and lease cleanup failed.');
+      }
+      throw cause;
     }
-    return outcome;
   }
 
-  /**
-   * Forgets a subscription entirely, dropping the user back to the default plan.
-   *
-   * Used when Stripe deletes one. Keeping a CANCELED record would work too, but
-   * absent is what the entitlement resolver already treats as "no subscription",
-   * and one representation of that state is better than two.
-   */
-  async removeSubscription(uid: string): Promise<void> {
-    await this.#firestore.doc(`${subscriptionsCollectionPath}/${uid}`).delete();
-    await this.#cache.invalidate(uid);
+  /** Persist request parameters before Stripe, so retries use one checkout and price. */
+  async checkoutOperation(uid: string, planKey: string, priceId: string): Promise<CheckoutOperation> {
+    const ref = this.#firestore.doc(`billingCheckouts/${uid}`);
+    return this.#firestore.runTransaction(async (tx) => {
+      const snapshot = await tx.get(ref);
+      if (snapshot.exists) {
+        const fields = snapshot.data() ?? {};
+        const expiresAt = timestampField(fields, 'expiresAt', ref.path).getTime() / 1000;
+        if (expiresAt > Date.now() / 1000) {
+          const storedPlan = stringField(fields, 'planKey', ref.path);
+          if (storedPlan !== planKey) throw new AppError({ code: 'billing/checkout-pending', statusCode: 409,
+            message: 'A checkout for another plan is still open. Complete it or wait for it to expire.' });
+          return { id: stringField(fields, 'id', ref.path), planKey: storedPlan,
+            priceId: stringField(fields, 'priceId', ref.path), expiresAt };
+        }
+      }
+      // Stripe permits checkout lifetimes from 30 minutes to 24 hours. An hour
+      // leaves the minimum creation margin after transaction/API retries.
+      const operation = { id: randomUUID(), planKey, priceId, expiresAt: Math.floor(Date.now() / 1000) + 3600 };
+      tx.set(ref, { ...operation, expiresAt: Timestamp.fromMillis(operation.expiresAt * 1000) });
+      return operation;
+    });
   }
 }

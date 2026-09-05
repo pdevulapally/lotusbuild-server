@@ -1,43 +1,53 @@
 #!/usr/bin/env bash
-# Deploys the API and the runner to the VPS over ssh.
-# One-time server setup (Caddy, systemd, .env) is in deploy/SETUP.md.
-#
-# Firebase service-account JSON exist on the server only; `git archive` sends
-# only the committed tree, so an untracked .env cannot leak into a deploy.
+# Ships a committed candidate; preflight precedes an atomic directory exchange.
 set -euo pipefail
-
 HOST="${DEPLOY_HOST:-lotusbuild-vps}"
-DIR="apps/lotusbuild-server"
-
-echo "==> build locally (fail before touching the server)"
+revision=$(git rev-parse --verify HEAD)
+[[ "$revision" =~ ^[0-9a-f]{40,64}$ ]] || exit 1
+candidate="/home/preet/apps/.lotusbuild-candidate-${revision}-$$"
 npm run build
-
-echo "==> ship committed tree to $HOST"
-git archive --format=tar HEAD | ssh "$HOST" "mkdir -p ~/$DIR && tar x -C ~/$DIR"
-
-echo "==> install and build on $HOST"
-ssh "$HOST" "cd ~/$DIR && npm ci --silent && npm run build"
-
-echo "==> restart"
-ssh "$HOST" 'bash -s' <<'REMOTE'
+ssh "$HOST" "umask 077; mkdir '$candidate'"
+git archive --format=tar HEAD | ssh "$HOST" "tar -x -C '$candidate'"
+ssh "$HOST" bash -s -- "$candidate" <<'REMOTE'
 set -euo pipefail
-test -f ~/apps/lotusbuild-server/.env || { echo "FATAL: .env missing on server" >&2; exit 1; }
-
-# Passwordless for these two units only, via the sudoers drop-in from SETUP.md.
+candidate=$1
+active=/home/preet/apps/lotusbuild-server
+[[ "$candidate" =~ ^/home/preet/apps/\.lotusbuild-candidate-[0-9a-f]{40,64}-[0-9]+$ ]] || exit 1
+exec 9>/home/preet/apps/.lotusbuild-deploy.lock
+flock -n 9 || { echo 'Another deployment is active.' >&2; exit 1; }
+test -d "$active" && test ! -L "$active"
+test -f "$active/.env"
+install -m 600 "$active/.env" "$candidate/.env"
+if test -f "$active/service-account.json"; then
+  install -m 600 "$active/service-account.json" "$candidate/service-account.json"
+fi
+cd "$candidate"
+npm ci --silent
+npm run build
+node --env-file=.env dist/preflight.js
+python3 deploy/exchange-directories.py --check "$active" "$candidate"
+switched=0
+rollback() {
+  code=$?
+  trap - EXIT
+  if [[ "$code" != 0 && "$switched" == 1 ]]; then
+    python3 "$active/deploy/exchange-directories.py" "$active" "$candidate"
+    sudo -n systemctl restart lotusbuild-api lotusbuild-runner
+    echo 'Candidate failed; previous directory restored. Verify both units and health.' >&2
+  fi
+  exit "$code"
+}
+trap rollback EXIT
+python3 deploy/exchange-directories.py "$active" "$candidate"
+switched=1
+cd "$active"
 sudo -n systemctl restart lotusbuild-api lotusbuild-runner
-sleep 3
-
-for u in lotusbuild-api lotusbuild-runner; do
-  systemctl is-active --quiet "$u" || {
-    echo "FATAL: $u is not active" >&2
-    journalctl -u "$u" -n 40 --no-pager >&2
-    exit 1
-  }
+healthy=0
+for attempt in {1..10}; do
+  if systemctl is-active --quiet lotusbuild-api && systemctl is-active --quiet lotusbuild-runner && curl -fsS --max-time 5 -o /dev/null https://api.lotusbuild.co.uk/health; then healthy=1; break; fi
+  sleep 2
 done
-echo "both units active"
+test "$healthy" == 1
+trap - EXIT
+echo "Deployment healthy. Previous release retained at $candidate"
 REMOTE
-
-echo "==> smoke test"
-curl -fsS --max-time 15 -o /dev/null -w "https://api.lotusbuild.co.uk/health -> %{http_code}\n" \
-  https://api.lotusbuild.co.uk/health
-echo "==> deployed"

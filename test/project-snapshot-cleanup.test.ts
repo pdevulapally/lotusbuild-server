@@ -92,6 +92,8 @@ class FakePublisher implements SnapshotPublisher {
 
   async assertPersistenceLease(_authority: SessionLease): Promise<void> {}
 
+  async reserveSnapshotUpload(): Promise<void> {}
+
   async publishSnapshot(
     _authority: SessionLease,
     _entitlements: UserEntitlements,
@@ -130,7 +132,8 @@ class FakeSnapshotStorage implements SnapshotStorage {
     throw missingSnapshotError(projectId, snapshot);
   }
 
-  async createUpload(_projectId: string, _leaseToken: string): Promise<SnapshotUpload> {
+  async createUpload(_projectId: string, _leaseToken: string, _bytes: number, beforeSign: (name: string, expires: Date) => Promise<void>): Promise<SnapshotUpload> {
+    await beforeSign(uploaded.objectName, new Date(Date.now() + 60000));
     return { objectName: uploaded.objectName, url: 'https://storage.invalid/upload' };
   }
 
@@ -153,7 +156,7 @@ class FakeSandbox implements RunningSandbox {
   readonly externalId = 'sandbox-1';
 
   async runCommand(_command: string): Promise<CommandOutcome> {
-    return { exitCode: 0, stdout: 'committed=yes\n', stderr: '' };
+    return { exitCode: 0, stdout: _command.includes('stat -c') ? '321\n' : 'committed=yes\n', stderr: '' };
   }
 
   async writeFile(_path: string, _content: string): Promise<void> {}
@@ -194,7 +197,7 @@ test('a publication that fails leaves the previous snapshot authoritative', asyn
   assert.deepEqual(snapshots.removals, []);
 });
 
-test('a publication and cleanup that both succeed report an ordinary save', async () => {
+test('publication defers cleanup to the durable collector', async () => {
   const publisher = new FakePublisher();
   const snapshots = new FakeSnapshotStorage();
 
@@ -203,7 +206,7 @@ test('a publication and cleanup that both succeed report an ordinary save', asyn
   assert.equal(outcome.bytes, uploaded.bytes);
   assert.equal(outcome.committed, true);
   assert.equal(outcome.cleanupFailure, undefined);
-  assert.deepEqual(snapshots.removals, [superseded]);
+  assert.deepEqual(snapshots.removals, []);
 });
 
 test('a cleanup failure after publication still reports a committed save', async () => {
@@ -215,9 +218,8 @@ test('a cleanup failure after publication still reports a committed save', async
   assert.equal(outcome.bytes, uploaded.bytes);
   assert.equal(outcome.committed, true);
   // Observable: the caller is handed the object it must collect and the reason.
-  assert.notEqual(outcome.cleanupFailure, undefined);
-  assert.deepEqual(outcome.cleanupFailure?.superseded, superseded);
-  assert.ok(outcome.cleanupFailure?.cause instanceof BucketUnavailable);
+  assert.equal(outcome.cleanupFailure, undefined);
+  assert.deepEqual(snapshots.removals, []);
 });
 
 test('a cleanup failure rolls nothing back', async () => {
@@ -242,9 +244,7 @@ test('cleanup targets the superseded generation and never the new one', async ()
 
   await save(publisher, snapshots);
 
-  assert.equal(snapshots.removals.length, 1);
-  assert.deepEqual(snapshots.removals[0], superseded);
-  assert.notDeepEqual(snapshots.removals[0], publisher.authoritative);
+  assert.deepEqual(snapshots.removals, []);
 });
 
 test('an obsolete snapshot that is already gone is not a cleanup failure', async () => {
@@ -254,7 +254,7 @@ test('an obsolete snapshot that is already gone is not a cleanup failure', async
   const outcome = await save(publisher, snapshots);
 
   assert.equal(outcome.cleanupFailure, undefined);
-  assert.deepEqual(snapshots.removals, [superseded]);
+  assert.deepEqual(snapshots.removals, []);
 });
 
 test('a cleanup failure cannot displace the failure a partial save was preserving', async () => {

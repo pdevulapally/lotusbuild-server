@@ -55,7 +55,10 @@ export class UserRepository {
    */
   async ensure(user: AuthenticatedUser): Promise<UserRecord> {
     const ref = this.#ref(user.uid);
-    const snapshot = await ref.get();
+    return this.#firestore.runTransaction(async (transaction) => {
+    const erased = await transaction.get(this.#firestore.doc(`accountErasures/${user.uid}`));
+    if (erased.exists) throw new AppError({ code: 'account/erasure-pending', statusCode: 403, message: 'This account is closed or being erased.' });
+    const snapshot = await transaction.get(ref);
 
     if (!snapshot.exists) {
       const created: UserRecord = {
@@ -75,7 +78,7 @@ export class UserRepository {
           message: 'This account has no email address, which this service requires.',
         });
       }
-      await ref.create({
+      transaction.create(ref, {
         ...created,
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
@@ -99,13 +102,14 @@ export class UserRepository {
       displayName: user.displayName,
       photoUrl: user.photoUrl,
     };
-    await ref.update({
+    transaction.update(ref, {
       email: refreshed.email,
       displayName: refreshed.displayName ?? FieldValue.delete(),
       photoUrl: refreshed.photoUrl ?? FieldValue.delete(),
       updatedAt: FieldValue.serverTimestamp(),
     });
     return refreshed;
+    });
   }
 
   /**
@@ -116,6 +120,11 @@ export class UserRepository {
   async readInTransaction(transaction: Transaction, uid: string): Promise<UserRecord> {
     const ref = this.#ref(uid);
     const snapshot = await transaction.get(ref);
+    const family = await transaction.get(this.#firestore.doc(`familyLinks/${uid}`));
+    const erased = await transaction.get(this.#firestore.doc(`accountErasures/${uid}`));
+    if (erased.exists) throw new AppError({ code: 'account/erasure-pending', statusCode: 403, message: 'This account is closed or being erased.' });
+    if (family.exists) throw new AppError({ code: 'family/parent-owned-account-required', statusCode: 403,
+      message: 'Linked child accounts use projects owned and controlled by their parent.' });
     if (!snapshot.exists) {
       throw new AppError({
         code: 'user/not-initialised',
@@ -132,6 +141,10 @@ export class UserRepository {
    */
   async read(uid: string): Promise<UserRecord> {
     const ref = this.#ref(uid);
+    const family = await this.#firestore.doc(`familyLinks/${uid}`).get();
+    const erasure = await this.#firestore.doc(`accountErasures/${uid}`).get();
+    if (family.exists || erasure.exists) throw new AppError({ code: 'account/billing-unavailable', statusCode: 403,
+      message: 'Billing is unavailable for linked child accounts and accounts being erased.' });
     const snapshot = await ref.get();
     if (!snapshot.exists) {
       throw new AppError({

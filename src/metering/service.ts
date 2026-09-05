@@ -73,6 +73,7 @@ interface UsageState {
 interface CloseOutcome {
   readonly status: ReservationStatus;
   readonly settledQuantity?: number;
+  readonly overrunQuantity?: number;
 }
 
 /**
@@ -255,6 +256,7 @@ export class MeteringService {
       readonly entitlements: UserEntitlements;
       readonly meterKey: string;
       readonly quantity: number;
+      readonly chargedAt: Date;
       readonly now: Date;
     },
   ): Promise<Consumption> {
@@ -271,7 +273,10 @@ export class MeteringService {
     const periodStart = periodStartFor(meter, input.now);
     const state = this.#state(snapshot, periodStart, ref.path);
 
-    const after = Math.max(0, state.consumed - input.quantity);
+    // A cancellation from an older window must never refund this window's
+    // unrelated builds. QUEUED sessions retain their original charge time.
+    const sameWindow = periodStartFor(meter, input.chargedAt).getTime() === periodStart.getTime();
+    const after = sameWindow ? Math.max(0, state.consumed - input.quantity) : state.consumed;
 
     transaction.set(ref, {
       meterKey: meter.key,
@@ -379,7 +384,7 @@ export class MeteringService {
           `have held ${input.previousQuantity}.`,
       );
     }
-    if (total + state.reserved > limit.hardLimit) {
+    if (input.quantity > input.previousQuantity && total + state.reserved > limit.hardLimit) {
       throw this.#exceeded(input.entitlements, meter, limit, state, input.quantity, periodStart);
     }
 
@@ -478,6 +483,40 @@ export class MeteringService {
   }
 
   /** `reserveIn` for callers with nothing else to commit alongside it. */
+  async commitStorageIn(transaction: Transaction, uid: string, reservationId: string, bytes: number): Promise<void> {
+    const { registry } = await this.#configuration.get();
+    const ref = this.#reservationRef(uid, reservationId);
+    const reservation = await transaction.get(ref);
+    const fields = reservation.data() ?? {};
+    if (fields['status'] !== 'OPEN' || fields['meterKey'] !== registry.storageMeterKey || fields['estimatedQuantity'] !== bytes) {
+      throw new Error('Snapshot storage reservation does not match the uploaded object.');
+    }
+    const meter = registry.meters.get(registry.storageMeterKey)!;
+    if (meter.kind !== 'GAUGE') throw new Error('Storage requires a gauge.');
+    const usageRef = this.#usageRef(uid, meter.key);
+    const usage = await transaction.get(usageRef);
+    const periodStart = periodStartFor(meter, new Date());
+    const state = this.#state(usage, periodStart, usageRef.path);
+    if (state.reserved < bytes) throw new Error('Storage reservation ledger disagrees.');
+    transaction.set(usageRef, { meterKey: meter.key, consumed: state.consumed + bytes,
+      reserved: state.reserved - bytes, periodStart: Timestamp.fromDate(periodStart), updatedAt: FieldValue.serverTimestamp() });
+    transaction.update(ref, { status: 'SETTLED', settledQuantity: bytes, updatedAt: FieldValue.serverTimestamp() });
+  }
+
+  async removeStoredBytesIn(transaction: Transaction, uid: string, bytes: number): Promise<void> {
+    if (!Number.isSafeInteger(bytes) || bytes <= 0) throw new Error('Invalid stored byte count.');
+    const { registry } = await this.#configuration.get();
+    const meter = registry.meters.get(registry.storageMeterKey)!;
+    if (meter.kind !== 'GAUGE') throw new Error('Storage requires a gauge.');
+    const ref = this.#usageRef(uid, meter.key);
+    const snapshot = await transaction.get(ref);
+    const periodStart = periodStartFor(meter, new Date());
+    const state = this.#state(snapshot, periodStart, ref.path);
+    if (state.consumed < bytes) throw new Error('Stored byte ledger disagrees.');
+    transaction.set(ref, { meterKey: meter.key, consumed: state.consumed - bytes, reserved: state.reserved,
+      periodStart: Timestamp.fromDate(periodStart), updatedAt: FieldValue.serverTimestamp() });
+  }
+
   async reserve(input: {
     readonly uid: string;
     readonly entitlements: UserEntitlements;
@@ -526,6 +565,7 @@ export class MeteringService {
       if (enumField(fields, 'status', ref.path, reservationStatuses) !== 'OPEN') {
         continue;
       }
+      if (fields['inFlight'] === true) throw this.#needsReconciliation(reservationId);
       const meterKey = stringField(fields, 'meterKey', ref.path);
       const meter = registry.meters.get(meterKey);
       if (meter === undefined) {
@@ -604,6 +644,8 @@ export class MeteringService {
     readonly uid: string;
     readonly reservationId: string;
     readonly actualQuantity: number;
+    /** Explicitly authorized for Anthropic token-count estimates, not capacity gauges. */
+    readonly recordOverrun?: boolean;
     readonly now: Date;
   }): Promise<boolean> {
     return this.#close(
@@ -620,7 +662,7 @@ export class MeteringService {
         if (
           !Number.isSafeInteger(input.actualQuantity) ||
           input.actualQuantity < 0 ||
-          input.actualQuantity > estimatedQuantity
+          (input.actualQuantity > estimatedQuantity && input.recordOverrun !== true)
         ) {
           throw new Error(
             `Reservation ${input.reservationId} held ${estimatedQuantity} ${meter.unit} and ` +
@@ -635,8 +677,11 @@ export class MeteringService {
           periodStart: Timestamp.fromDate(periodStart),
           updatedAt: FieldValue.serverTimestamp(),
         });
-        return { status: 'SETTLED', settledQuantity: input.actualQuantity };
+        return { status: 'SETTLED', settledQuantity: input.actualQuantity,
+          overrunQuantity: Math.max(0, input.actualQuantity - estimatedQuantity) };
       },
+      true,
+      input.actualQuantity,
     );
   }
 
@@ -663,7 +708,102 @@ export class MeteringService {
         });
         return { status: 'RELEASED' };
       },
+      false,
     );
+  }
+
+  #needsReconciliation(id: string): AppError {
+    return new AppError({ code: 'usage/reconciliation-required', statusCode: 409,
+      message: 'A provider operation has unresolved usage. Its allowance remains held for reconciliation.',
+      details: { reservationId: id } });
+  }
+
+  /** Persist ambiguity BEFORE dispatch: a killed process cannot turn unknown spend into zero. */
+  async markInFlight(uid: string, ids: readonly string[]): Promise<void> {
+    await this.#firestore.runTransaction(async (tx) => {
+      const records = [];
+      for (const id of ids) {
+        const ref = this.#reservationRef(uid, id);
+        const snapshot = await tx.get(ref);
+        if (!snapshot.exists || snapshot.data()?.['status'] !== 'OPEN') {
+          throw new Error('Cannot dispatch against a missing or closed reservation.');
+        }
+        records.push(ref);
+      }
+      for (const ref of records) tx.update(ref, { inFlight: true, updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+
+  /** Persist termination evidence before closing any accounting hold. */
+  async confirmSandboxStopped(uid: string, ids: readonly string[], stoppedAt?: Date): Promise<void> {
+    const { registry } = await this.#configuration.get();
+    await this.#firestore.runTransaction(async (tx) => {
+      const changes: { ref: DocumentReference; data: Record<string, unknown> }[] = [];
+      for (const id of ids) {
+        const ref = this.#reservationRef(uid, id);
+        const snapshot = await tx.get(ref);
+        if (!snapshot.exists) throw new Error('A sandbox reservation is missing.');
+        const fields = snapshot.data() ?? {};
+        const meter = registry.meters.get(stringField(fields, 'meterKey', ref.path));
+        if (meter === undefined) throw new Error('Unknown sandbox meter.');
+        if (fields['status'] !== 'OPEN') continue;
+        if (meter.kind === 'GAUGE') changes.push({ ref, data: { inFlight: false } });
+        else if (stoppedAt !== undefined) {
+          const start = timestampField(fields, 'sandboxStartedAt', ref.path);
+          const end = timestampField(fields, 'sandboxEndAt', ref.path);
+          const actual = Math.max(1, Math.ceil((Math.min(stoppedAt.getTime(), end.getTime()) - start.getTime()) / 1000));
+          changes.push({ ref, data: { observedQuantity: Math.min(actual, integerField(fields, 'estimatedQuantity', ref.path, { min: 1 })) } });
+        }
+      }
+      for (const { ref, data } of changes) tx.update(ref, { ...data, updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+
+  async recordSandbox(uid: string, ids: readonly string[], input: { externalId: string; platform: string; startedAt: Date; endAt: Date }): Promise<void> {
+    await this.#firestore.runTransaction(async (tx) => {
+      const refs = ids.map((id) => this.#reservationRef(uid, id));
+      for (const ref of refs) {
+        const snapshot = await tx.get(ref);
+        if (snapshot.data()?.['status'] !== 'OPEN') throw new Error('Sandbox hold is not open.');
+      }
+      for (const ref of refs) tx.update(ref, { sandboxExternalId: input.externalId, sandboxPlatform: input.platform,
+        sandboxStartedAt: Timestamp.fromDate(input.startedAt), sandboxEndAt: Timestamp.fromDate(input.endAt) });
+    });
+  }
+
+  async reservationRecord(uid: string, id: string): Promise<Record<string, unknown>> {
+    const snapshot = await this.#reservationRef(uid, id).get();
+    if (!snapshot.exists) throw new Error('Reservation is missing.');
+    return snapshot.data() ?? {};
+  }
+
+  async recordObservedUsage(uid: string, id: string, quantity: number, evidence?: string): Promise<void> {
+    if (!Number.isSafeInteger(quantity) || quantity < 0) throw new Error('Invalid authoritative usage.');
+    const ref = this.#reservationRef(uid, id);
+    await this.#firestore.runTransaction(async (tx) => {
+      const snapshot = await tx.get(ref);
+      const fields = snapshot.data() ?? {};
+      if (!snapshot.exists) throw new Error('Reservation is missing.');
+      if (fields['status'] !== 'OPEN') {
+        if (fields['settledQuantity'] === quantity) return;
+        throw new Error('Reconciliation contradicts a closed reservation.');
+      }
+      const observed = fields['observedQuantity'];
+      if (typeof observed === 'number' && quantity < observed) throw new Error('Authoritative usage cannot decrease.');
+      tx.update(ref, { observedQuantity: quantity, ...(evidence === undefined ? {} : { usageEvidence: evidence }), updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+
+  /** Recovery closes recorded usage, never guessed usage. */
+  async reconcile(uid: string, id: string, now: Date = new Date()): Promise<boolean> {
+    const fields = await this.reservationRecord(uid, id);
+    if (fields['status'] !== 'OPEN') return false;
+    if (typeof fields['observedQuantity'] === 'number') {
+      const { registry } = await this.#configuration.get();
+      return this.settle({ uid, reservationId: id, actualQuantity: fields['observedQuantity'], now,
+        recordOverrun: fields['meterKey'] === registry.inputTokenMeterKey });
+    }
+    return this.release(uid, id, now);
   }
 
   /**
@@ -683,6 +823,8 @@ export class MeteringService {
       state: UsageState,
       periodStart: Date,
     ) => CloseOutcome,
+    allowInFlight = true,
+    expectedObservedQuantity?: number,
   ): Promise<boolean> {
     const reservationRef = this.#reservationRef(uid, reservationId);
     const { registry } = await this.#configuration.get();
@@ -695,6 +837,11 @@ export class MeteringService {
       const fields = snapshot.data() ?? {};
       if (enumField(fields, 'status', reservationRef.path, reservationStatuses) !== 'OPEN') {
         return false;
+      }
+      if (!allowInFlight && fields['inFlight'] === true) throw this.#needsReconciliation(reservationId);
+      if (expectedObservedQuantity !== undefined && typeof fields['observedQuantity'] === 'number'
+        && fields['observedQuantity'] !== expectedObservedQuantity) {
+        throw new Error('Recorded usage changed during settlement; retry reconciliation.');
       }
 
       const meterKey = stringField(fields, 'meterKey', reservationRef.path);
@@ -729,6 +876,7 @@ export class MeteringService {
         ...(outcome.settledQuantity === undefined
           ? {}
           : { settledQuantity: outcome.settledQuantity }),
+        ...(outcome.overrunQuantity === undefined ? {} : { overrunQuantity: outcome.overrunQuantity }),
         updatedAt: FieldValue.serverTimestamp(),
       });
       return true;

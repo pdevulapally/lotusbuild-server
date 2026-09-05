@@ -157,7 +157,7 @@ function harness(messageCount: number) {
   );
   const sessions = new SessionRepository(
     firestore as unknown as Firestore,
-    {} as unknown as ProjectRepository,
+    { readOwned: async () => ({ id: "project-1", ownerUid: "user-1" }) } as unknown as ProjectRepository,
     {} as unknown as EntitlementService,
     {} as unknown as ConfigurationStore,
     {} as unknown as MeteringService,

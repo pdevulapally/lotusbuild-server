@@ -6,6 +6,7 @@ import { type Platform, platforms } from '../entitlements/schema.ts';
 import { AppError } from '../http/errors.ts';
 import type { MeteringService } from '../metering/service.ts';
 import type { SnapshotStore, StoredSnapshot } from '../storage/snapshots.ts';
+import { SnapshotMaintenance } from '../storage/maintenance.ts';
 import {
   DocumentShapeError,
   type Fields,
@@ -25,7 +26,7 @@ export const messagesCollectionName = 'messages';
 export const projectNameMaxLength = 100;
 export const projectDescriptionMaxLength = 500;
 
-export const projectStatuses = ['draft'] as const;
+export const projectStatuses = ['draft', 'deleting'] as const;
 
 export interface Project {
   readonly id: string;
@@ -37,6 +38,8 @@ export interface Project {
   /** Bytes the last saved snapshot occupies, and so what it charges storage. */
   readonly snapshotBytes: number;
   readonly snapshot: StoredSnapshot;
+  readonly snapshotUploadId?: string;
+  readonly publicPreviewEnabled?: boolean;
   /**
    * The session allowed to mutate this project's workspace. `null` is an
    * explicitly unlocked project; `undefined` is a legacy document that must be
@@ -107,7 +110,9 @@ function parseProject(id: string, fields: Fields, where: string): Project {
     platform: enumField(fields, 'platform', where, platforms),
     status: enumField(fields, 'status', where, projectStatuses),
     snapshotBytes,
+    publicPreviewEnabled: fields['publicPreviewEnabled'] === true,
     snapshot: storedSnapshot(fields, where, snapshotBytes),
+    ...(typeof fields['snapshotUploadId'] === 'string' ? { snapshotUploadId: fields['snapshotUploadId'] } : {}),
     activeSessionId: activeSessionIdField(fields, where),
     createdAt: timestampField(fields, 'createdAt', where),
   };
@@ -136,6 +141,7 @@ export class ProjectRepository {
   readonly #metering: MeteringService | undefined;
   readonly #configuration: ConfigurationStore | undefined;
   readonly #snapshots: SnapshotStore | undefined;
+  readonly #eraseSessionEvents: ((id: string) => Promise<void>) | undefined;
 
   constructor(
     firestore: Firestore,
@@ -144,6 +150,7 @@ export class ProjectRepository {
     metering?: MeteringService | undefined,
     configuration?: ConfigurationStore | undefined,
     snapshots?: SnapshotStore | undefined,
+    eraseSessionEvents?: (id: string) => Promise<void>,
   ) {
     this.#firestore = firestore;
     this.#users = users;
@@ -151,6 +158,7 @@ export class ProjectRepository {
     this.#metering = metering;
     this.#configuration = configuration;
     this.#snapshots = snapshots;
+    this.#eraseSessionEvents = eraseSessionEvents;
   }
 
 
@@ -261,6 +269,27 @@ export class ProjectRepository {
     };
   }
 
+  async setPublicPreview(ownerUid: string, projectId: string, enabled: boolean): Promise<{ enabled: boolean; terminationPending: boolean }> {
+    const ref = this.refFor(projectId);
+    return this.#firestore.runTransaction(async (tx) => {
+      const snapshot = await tx.get(ref);
+      const project = this.#ownedFromSnapshot(ownerUid, ref.path, snapshot);
+      if (project.activeSessionId === undefined) throw projectSessionGuardUnmigratedError();
+      if (enabled && project.activeSessionId !== null) throw new AppError({ code: 'project/session-active', statusCode: 409,
+        message: 'Finish the current session before enabling public previews.' });
+      const active = project.activeSessionId === null ? undefined : this.#firestore.doc(`sessions/${project.activeSessionId}`);
+      let terminationPending = false;
+      if (active !== undefined) {
+        const session = await tx.get(active);
+        if (session.data()?.['ownerUid'] !== ownerUid || session.data()?.['projectId'] !== projectId) throw new Error('Project session guard disagrees.');
+        terminationPending = project.publicPreviewEnabled === true && session.data()?.['status'] === 'RUNNING';
+      }
+      tx.update(ref, { publicPreviewEnabled: enabled, updatedAt: FieldValue.serverTimestamp() });
+      if (active !== undefined && terminationPending) tx.update(active, { cancelRequested: true, updatedAt: FieldValue.serverTimestamp() });
+      return { enabled, terminationPending };
+    });
+  }
+
   /**
    * Deletes a project, decrements the owner's project count, releases any
    * storage gauge occupancy, deletes associated sessions and messages, and
@@ -270,65 +299,64 @@ export class ProjectRepository {
     const ref = this.refFor(projectId);
     const userRef = this.#users.refFor(ownerUid);
 
+    // The parent remains as a durable tombstone until every cleanup succeeds.
+    // A repeated DELETE resumes it; other project operations fail closed.
     await this.#firestore.runTransaction(async (transaction) => {
-      const project = await this.readOwnedInTransaction(transaction, ownerUid, projectId);
-      if (project.activeSessionId === undefined) {
-        throw projectSessionGuardUnmigratedError();
-      }
-      if (project.activeSessionId !== null) {
-        throw projectSessionActiveError();
-      }
-
-      // Release storage meter gauge if bytes were charged
-      if (this.#metering !== undefined && this.#configuration !== undefined && project.snapshotBytes > 0) {
-        const { registry } = await this.#configuration.get();
-        const entitlements = await this.#entitlements.forUser(ownerUid);
-        await this.#metering.setGaugeIn(transaction, {
-          uid: ownerUid,
-          entitlements,
-          meterKey: registry.storageMeterKey,
-          previousQuantity: project.snapshotBytes,
-          quantity: 0,
-          now: new Date(),
-        });
-      }
-
-      transaction.delete(ref);
-      transaction.update(userRef, {
-        projectCount: FieldValue.increment(-1),
-        updatedAt: FieldValue.serverTimestamp(),
-      });
+      const snapshot = await transaction.get(ref);
+      const project = this.#ownedFromSnapshot(ownerUid, ref.path, snapshot, true);
+      if (project.activeSessionId === undefined) throw projectSessionGuardUnmigratedError();
+      if (project.activeSessionId !== null) throw projectSessionActiveError();
+      transaction.update(ref, { status: 'deleting', updatedAt: FieldValue.serverTimestamp() });
     });
 
-    // Delete associated sessions and message sub-collections
-    const sessionDocs = await this.#firestore
-      .collection(sessionsCollectionPath)
-      .where('projectId', '==', projectId)
-      .get();
-
-    for (const sessionDoc of sessionDocs.docs) {
-      const messages = await sessionDoc.ref.collection(messagesCollectionName).get();
-      const queuedMessages = await sessionDoc.ref.collection('queued_messages').get();
-      const batch = this.#firestore.batch();
-      for (const msg of messages.docs) {
-        batch.delete(msg.ref);
-      }
-      for (const qMsg of queuedMessages.docs) {
-        batch.delete(qMsg.ref);
-      }
-      batch.delete(sessionDoc.ref);
-      await batch.commit();
-    }
-
-
-    // Clean up durable git snapshot archive if snapshot store is available
-    if (this.#snapshots !== undefined) {
-      try {
-        await this.#snapshots.remove(projectId);
-      } catch {
-        // Ignored: Snapshot removal is best-effort if file does not exist
+    // Delete descendants before their session parent. recursiveDelete uses the
+    // SDK's bounded BulkWriter; a partially deleted subtree stays discoverable.
+    for (;;) {
+      const page = await this.#firestore.collection(sessionsCollectionPath)
+        .where('projectId', '==', projectId).limit(100).get();
+      if (page.docs.length === 0) break;
+      for (const session of page.docs) {
+        if (this.#eraseSessionEvents === undefined) throw new Error('Session event erasure is not configured.');
+        await this.#eraseSessionEvents(session.id);
+        await this.#firestore.recursiveDelete(session.ref.collection(messagesCollectionName));
+        await this.#firestore.recursiveDelete(session.ref.collection('queued_messages'));
+        await session.ref.delete();
       }
     }
+    if (this.#snapshots === undefined) {
+      throw new Error('Project deletion requires the snapshot store. Cleanup remains pending.');
+    }
+    // Storage errors must reach the caller and leave the tombstone retryable.
+    if (this.#metering === undefined) throw new Error('Storage accounting is not configured.');
+    await new SnapshotMaintenance(this.#firestore, this.#metering, this.#snapshots).deleteProject(projectId);
+    const deleting = await ref.get();
+    const deletingProject = this.#ownedFromSnapshot(ownerUid, ref.path, deleting, true);
+    if (deletingProject.snapshotUploadId === undefined) await this.#snapshots.removeStored(projectId, deletingProject.snapshot);
+    await this.#snapshots.eraseProjectContent(projectId);
+
+    await this.#firestore.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(ref);
+      if (!snapshot.exists) return; // A concurrent deletion already finalized.
+      const project = this.#ownedFromSnapshot(ownerUid, ref.path, snapshot, true);
+      if (project.status !== 'deleting' || project.activeSessionId !== null) {
+        throw new Error('Project deletion lost its tombstone.');
+      }
+      if (project.snapshotBytes > 0 && project.snapshotUploadId === undefined) {
+        if (this.#metering === undefined || this.#configuration === undefined) {
+          throw new Error('Project deletion requires storage accounting.');
+        }
+        const { registry } = await this.#configuration.get();
+        await this.#metering.setGaugeIn(transaction, {
+          uid: ownerUid, entitlements: await this.#entitlements.forUser(ownerUid),
+          meterKey: registry.storageMeterKey, previousQuantity: project.snapshotBytes,
+          quantity: 0, now: new Date(),
+        });
+      }
+      transaction.delete(ref);
+      transaction.update(userRef, {
+        projectCount: FieldValue.increment(-1), updatedAt: FieldValue.serverTimestamp(),
+      });
+    });
   }
 
   /** For callers that update a project inside their own transaction. */
@@ -340,9 +368,14 @@ export class ProjectRepository {
     transaction: Transaction,
     ownerUid: string,
     projectId: string,
+    allowErasing = false,
   ): Promise<Project> {
     const ref = this.refFor(projectId);
     const snapshot = await transaction.get(ref);
+    if (!allowErasing) {
+      const erasure = await transaction.get(this.#firestore.doc(`accountErasures/${ownerUid}`));
+      if (erasure.exists) throw new AppError({ code: 'account/erasure-pending', statusCode: 403, message: 'This account is closed or being erased.' });
+    }
     return this.#ownedFromSnapshot(ownerUid, ref.path, snapshot);
   }
 
@@ -375,6 +408,7 @@ export class ProjectRepository {
     ownerUid: string,
     path: string,
     snapshot: { readonly exists: boolean; readonly id: string; data(): Fields | undefined },
+    allowDeleting = false,
   ): Project {
     const missing = new AppError({
       code: 'project/not-found',
@@ -388,6 +422,10 @@ export class ProjectRepository {
     const project = parseProject(snapshot.id, snapshot.data() ?? {}, path);
     if (project.ownerUid !== ownerUid) {
       throw missing;
+    }
+    if (project.status === 'deleting' && !allowDeleting) {
+      throw new AppError({ code: 'project/deleting', statusCode: 409,
+        message: 'This project is being deleted. Retry deletion to complete pending cleanup.' });
     }
     return project;
   }

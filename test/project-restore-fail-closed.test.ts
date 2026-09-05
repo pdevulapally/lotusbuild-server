@@ -94,6 +94,8 @@ class UnusedPublisher implements SnapshotPublisher {
     throw new Error('restore must not take a persistence lease');
   }
 
+  async reserveSnapshotUpload(): Promise<void> {}
+
   async publishSnapshot(
     _authority: SessionLease,
     _entitlements: UserEntitlements,

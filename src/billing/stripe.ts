@@ -148,6 +148,19 @@ export function readSubscription(
   };
 }
 
+/** Our account model supports one non-terminal subscription, never an arbitrary first item. */
+export function currentSubscription(subscriptions: readonly Stripe.Subscription[]): Stripe.Subscription | undefined {
+  const current = subscriptions.filter((subscription) => {
+    translateStatus(subscription.status);
+    return subscription.status !== 'canceled' && subscription.status !== 'incomplete_expired';
+  });
+  if (current.length > 1) {
+    throw new AppError({ code: 'billing/multiple-subscriptions', statusCode: 409,
+      message: 'This account has multiple subscriptions. Contact support to reconcile billing.' });
+  }
+  return current[0];
+}
+
 /** Where a plan key is recorded on the Stripe objects we create. */
 export const planKeyMetadataField = 'planKey';
 

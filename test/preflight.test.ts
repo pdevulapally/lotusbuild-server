@@ -20,6 +20,8 @@ import { registryDocument, planDocuments } from '../src/seed/config.ts';
 function validEnv(): Record<string, string> {
   return {
     NODE_ENV: 'test',
+    SESSION_EVENT_MAX_BYTES: '65536',
+    FAMILY_INVITATION_TTL_SECONDS: '3600',
     LOG_LEVEL: 'error',
     FIREBASE_PROJECT_ID: 'lotusbuild-test',
     FIREBASE_SERVICE_ACCOUNT_FILE: '/tmp/does-not-need-to-exist.json',
@@ -36,6 +38,9 @@ function validEnv(): Record<string, string> {
     PUBLIC_API_URL: 'https://api.example.test',
     SSE_HEARTBEAT_SECONDS: '15',
     SSE_MAX_CONNECTIONS: '100',
+    SSE_MAX_CONNECTIONS_PER_USER: '4',
+    SSE_BUFFER_MAX_BYTES: '65536',
+    HTTP_MAX_REQUESTS_PER_MINUTE: '300',
     // Deliberately not shaped like a real Stripe secret key or webhook
     // signing secret — CI's own secret scanner greps for those exact
     // prefixes, correctly, since it cannot tell a fixture from the real

@@ -15,6 +15,7 @@ export interface CommandOutcome {
  * to imitate.
  */
 export interface RunningSandbox {
+  projectFileOperation?(root: string, request: Readonly<Record<string, unknown>>, timeoutMs: number): Promise<CommandOutcome>;
   /** The provider's own id, recorded so an orphan can be found and killed. */
   readonly externalId: string;
   runCommand(
@@ -35,15 +36,20 @@ export interface RunningSandbox {
   ): Promise<CommandOutcome>;
   writeFile(path: string, content: string): Promise<void>;
   readFile(path: string): Promise<string>;
+  readFileRange?(path: string, offset: number, limit: number, timeoutMs: number): Promise<{ text: string; start: number; total: number }>;
   /** Public URL a port inside the sandbox is reachable on. */
   previewUrl(port: number): string;
   stop(): Promise<void>;
+  lifetime?(): Promise<{ startedAt: Date; endAt: Date }>;
+  /** Provider VM copy. Never implemented as a second directory in the same VM. */
+  forkForValidation?(timeoutMs: number): Promise<RunningSandbox>;
 }
 
 export interface SandboxAdapter {
+  terminate?(externalId: string): Promise<boolean>;
   start(
     provider: SandboxProvider,
-    context: { readonly metadata: Readonly<Record<string, string>> },
+    context: { readonly metadata: Readonly<Record<string, string>>; readonly publicPreviewEnabled?: boolean },
   ): Promise<RunningSandbox>;
   /** Reconnects to an existing sandbox, so a successor can shut an orphan down. */
   connect(externalId: string): Promise<RunningSandbox>;

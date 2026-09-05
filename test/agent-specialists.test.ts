@@ -288,6 +288,7 @@ function anthropicOf(script: readonly Responder[]): {
 }
 
 class FakeMetering {
+  async recordObservedUsage(): Promise<void> {}
   readonly consumed: { meterKey: string; quantity: number }[] = [];
   readonly reserved: { meterKey: string; quantity: number }[] = [];
   readonly settled: number[] = [];
@@ -450,6 +451,15 @@ async function turn(options: {
   const reservations = options.reservations ?? new FakeReservations(metering);
   const problems = options.problems ?? [];
   const run = await runAgentTurn({
+    withValidationSandbox: sandbox instanceof ValidationSandbox ? sandbox.withCopy.bind(sandbox) : undefined,
+    // Agent orchestration tests inject the billing boundary. The real admission
+    // service's reserve-before-dispatch protocol is covered independently.
+    admission: { begin: async ({ outputReservationId }) => ({ settle: async (usage) => {
+      if (usage.input !== undefined && usage.input > 0) await metering.consume({ meterKey: 'ai.tokens.input', quantity: usage.input });
+      if (outputReservationId === undefined && usage.output !== undefined && usage.output > 0) {
+        await metering.consume({ meterKey: 'ai.tokens.output', quantity: usage.output });
+      }
+    } }) },
     anthropic: client,
     session,
     project,
@@ -850,34 +860,16 @@ test('a specialist that fails normally still finalises its hold', async () => {
   assert.equal(reservations.open.size, 0);
 });
 
-test('a cancelled consultation leaves no hold open and keeps it recoverable meanwhile', async () => {
+test('cancellation before a consultation prevents both the tool and its reservation', async () => {
   const controller = new AbortController();
   const metering = new FakeMetering();
   const reservations = new FakeReservations(metering);
-
-  await assert.rejects(
-    turn({
-      metering,
-      reservations,
-      signal: controller.signal,
-      script: [
-        () => {
-          controller.abort();
-          return consultMessage();
-        },
-        () => say('never reached'),
-      ],
-    }),
-    /aborted/,
-  );
-
-  // The hold reached a terminal outcome even though the model call was killed.
-  assert.equal(metering.reserved.length, 1);
-  assert.deepEqual(metering.settled, [0]);
-  // The record survives the failure, so recovery would still find it. Releasing
-  // it later is a no-op because it is already closed.
-  assert.deepEqual([...reservations.open], ['reservation-1']);
-  assert.equal(await metering.release('user-1', 'reservation-1'), false);
+  await assert.rejects(turn({ metering, reservations, signal: controller.signal,
+    script: [() => { controller.abort(); return consultMessage(); }, () => say('never reached')],
+  }), /aborted/);
+  assert.deepEqual(metering.reserved, []);
+  assert.deepEqual(metering.settled, []);
+  assert.equal(reservations.open.size, 0);
 });
 
 test('a refused take creates neither the hold nor the session record', async () => {
@@ -981,11 +973,8 @@ test('a settlement failure never displaces the error that actually stopped the w
       problems,
       signal: controller.signal,
       script: [
-        () => {
-          controller.abort();
-          return consultMessage();
-        },
-        () => say('never reached'),
+        consult(),
+        () => { controller.abort(); return { ...say('partial'), events: [messageDelta(7)], abortAfterEvents: true }; },
       ],
     }),
     // The cancellation is what went wrong, not the settlement that followed it.
@@ -1499,9 +1488,8 @@ test('one specialist failing leaves a sibling result standing', async () => {
   );
   assert.ok(results[0]?.text.includes('Security specialist — verdict: ok'));
   assert.ok(results[1]?.text.includes('the provider returned 529'));
-  // Both consultations settled their own accounting, and the failed one keeps
-  // its hold recorded for recovery.
-  assert.equal(metering.settled.length, 2);
+  // Only known usage settles; the failed provider call remains held.
+  assert.equal(metering.settled.length, 1);
   assert.equal(reservations.open.size, 1);
 });
 
@@ -1751,7 +1739,7 @@ test('cancellation reaches every in-flight consultation and leaves nothing detac
   // Control returned only after every started consultation had settled its own
   // accounting — nothing kept running past the turn — and both holds stayed
   // recorded for recovery.
-  assert.deepEqual(metering.settled, [0, 0]);
+  assert.deepEqual(metering.settled, []);
   assert.equal(reservations.open.size, 2);
 });
 
@@ -2265,111 +2253,51 @@ interface ValidationOptions {
   readonly breakVerify?: boolean;
 }
 
-/**
- * A sandbox that models git checkpoint/restore semantics: it captures the tree
- * at the checkpoint marker and puts it back at the restore marker, so a test
- * can prove that pre-existing changes survive and validation changes do not.
- * It executes the real checkpoint/restore scripts' contract, not the scripts.
- */
+/** Separate maps represent separate VM filesystems; disposal never copies back. */
 class ValidationSandbox implements RunningSandbox {
   readonly externalId = 'sandbox-1';
-  files: Map<string, string>;
+  readonly files: Map<string, string>;
   readonly writes: string[] = [];
   readonly commands: string[] = [];
   readonly allCommands: string[] = [];
   readonly profileCommands: { command: string; envs: Record<string, string> | undefined }[] = [];
-  #snapshot: Map<string, string> | undefined;
-  readonly #onCommand: NonNullable<ValidationOptions['onCommand']>;
-  readonly #tracker: Tracker | undefined;
-  readonly #failRestore: boolean;
-  readonly #breakVerify: boolean;
-
+  stopped = 0;
+  forks = 0;
+  readonly #options: ValidationOptions;
   constructor(options: ValidationOptions = {}) {
     this.files = new Map(Object.entries(options.files ?? {}));
-    this.#onCommand = options.onCommand ?? (() => ({ exitCode: 0, stdout: '', stderr: '' }));
-    this.#tracker = options.tracker;
-    this.#failRestore = options.failRestore ?? false;
-    this.#breakVerify = options.breakVerify ?? false;
+    this.#options = options;
   }
-
-  #hash(files: Map<string, string>): string {
-    return JSON.stringify([...files.entries()].sort());
+  async runCommand(command: string, options?: { envs?: Readonly<Record<string, string>> }): Promise<CommandOutcome> {
+    this.commands.push(command);
+    return this.#run(command, this.files, options);
   }
-
-  #diff(before: Map<string, string>, after: Map<string, string>): string[] {
-    const changed: string[] = [];
-    for (const key of new Set([...before.keys(), ...after.keys()])) {
-      const b = before.get(key);
-      const a = after.get(key);
-      if (b === undefined && a !== undefined) {
-        changed.push(`A\t${key}`);
-      } else if (b !== undefined && a === undefined) {
-        changed.push(`D\t${key}`);
-      } else if (b !== a) {
-        changed.push(`M\t${key}`);
-      }
-    }
-    return changed;
-  }
-
-  async runCommand(
-    command: string,
-    options?: { readonly cwd: string; readonly timeoutMs: number; readonly envs?: Readonly<Record<string, string>> },
-  ): Promise<CommandOutcome> {
+  async #run(command: string, files: Map<string, string>, options?: { envs?: Readonly<Record<string, string>> }): Promise<CommandOutcome> {
     this.allCommands.push(command);
-    if (command.startsWith('# lotusbuild:validation-checkpoint')) {
-      this.#snapshot = new Map(this.files);
-      const hash = this.#hash(this.files);
-      // The content-only fake has no index or HEAD, so both trees are the
-      // content hash and the HEAD fields are empty — enough to exercise the
-      // tool's parse and restore flow. Git semantics are proven separately by
-      // the real-repository tests.
-      return {
-        exitCode: 0,
-        stdout: `index_tree=${hash}\nworking_tree=${hash}\nhead_ref=\nhead_commit=\n`,
-        stderr: '',
-      };
-    }
-    if (command.startsWith('# lotusbuild:validation-restore')) {
-      if (this.#failRestore) {
-        return { exitCode: 1, stdout: '', stderr: 'restore failed' };
-      }
-      const checkpoint = options?.envs?.['LOTUSBUILD_WORKING_TREE'] ?? '';
-      const snapshot = this.#snapshot ?? new Map<string, string>();
-      const mutated = this.#hash(this.files) !== checkpoint;
-      const changed = this.#diff(snapshot, this.files);
-      // Restore the tree exactly to the checkpoint, discarding validation work.
-      this.files = new Map(snapshot);
-      const verified = !this.#breakVerify && this.#hash(this.files) === checkpoint;
-      const stdout = `mutated=${mutated ? 1 : 0}\nverified=${verified ? 1 : 0}\nchanged:\n${changed.join('\n')}\n`;
-      return { exitCode: 0, stdout, stderr: '' };
-    }
-    // A real command: the validation profile, or the primary's own run_command.
     this.profileCommands.push({ command, envs: options?.envs === undefined ? undefined : { ...options.envs } });
-    const exec = (): { exitCode: number; stdout: string; stderr: string } =>
-      this.#onCommand(command, this.files);
-    return this.#tracker === undefined ? exec() : this.#tracker.run(exec);
+    const exec = () => this.#options.onCommand?.(command, files) ?? { exitCode: 0, stdout: '', stderr: '' };
+    return this.#options.tracker === undefined ? exec() : this.#options.tracker.run(exec);
   }
-
-  async writeFile(path: string): Promise<void> {
-    const record = (): void => {
-      this.writes.push(path);
+  async withCopy(run: (copy: RunningSandbox) => Promise<CommandOutcome>): Promise<CommandOutcome> {
+    if (this.#options.breakVerify) throw new Error('fork failed');
+    this.forks += 1;
+    const files = new Map(this.files);
+    const copy: RunningSandbox = {
+      externalId: 'validation-copy',
+      runCommand: (command, options) => this.#run(command, files, options),
+      writeFile: async (path, content) => { files.set(path, content); },
+      readFile: async (path) => files.get(path) ?? '',
+      previewUrl: () => { throw new Error('No validation preview'); },
+      stop: async () => { this.stopped += 1; if (this.#options.failRestore) throw new Error('disposal failed'); },
     };
-    if (this.#tracker === undefined) {
-      record();
-      return;
-    }
-    await this.#tracker.run(async () => record());
+    try { return await run(copy); } finally { await copy.stop(); }
   }
-
-  async readFile(): Promise<string> {
-    return 'file contents';
+  async writeFile(path: string): Promise<void> {
+    const work = () => { this.writes.push(path); };
+    if (this.#options.tracker === undefined) work(); else await this.#options.tracker.run(work);
   }
-
-  previewUrl(): string {
-    return 'https://preview.invalid';
-  }
-
+  async readFile(): Promise<string> { return 'file contents'; }
+  previewUrl(): string { return 'https://preview.invalid'; }
   async stop(): Promise<void> {}
 }
 
@@ -2524,6 +2452,7 @@ async function runValidationOnce(
 ): Promise<{ sandbox: ValidationSandbox; result: { text: string; isError: boolean } }> {
   const sandbox = new ValidationSandbox(options);
   const context: ToolContext = {
+    withValidationSandbox: sandbox.withCopy.bind(sandbox),
     sandbox,
     provider,
     commandTimeoutMs: 1000,
@@ -2562,7 +2491,7 @@ test('a pre-existing untracked primary file survives validation deleting it', as
   assert.equal(sandbox.files.get('src/new-file.ts'), 'brand new primary work');
 });
 
-test('a validation-created file is removed by restoration', async () => {
+test('a validation-created file never reaches the primary', async () => {
   const { sandbox, result } = await runValidationOnce({
     files: { 'src/app.ts': 'x' },
     onCommand: (_command, files) => {
@@ -2571,10 +2500,10 @@ test('a validation-created file is removed by restoration', async () => {
     },
   });
   assert.equal(sandbox.files.has('.snapshot'), false);
-  assert.ok(result.text.includes('modified the project git state'));
+  assert.ok(result.text.includes('disposable sandbox copy'));
 });
 
-test('a validation-modified tracked file is restored', async () => {
+test('a validation modification stays in the copy', async () => {
   const { sandbox } = await runValidationOnce({
     files: { 'src/app.ts': 'original' },
     onCommand: (_command, files) => {
@@ -2585,7 +2514,7 @@ test('a validation-modified tracked file is restored', async () => {
   assert.equal(sandbox.files.get('src/app.ts'), 'original');
 });
 
-test('a validation-deleted tracked file is restored', async () => {
+test('a validation deletion stays in the copy', async () => {
   const { sandbox } = await runValidationOnce({
     files: { 'src/app.ts': 'original', 'package.json': '{}' },
     onCommand: (_command, files) => {
@@ -2596,7 +2525,7 @@ test('a validation-deleted tracked file is restored', async () => {
   assert.equal(sandbox.files.get('src/app.ts'), 'original');
 });
 
-test('a workspace mutation is reported after restoration', async () => {
+test('the result identifies the disposable workspace boundary', async () => {
   const { result } = await runValidationOnce({
     files: { 'src/app.ts': 'x' },
     onCommand: (_command, files) => {
@@ -2604,29 +2533,39 @@ test('a workspace mutation is reported after restoration', async () => {
       return { exitCode: 0, stdout: 'ok', stderr: '' };
     },
   });
-  assert.ok(result.text.includes('modified the project git state'));
-  assert.ok(result.text.includes('Changed:'));
+  assert.ok(result.text.includes('disposable sandbox copy'));
+  assert.ok(result.text.includes('primary workspace was not changed'));
   assert.equal(result.isError, false);
 });
 
-test('restoration is explicitly verified: the restore script runs with the checkpoint', async () => {
+test('validation runs only in the copy and confirms disposal', async () => {
   const { sandbox } = await runValidationOnce({ files: { 'a.ts': '1' } });
-  const restore = sandbox.allCommands.find((c) => c.startsWith('# lotusbuild:validation-restore'));
-  assert.ok(restore !== undefined);
-  // Checkpoint captured, command run, restore verified — three phases, in order.
-  assert.equal(sandbox.allCommands[0]?.startsWith('# lotusbuild:validation-checkpoint'), true);
+  assert.equal(sandbox.forks, 1);
+  assert.equal(sandbox.stopped, 1);
+  assert.deepEqual(sandbox.commands, []);
+  assert.deepEqual(sandbox.allCommands, ['run-tests']);
 });
 
-test('a restore that cannot be verified becomes an explicit tool failure', async () => {
-  const { result } = await runValidationOnce({ files: { 'a.ts': '1' }, breakVerify: true });
-  assert.equal(result.isError, true);
-  assert.ok(result.text.includes('restoration could not be verified'));
+test('failure to provision an isolated copy prevents the validation command', async () => {
+  await assert.rejects(runValidationOnce({ breakVerify: true }), /fork failed/);
 });
 
-test('a restore command that fails becomes an explicit tool failure', async () => {
-  const { result } = await runValidationOnce({ files: { 'a.ts': '1' }, failRestore: true });
-  assert.equal(result.isError, true);
-  assert.ok(result.text.includes('could not be restored'));
+test('failed disposal is an explicit failure', async () => {
+  await assert.rejects(runValidationOnce({ failRestore: true }), /disposal failed/);
+});
+
+test('a thrown validation command cannot alter primary ignored files or Git configuration', async () => {
+  const sandbox = new ValidationSandbox({ files: { '.git/config': 'original', 'ignored.txt': 'original' },
+    onCommand: (_command, files) => { files.set('.git/config', 'hostile'); files.set('ignored.txt', 'hostile'); throw new Error('timed out'); },
+  });
+  const tool = makeRunValidation({ signal: new AbortController().signal, assertStillOurs: () => {} });
+  await assert.rejects(tool.run({ operation: 'test' }, { sandbox, provider,
+    withValidationSandbox: sandbox.withCopy.bind(sandbox), commandTimeoutMs: 1000,
+    previewReadyTimeoutSeconds: 5, toolOutputMaxChars: 4000, onPreview: async () => {},
+  }), /timed out/);
+  assert.equal(sandbox.files.get('.git/config'), 'original');
+  assert.equal(sandbox.files.get('ignored.txt'), 'original');
+  assert.equal(sandbox.stopped, 1);
 });
 
 test('a failing validation exit code is evidence, not an infrastructure failure', async () => {

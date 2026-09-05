@@ -23,6 +23,7 @@ export { EnvironmentError } from './env.ts';
  * had no reason to be.
  */
 const sharedSpec = {
+  SESSION_EVENT_MAX_BYTES: asInteger('maximum serialized live event bytes', { min: 1024, max: 1048576 }),
   NODE_ENV: asEnum('deployment mode', ['development', 'production', 'test']),
   LOG_LEVEL: asEnum('pino log level', ['trace', 'debug', 'info', 'warn', 'error', 'fatal']),
   FIREBASE_PROJECT_ID: asString('Firebase project this service authenticates against'),
@@ -61,6 +62,7 @@ const sharedSpec = {
 
 
 const apiSpec = {
+  FAMILY_INVITATION_TTL_SECONDS: asInteger('lifetime of a one-use parent linking invitation', { min: 60, max: 86400 }),
   HOST: asString('interface to bind (127.0.0.1 behind a reverse proxy, 0.0.0.0 otherwise)'),
   PORT: asPort('TCP port to listen on'),
   PUBLIC_API_URL: asUrl('externally reachable base URL of this API', {
@@ -74,6 +76,9 @@ const apiSpec = {
     'open event streams this process will hold at once',
     { min: 1, max: 10000 },
   ),
+  SSE_MAX_CONNECTIONS_PER_USER: asInteger('maximum simultaneous event streams per account per API process', { min: 1, max: 100 }),
+  SSE_BUFFER_MAX_BYTES: asInteger('maximum buffered event bytes per connection', { min: 1024, max: 1048576 }),
+  HTTP_MAX_REQUESTS_PER_MINUTE: asInteger('pre-authentication requests per client IP per minute', { min: 1, max: 100000 }),
   STRIPE_SECRET_KEY: asString('Stripe secret key this service bills with'),
   STRIPE_WEBHOOK_SECRET: asString('signing secret for the Stripe webhook endpoint'),
   STRIPE_EVENT_REPLAY_WINDOW_SECONDS: asInteger(

@@ -65,40 +65,60 @@ export class SandboxService {
     readonly platform: Platform;
     readonly sessionId: string;
     readonly now: Date;
+    readonly reservations: {
+      take(input: { meterKey: string; quantity: number; operationId: string }): Promise<Reservation>;
+    };
+    readonly source?: RunningSandbox;
+    readonly publicPreviewEnabled?: boolean;
   }): Promise<AcquiredSandbox> {
     const { registry } = await this.#configuration.get();
     const provider = await this.providerFor(input.platform);
     // Resolved before anything is reserved: a provider with no adapter must fail
     // before it costs the user a hold.
     const adapter = adapterFor(this.#adapters, provider);
+    if (input.source !== undefined && input.source.forkForValidation === undefined) {
+      throw new Error('This sandbox provider cannot create an isolated validation copy.');
+    }
 
     const held: Reservation[] = [];
+    let dispatched = false;
     try {
       for (const [meterKey, quantity] of [
         [provider.concurrencyMeterKey, 1],
         [registry.sandboxTimeMeterKey, provider.timeoutSeconds],
       ] as const) {
         held.push(
-          await this.#metering.reserve({
-            uid: input.uid,
-            entitlements: input.entitlements,
+          await input.reservations.take({
             meterKey,
             quantity,
             operationId: input.sessionId,
-            now: input.now,
           }),
         );
       }
 
-      const running = await adapter.start(provider, {
+      dispatched = true;
+      await this.#metering.markInFlight(input.uid, held.map((hold) => hold.id));
+      const running = input.source === undefined ? await adapter.start(provider, {
         // Enough to find the machine from the provider's own console when
         // something is stuck, without putting anything private on it.
         metadata: { sessionId: input.sessionId, platform: provider.platform },
-      });
+        publicPreviewEnabled: input.publicPreviewEnabled === true,
+      }) : await input.source.forkForValidation!(provider.timeoutSeconds * 1000);
 
-      return { running, provider, reservations: held, startedAt: new Date() };
+      try {
+        if (running.lifetime === undefined) throw new Error('The provider does not expose authoritative sandbox lifetime metadata.');
+        const lifetime = await running.lifetime();
+        await this.#metering.recordSandbox(input.uid, held.map((hold) => hold.id), {
+          externalId: running.externalId, platform: provider.platform, ...lifetime,
+        });
+        return { running, provider, reservations: held, startedAt: lifetime.startedAt };
+      } catch (cause) {
+        try { await running.stop(); }
+        catch (cleanup) { throw new AggregateError([cause, cleanup], 'Sandbox registration and termination failed.'); }
+        throw cause;
+      }
     } catch (error) {
-      for (const reservation of held) {
+      if (!dispatched) for (const reservation of held) {
         await this.#metering.release(input.uid, reservation.id, input.now);
       }
       throw error;
@@ -108,10 +128,8 @@ export class SandboxService {
   /**
    * Stops the machine and closes its holds at what it actually cost.
    *
-   * The sandbox is stopped first but a failure to stop does not prevent the
-   * accounting: a machine we cannot reach still stops charging when its own
-   * timeout expires, whereas a hold nobody returns is a slot the user loses for
-   * good.
+   * Termination must succeed before capacity is released. A failed or ambiguous
+   * stop preserves holds until provider evidence can resolve the lifetime.
    */
   async release(input: {
     readonly uid: string;
@@ -126,42 +144,21 @@ export class SandboxService {
         await input.acquired.running.stop();
       } catch (cause) {
         input.onStopFailure(cause instanceof Error ? cause : new Error(String(cause)));
+        throw cause;
       }
+    } else {
+      throw new Error('Sandbox termination is unconfirmed; reservations remain held.');
     }
-
-    const { registry } = await this.#configuration.get();
-    // Rounded up: a sandbox that lived for part of a second still occupied one.
-    const elapsedSeconds = Math.max(
-      1,
-      Math.ceil((input.now.getTime() - input.acquired.startedAt.getTime()) / 1000),
-    );
-
-    for (const reservation of input.acquired.reservations) {
-      // Which verb closes a hold follows from what the meter measures, not from
-      // its name: time was spent and is settled, a gauge slot was occupied and
-      // is handed back.
-      if (reservation.meterKey === registry.sandboxTimeMeterKey) {
-        await this.#metering.settle({
-          uid: input.uid,
-          reservationId: reservation.id,
-          // Never more than was held: the machine cannot outlive its own timeout,
-          // and if the clock says otherwise the reservation is the honest figure.
-          actualQuantity: Math.min(elapsedSeconds, reservation.estimatedQuantity),
-          now: input.now,
-        });
-        continue;
-      }
-      await this.#metering.release(input.uid, reservation.id, input.now);
-    }
+    const ids = input.acquired.reservations.map((hold) => hold.id);
+    await this.#metering.confirmSandboxStopped(input.uid, ids, new Date());
+    for (const id of ids) await this.#metering.reconcile(input.uid, id, new Date());
   }
 
   /**
    * Cleans up after a runner that died holding a session.
    *
-   * Called by whoever inherits the expired lease. Both halves are best effort
-   * and reported rather than thrown: the successor's job is to build, and
-   * refusing to work because a corpse could not be tidied would turn one dead
-   * runner into a session nobody can ever pick up.
+   * Called by whoever inherits the expired lease. Unresolved usage preserves
+   * the ledger and prevents new work until reconciliation succeeds.
    */
   async recover(input: {
     readonly uid: string;
@@ -171,28 +168,39 @@ export class SandboxService {
     readonly now: Date;
     readonly onProblem: (error: Error, what: string) => void;
   }): Promise<void> {
-    if (input.externalSandboxId !== undefined) {
-      try {
-        const provider = await this.providerFor(input.platform);
-        const adapter = adapterFor(this.#adapters, provider);
-        await (await adapter.connect(input.externalSandboxId)).stop();
-      } catch (cause) {
-        input.onProblem(
-          cause instanceof Error ? cause : new Error(String(cause)),
-          `stopping orphaned sandbox ${input.externalSandboxId}`,
-        );
+    const provider = await this.providerFor(input.platform);
+    const adapter = adapterFor(this.#adapters, provider);
+    if (adapter.terminate === undefined) throw new Error('Provider termination without resuming is unavailable.');
+    const groups = new Map<string, string[]>();
+    for (const id of input.reservationIds) {
+      const fields = await this.#metering.reservationRecord(input.uid, id);
+      if (fields['status'] !== 'OPEN') continue;
+      const externalId = fields['sandboxExternalId'];
+      if (typeof externalId === 'string') {
+        const group = groups.get(externalId) ?? [];
+        group.push(id);
+        groups.set(externalId, group);
       }
     }
-
-    for (const reservationId of input.reservationIds) {
+    if (input.externalSandboxId !== undefined && !groups.has(input.externalSandboxId)) {
+      groups.set(input.externalSandboxId, []);
+    }
+    const failures: unknown[] = [];
+    for (const [id, holds] of groups) {
       try {
-        await this.#metering.release(input.uid, reservationId, input.now);
-      } catch (cause) {
-        input.onProblem(
-          cause instanceof Error ? cause : new Error(String(cause)),
-          `releasing orphaned reservation ${reservationId}`,
-        );
-      }
+        const terminated = await adapter.terminate(id);
+        // Already absent proves no concurrency, but not when billing stopped.
+        await this.#metering.confirmSandboxStopped(input.uid, holds, terminated ? new Date() : undefined);
+      } catch (cause) { failures.push(cause); }
+    }
+    for (const id of input.reservationIds) {
+      try { await this.#metering.reconcile(input.uid, id, input.now); }
+      catch (cause) { failures.push(cause); }
+    }
+    if (failures.length > 0) {
+      const error = new AggregateError(failures, 'Recovery remains incomplete; resource records and unresolved usage are retained.');
+      input.onProblem(error, 'recovering sandbox and usage reservations');
+      throw error;
     }
   }
 }

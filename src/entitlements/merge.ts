@@ -102,9 +102,15 @@ const strategies: Readonly<Record<MergeStrategy, StrategyDefinition>> = {
       if (a.length === 0) return { kind: 'stringList', value: b };
       if (b.length === 0) return { kind: 'stringList', value: a };
       const permitted = new Set(b);
+      const intersection = a.filter((item) => permitted.has(item));
+      if (intersection.length === 0) {
+        // [] is the persisted unrestricted sentinel. It cannot also encode
+        // deny-all without silently widening these two conflicting grants.
+        throw new EntitlementConfigError('Allowlist contributions have no permitted value in common.');
+      }
       return {
         kind: 'stringList',
-        value: Object.freeze(a.filter((item) => permitted.has(item))),
+        value: Object.freeze(intersection),
       };
     },
   },

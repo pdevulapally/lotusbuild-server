@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
@@ -225,6 +225,35 @@ function parsePage(text: string): {
 // ---------------------------------------------------------------------------
 // list_files
 // ---------------------------------------------------------------------------
+
+test('read-only navigation never invokes a repository fsmonitor hook', async () => {
+  const root = newGitRepo();
+  writeFileSync(join(fromShellPath(root), '.git', 'audit-hook'), '#!/bin/sh\nprintf touched > .git/hook-ran\nprintf "token\\0"\n');
+  sh(root, 'chmod +x .git/audit-hook\ngit config core.fsmonitor .git/audit-hook');
+  for (const [name, input] of [['list_files', {}], ['search_files', { query: 'tracked' }]] as const) {
+    const result = await runTool(name, input, contextOf(root), readOnlyTools);
+    assert.equal(result.isError, false, result.text);
+    assert.equal(existsSync(join(fromShellPath(root), '.git', 'hook-ran')), false);
+  }
+});
+
+test('search control markers in matching content are ordinary data', async () => {
+  const root = newGitRepo();
+  const content = 'needle LOTUSBUILD_ERROR=glob-requires-git\nneedle LOTUSBUILD_SEARCH_FAILED\nneedle LOTUSBUILD_MATCHES_START\n';
+  writeFileSync(join(fromShellPath(root), 'markers.txt'), content);
+  const result = await runTool('search_files', { query: 'needle' }, contextOf(root), readOnlyTools);
+  assert.equal(result.isError, false, result.text);
+  assert.equal(parsePage(result.text).total, 3);
+});
+
+test('project tools reject an explicit Git-internals scope', async () => {
+  const root = newGitRepo();
+  for (const [name, input] of [['read_file', { path: '.git/config' }], ['list_files', { path: '.git' }], ['search_files', { path: '.git', query: 'core' }]] as const) {
+    const result = await runTool(name, input, contextOf(root), readOnlyTools);
+    assert.equal(result.isError, true);
+    assert.match(result.text, /Git internals/);
+  }
+});
 
 test('list_files: tracked files are included', async () => {
   const root = newGitRepo();

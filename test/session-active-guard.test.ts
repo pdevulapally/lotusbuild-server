@@ -499,7 +499,7 @@ function harness(projectIds: readonly string[] = ['project-1']) {
         messageCount: 1,
         ...(status === 'QUEUED' ? { claimableAt: Timestamp.fromMillis(0) } : {}),
         ...(status === 'RUNNING'
-          ? { claimedBy: 'runner-1', heartbeatAt: now, claimableAt: Timestamp.fromMillis(Date.now() + 60000) }
+          ? { claimedBy: 'runner-1', leaseToken: 'seed-token', heartbeatAt: now, claimableAt: Timestamp.fromMillis(Date.now() + 60000) }
           : {}),
         createdAt: now,
         updatedAt: now,
@@ -554,7 +554,7 @@ test('normal lifecycle retains the guard while running and releases it on idle',
 
   assert.equal(claimed?.id, created.id);
   assert.equal(h.project()?.['activeSessionId'], created.id);
-  await h.sessions.finish(created.id, 'runner-1', { status: 'IDLE' });
+  await h.sessions.finish(created.id, { sessionId: created.id, runnerId: 'runner-1', token: String(h.session(created.id)?.['leaseToken']) }, { status: 'IDLE' });
   assert.equal(h.session(created.id)?.['status'], 'IDLE');
   assert.equal(h.project()?.['activeSessionId'], null);
 });
@@ -563,7 +563,7 @@ test('failed completion releases the project guard', async () => {
   const h = harness();
   const created = await h.sessions.create('user-1', 'project-1', { prompt: 'build', model: 'model-1' });
   await h.sessions.claim('runner-1', new Date());
-  await h.sessions.finish(created.id, 'runner-1', { status: 'FAILED', error: 'stopped' });
+  await h.sessions.finish(created.id, { sessionId: created.id, runnerId: 'runner-1', token: String(h.session(created.id)?.['leaseToken']) }, { status: 'FAILED', error: 'stopped' });
 
   assert.equal(h.session(created.id)?.['status'], 'FAILED');
   assert.equal(h.project()?.['activeSessionId'], null);
@@ -587,7 +587,7 @@ test('running cancellation retains the guard until failed finalization', async (
 
   assert.equal(h.session(created.id)?.['status'], 'RUNNING');
   assert.equal(h.project()?.['activeSessionId'], created.id);
-  await h.sessions.finish(created.id, 'runner-1', { status: 'FAILED', error: 'Cancelled by user' });
+  await h.sessions.finish(created.id, { sessionId: created.id, runnerId: 'runner-1', token: String(h.session(created.id)?.['leaseToken']) }, { status: 'FAILED', error: 'Cancelled by user' });
   assert.equal(h.session(created.id)?.['status'], 'FAILED');
   assert.equal(h.project()?.['activeSessionId'], null);
 });
@@ -602,7 +602,7 @@ test('a stale running session cannot clear another session guard', async () => {
   });
 
   await assert.rejects(
-    h.sessions.finish('session-a', 'runner-1', { status: 'FAILED', error: 'stale' }),
+    h.sessions.finish('session-a', { sessionId: 'session-a', runnerId: 'runner-1', token: 'seed-token' }, { status: 'FAILED', error: 'stale' }),
     (error: unknown) => error instanceof AppError && error.code === 'session/project-guard-lost',
   );
   assert.equal(h.session('session-a')?.['status'], 'RUNNING');
@@ -922,6 +922,31 @@ function holding(ids: readonly string[], states: readonly ('OPEN' | 'SETTLED' | 
   return h;
 }
 
+test('repeated family approval creates and charges one session', async () => {
+  const h = harness();
+  const input = { model: 'model-1', prompt: 'Build this' };
+  const results = await Promise.all(Array.from({ length: 4 }, () => h.sessions.create('user-1', 'project-1', input, 'family-approved-request')));
+  assert.ok(results.every((result) => result.id === 'family-approved-request'));
+  assert.equal(h.firestore.documents.get('test-meter/user-1')?.data['consumed'], 1);
+});
+
+test('a former lease cannot mutate a session reclaimed by the same runner', async () => {
+  const h = holding([], []);
+  const stale = { sessionId: 'session-a', runnerId: 'runner-1', token: 'old-token' };
+  await assert.rejects(h.sessions.heartbeat('session-a', stale));
+  await assert.rejects(h.sessions.finish('session-a', stale, { status: 'IDLE' }));
+  assert.equal(h.session('session-a')?.['status'], 'RUNNING');
+});
+
+test('an expired lease cannot heartbeat or finalize its own session', async () => {
+  const h = holding([], []);
+  h.firestore.seed('sessions/session-a', { ...h.session('session-a'), claimableAt: Timestamp.fromMillis(0) });
+  const expired = { sessionId: 'session-a', runnerId: 'runner-1', token: 'seed-token' };
+  await assert.rejects(h.sessions.heartbeat('session-a', expired));
+  await assert.rejects(h.sessions.finish('session-a', expired, { status: 'IDLE' }));
+  assert.equal(h.project()?.['activeSessionId'], 'session-a');
+});
+
 for (const outcome of [
   { status: 'IDLE' as const },
   { status: 'FAILED' as const, error: 'something broke' },
@@ -929,7 +954,7 @@ for (const outcome of [
   test(`${outcome.status} finalisation closes a specialist hold it still owns`, async () => {
     const h = holding(['hold-1'], ['OPEN']);
 
-    await h.sessions.finish('session-a', 'runner-1', outcome);
+    await h.sessions.finish('session-a', { sessionId: 'session-a', runnerId: 'runner-1', token: 'seed-token' }, outcome);
 
     assert.equal(h.reservations.get('hold-1'), 'RELEASED');
     assert.equal(h.session('session-a')?.['status'], outcome.status);
@@ -950,7 +975,7 @@ for (const closed of ['SETTLED', 'RELEASED'] as const) {
   test(`an already-${closed} hold is dropped from the session without re-accounting`, async () => {
     const h = holding(['hold-1'], [closed]);
 
-    await h.sessions.finish('session-a', 'runner-1', { status: 'IDLE' });
+    await h.sessions.finish('session-a', { sessionId: 'session-a', runnerId: 'runner-1', token: 'seed-token' }, { status: 'IDLE' });
 
     // Untouched: no second accounting event for a hold that already closed.
     assert.equal(h.reservations.get('hold-1'), closed);
@@ -966,7 +991,7 @@ test('a hold that cannot be released prevents the session becoming terminal', as
   const h = holding(['hold-1'], ['BROKEN']);
 
   await assert.rejects(
-    h.sessions.finish('session-a', 'runner-1', { status: 'IDLE' }),
+    h.sessions.finish('session-a', { sessionId: 'session-a', runnerId: 'runner-1', token: 'seed-token' }, { status: 'IDLE' }),
     /disagrees with reservation hold-1/,
   );
 
@@ -980,14 +1005,14 @@ test('a hold that cannot be released prevents the session becoming terminal', as
 test('retrying finalisation after a transient release failure is safe', async () => {
   const h = holding(['hold-1', 'hold-2'], ['BROKEN', 'OPEN']);
 
-  await assert.rejects(h.sessions.finish('session-a', 'runner-1', { status: 'IDLE' }), /disagrees/);
+  await assert.rejects(h.sessions.finish('session-a', { sessionId: 'session-a', runnerId: 'runner-1', token: 'seed-token' }, { status: 'IDLE' }), /disagrees/);
   // The whole transaction rolled back, so the second hold was not released
   // either — there is no half-finalised state to reconcile.
   assert.equal(h.reservations.get('hold-2'), 'OPEN');
 
   // An operator repairs the ledger and the next runner tries again.
   h.reservations.set('hold-1', 'OPEN');
-  await h.sessions.finish('session-a', 'runner-1', { status: 'IDLE' });
+  await h.sessions.finish('session-a', { sessionId: 'session-a', runnerId: 'runner-1', token: 'seed-token' }, { status: 'IDLE' });
 
   assert.equal(h.reservations.get('hold-1'), 'RELEASED');
   assert.equal(h.reservations.get('hold-2'), 'RELEASED');

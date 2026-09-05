@@ -142,8 +142,8 @@ export class EntitlementService {
    * one: most users are on the default plan, and without it every one of their
    * requests is a billed Firestore read for a document that does not exist.
    */
-  async #subscriptionFor(uid: string): Promise<Subscription | null> {
-    const cached = await this.#cache.read(uid);
+  async #subscriptionFor(uid: string, fresh: boolean): Promise<Subscription | null> {
+    const cached = fresh ? undefined : await this.#cache.read(uid);
     if (cached !== undefined) {
       return cached.subscription;
     }
@@ -152,7 +152,7 @@ export class EntitlementService {
     const snapshot = await this.#firestore.doc(path).get();
     const subscription = snapshot.exists ? parseSubscription(snapshot.data() ?? {}, path) : null;
 
-    await this.#cache.write(uid, subscription);
+    if (!fresh) await this.#cache.write(uid, subscription);
     return subscription;
   }
 
@@ -170,14 +170,14 @@ export class EntitlementService {
     );
   }
 
-  async #planFor(uid: string, now: Date): Promise<{
+  async #planFor(uid: string, now: Date, fresh: boolean): Promise<{
     plan: Plan;
     status: SubscriptionStatus | undefined;
   }> {
     const { registry, plans } = await this.#configuration.get();
 
     const path = `${subscriptionsCollectionPath}/${uid}`;
-    const subscription = await this.#subscriptionFor(uid);
+    const subscription = await this.#subscriptionFor(uid, fresh);
 
     const defaultPlan = plans.get(registry.defaultPlanKey);
     if (defaultPlan === undefined) {
@@ -212,9 +212,9 @@ export class EntitlementService {
     return { plan, status: subscription.status };
   }
 
-  async forUser(uid: string, now: Date = new Date()): Promise<UserEntitlements> {
+  async forUser(uid: string, now: Date = new Date(), fresh = false): Promise<UserEntitlements> {
     const { registry } = await this.#configuration.get();
-    const { plan, status } = await this.#planFor(uid, now);
+    const { plan, status } = await this.#planFor(uid, now, fresh);
 
     const planSource = registry.entitlementSources.get('plan');
     if (planSource === undefined) {

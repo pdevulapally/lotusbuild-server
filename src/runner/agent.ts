@@ -1,3 +1,4 @@
+import type { CallAdmission } from './call-admission.ts';
 import type Anthropic from '@anthropic-ai/sdk';
 import type {
   ContentBlockParam,
@@ -372,6 +373,8 @@ class BlockerLedger {
 }
 
 interface ModelLoopInput {
+  readonly admission: CallAdmission;
+  readonly outputReservationId?: string;
   readonly anthropic: Anthropic;
   readonly model: string;
   readonly system: string;
@@ -432,6 +435,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
 
   for (let step = 1; step <= input.maxSteps; step += 1) {
     input.assertStillOurs();
+    input.signal.throwIfAborted();
 
     const steer = input.beforeStep?.();
     if (steer !== undefined) {
@@ -443,6 +447,11 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
         : { number: step, of: input.maxSteps, steered: true },
     );
 
+    const admitted = await input.admission.begin({
+      params: { model: input.model, system: input.system, tools: [...specs], messages: input.conversation },
+      maxOutputTokens: input.maxOutputTokens, signal: input.signal,
+      ...(input.outputReservationId === undefined ? {} : { outputReservationId: input.outputReservationId }),
+    });
     const usage = new UsageAccumulator();
     const stream = input.anthropic.messages.stream(
       {
@@ -503,6 +512,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
     try {
       // Charged before anything else happens with the response: a loop that
       // crashes mid-step still used the tokens it used.
+      await admitted.settle(spend);
       await input.charge(spend);
     } catch (error) {
       chargeError = error;
@@ -546,8 +556,12 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
     input.conversation.push({ role: 'assistant', content: message.content });
 
     const executeOne = async (toolUse: ToolUseBlock): Promise<ContentBlockParam> => {
+      input.assertStillOurs();
+      input.signal.throwIfAborted();
       const toolInput = (toolUse.input ?? {}) as Record<string, unknown>;
       await input.onToolCall?.(toolUse.name, toolInput);
+      input.assertStillOurs();
+      input.signal.throwIfAborted();
       const result = await runTool(toolUse.name, toolInput, input.toolContext, input.tools);
       await input.onToolResult?.(toolUse.name, result);
       return {
@@ -675,6 +689,7 @@ function specialistSystemPrompt(
 }
 
 interface SpecialistCall {
+  readonly admission: CallAdmission;
   readonly anthropic: Anthropic;
   readonly session: BuildSession;
   readonly project: Project;
@@ -738,6 +753,7 @@ async function consultSpecialist(
 
   let review: SpecialistReview | undefined;
   let spent = 0;
+  let unknownOutput = false;
   const tools = new Map(readOnlyTools);
   if (call.specialist.validation) {
     // Granted only to a validation-capable specialist, and only ever the
@@ -774,6 +790,8 @@ async function consultSpecialist(
     ];
 
     const outcome = await runModelLoop({
+      admission: call.admission,
+      outputReservationId: reservation.id,
       anthropic: call.anthropic,
       model: call.session.model,
       system: specialistSystemPrompt(call.specialist, call.project, call.provider),
@@ -791,16 +809,8 @@ async function consultSpecialist(
         // to the sum of what was reported across this specialist's calls.
         if (output !== undefined) {
           spent += output;
-        }
-        if (input !== undefined && input > 0) {
-          await call.metering.consume({
-            uid: call.session.ownerUid,
-            entitlements: call.entitlements,
-            meterKey: call.registry.inputTokenMeterKey,
-            quantity: input,
-            now: new Date(),
-          });
-        }
+        } else { unknownOutput = true; }
+
       },
       onProblem: call.onProblem,
       stopWhen: () => review !== undefined,
@@ -830,10 +840,12 @@ async function consultSpecialist(
   let settled = false;
   let settlementError: unknown;
   try {
+    if (unknownOutput) throw new Error('Specialist output usage requires reconciliation; the hold remains open.');
+    await call.metering.recordObservedUsage(call.session.ownerUid, reservation.id, spent);
     await call.metering.settle({
       uid: call.session.ownerUid,
       reservationId: reservation.id,
-      actualQuantity: Math.min(spent, ceiling),
+      actualQuantity: spent,
       now: new Date(),
     });
     settled = true;
@@ -939,6 +951,8 @@ function renderReview(
  * up to its budget.
  */
 export async function runAgentTurn(input: {
+  readonly withValidationSandbox: ToolContext["withValidationSandbox"];
+  readonly admission: CallAdmission;
   readonly anthropic: Anthropic;
   readonly session: BuildSession;
   readonly project: Project;
@@ -965,6 +979,8 @@ export async function runAgentTurn(input: {
   readonly drainSteer: () => string | undefined;
 }): Promise<AgentRun> {
   const toolContext: ToolContext = {
+    publicPreviewEnabled: input.project.publicPreviewEnabled === true,
+    ...(input.withValidationSandbox === undefined ? {} : { withValidationSandbox: input.withValidationSandbox }),
     sandbox: input.sandbox,
     provider: input.provider,
     commandTimeoutMs: input.limits.commandTimeoutMs,
@@ -1071,6 +1087,7 @@ export async function runAgentTurn(input: {
         await input.events.specialistStarted({ role: specialist.key, label: specialist.label });
 
         const outcome = await consultSpecialist({
+          admission: input.admission,
           anthropic: input.anthropic,
           session: input.session,
           project: input.project,
@@ -1125,6 +1142,7 @@ export async function runAgentTurn(input: {
   }
 
   const outcome = await runModelLoop({
+    admission: input.admission,
     anthropic: input.anthropic,
     model: input.session.model,
     system: systemPrompt(input.project, input.provider),
@@ -1136,23 +1154,7 @@ export async function runAgentTurn(input: {
     toolOutputMaxChars: input.limits.toolOutputMaxChars,
     signal: input.signal,
     assertStillOurs: input.assertStillOurs,
-    charge: async ({ input: inputTokens, output }) => {
-      for (const [meterKey, quantity] of [
-        [input.registry.inputTokenMeterKey, inputTokens],
-        [input.registry.outputTokenMeterKey, output],
-      ] as const) {
-        // Unknown is not zero, and neither is charged.
-        if (quantity !== undefined && quantity > 0) {
-          await input.metering.consume({
-            uid: input.session.ownerUid,
-            entitlements: input.entitlements,
-            meterKey,
-            quantity,
-            now: new Date(),
-          });
-        }
-      }
-    },
+    charge: async () => {},
     classifyParallelSafe: (toolUse) => {
       // The tool must declare itself parallel-safe at all, then — for a
       // consultation — the targeted specialist must be parallel-safe too. A

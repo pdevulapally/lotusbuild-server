@@ -5,7 +5,7 @@ import { EntitlementService } from './entitlements/service.ts';
 import { ConfigurationStore } from './entitlements/store.ts';
 import { SubscriptionCache } from './entitlements/subscription-cache.ts';
 import { MeteringService } from './metering/service.ts';
-import { connectRedis } from './redis/client.ts';
+import { connectRedis, redisKeyPrefixes } from './redis/client.ts';
 import { initialiseFirebase } from './firebase.ts';
 import { ProjectRepository } from './projects/repository.ts';
 import { SessionEvents } from './sessions/events.ts';
@@ -13,6 +13,8 @@ import { SessionRepository } from './sessions/repository.ts';
 import { UserRepository } from './users/repository.ts';
 import { SnapshotStore } from './storage/snapshots.ts';
 import { buildServer } from './server.ts';
+import { PrivacyRequests } from './privacy/requests.ts';
+import { FamilyService } from './family/service.ts';
 
 
 async function main(): Promise<void> {
@@ -66,6 +68,7 @@ async function main(): Promise<void> {
     metering,
     configuration,
     snapshots,
+    async (id) => { await redis.del(`${redisKeyPrefixes.sessionEvents}${id}`); },
   );
 
 
@@ -79,6 +82,8 @@ async function main(): Promise<void> {
   await subscriber.connect();
 
   const app = buildServer(config, {
+    privacyRequests: new PrivacyRequests(firebase.firestore),
+    family: new FamilyService(firebase.firestore, config.FAMILY_INVITATION_TTL_SECONDS),
     firebaseAuth: firebase.auth,
     redis,
     entitlements,
@@ -90,7 +95,6 @@ async function main(): Promise<void> {
     stripe: createStripe(config.STRIPE_SECRET_KEY),
     billing: new BillingRepository(
       firebase.firestore,
-      redis,
       subscriptionCache,
       config.STRIPE_EVENT_REPLAY_WINDOW_SECONDS,
     ),
@@ -103,6 +107,7 @@ async function main(): Promise<void> {
       config.SESSION_LEASE_SECONDS,
     ),
     sessionEvents: new SessionEvents(redis, subscriber, {
+      maxEventBytes: config.SESSION_EVENT_MAX_BYTES,
       retentionSeconds: config.SESSION_EVENT_RETENTION_SECONDS,
       maxPerSession: config.SESSION_EVENT_MAX_PER_SESSION,
       onListenerError: (error, sessionId) => {

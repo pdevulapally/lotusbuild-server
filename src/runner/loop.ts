@@ -1,3 +1,5 @@
+import { createCallAdmission } from './call-admission.ts';
+import { assertBuildAllowed } from '../entitlements/build-admission.ts';
 import type Anthropic from '@anthropic-ai/sdk';
 
 import type { EntitlementService, UserEntitlements } from '../entitlements/service.ts';
@@ -132,7 +134,7 @@ export class SessionRunner {
       cancellation.abort(reason);
     };
     const heartbeat = setInterval(() => {
-      void sessions.heartbeat(session.id, runnerId).catch((error: unknown) => {
+      void sessions.heartbeat(session.id, authority).catch((error: unknown) => {
         stopWork(error instanceof Error ? error : new Error(String(error)));
         log.warn({ sessionId: session.id, err: leaseLost }, 'lost the lease on this session');
       });
@@ -193,60 +195,57 @@ export class SessionRunner {
 
     try {
       project = await this.#deps.projects.readOwned(session.ownerUid, session.projectId);
-      entitlements = await this.#deps.entitlements.forUser(session.ownerUid);
+      entitlements = await this.#deps.entitlements.forUser(session.ownerUid, new Date(), true);
+      assertBuildAllowed(entitlements, project.platform, session.model);
       // Narrowed once here: the reservation closures below run later, so a
       // possibly-undefined outer binding would not be narrowed inside them.
-      const activeEntitlements = entitlements;
+      const tokenReservations = {
+        take: async (hold: { meterKey: string; quantity: number; operationId: string }) =>
+          sessions.reserveSpecialistTokens(session.id, runnerId, {
+            ...hold, leaseToken: authority.token,
+            entitlements: await this.#deps.entitlements.forUser(session.ownerUid, new Date(), true),
+            now: new Date(),
+          }),
+        forget: (id: string) => sessions.forgetSpecialistReservation(session.id, authority, id),
+      };
       persists = entitlements.capabilities.boolean('git.persistence');
       const { registry } = await this.#deps.configuration.get();
+      const admission = createCallAdmission({
+        anthropic: this.#deps.anthropic, uid: session.ownerUid, sessionId: session.id,
+        inputMeterKey: registry.inputTokenMeterKey, outputMeterKey: registry.outputTokenMeterKey,
+        metering: this.#deps.metering, reservations: tokenReservations,
+        authorize: async () => {
+          await sessions.assertPersistenceLease(authority);
+          const latest = await this.#deps.entitlements.forUser(session.ownerUid, new Date(), true);
+          assertBuildAllowed(latest, project!.platform, session.model);
+        },
+        onProblem: (error, what) => log.error({ sessionId: session.id, err: error }, what),
+      });
 
-      // Whatever the previous holder of this session left behind. Done before
-      // anything is reserved, so its concurrency slot is free again in time for
-      // this attempt to take one.
-      if (session.sandboxId !== undefined || session.reservationIds.length > 0) {
-        await sandboxes.recover({
-          uid: session.ownerUid,
-          platform: project.platform,
-          externalSandboxId: session.sandboxId,
-          reservationIds: session.reservationIds,
-          now: new Date(),
-          onProblem: (error, what) => {
-            log.warn({ sessionId: session.id, err: error }, `recovery problem: ${what}`);
-          },
+      const abandoned = [...new Set([...session.reservationIds, ...session.specialistReservationIds])];
+      if (session.sandboxId !== undefined || abandoned.length > 0) {
+        await sandboxes.recover({ uid: session.ownerUid, platform: project.platform,
+          externalSandboxId: session.sandboxId, reservationIds: abandoned, now: new Date(),
+          onProblem: (error, what) => log.warn({ sessionId: session.id, err: error }, what),
         });
-        await sessions.detachSandbox(session.id, runnerId);
-      }
-
-      // Specialist holds the previous holder took out and never closed. Found on
-      // the session document rather than in any process's memory, which is the
-      // only place a hold taken by a killed process can still be seen from.
-      if (session.specialistReservationIds.length > 0) {
-        await reconcileSpecialistReservations({
-          uid: session.ownerUid,
-          reservationIds: session.specialistReservationIds,
-          release: (uid, reservationId, when) =>
-            this.#deps.metering.release(uid, reservationId, when),
-          forget: (reservationId) =>
-            sessions.forgetSpecialistReservation(session.id, runnerId, reservationId),
-          onProblem: (error, what) => {
-            log.warn({ sessionId: session.id, err: error }, `recovery problem: ${what}`);
-          },
-          now: new Date(),
-        });
+        for (const id of session.specialistReservationIds) await sessions.forgetSpecialistReservation(session.id, authority, id);
+        await sessions.detachSandbox(session.id, authority);
       }
 
       await publish('session.running', { runnerId, model: session.model, effort: session.effort });
 
       acquired = await sandboxes.acquire({
+        publicPreviewEnabled: project.publicPreviewEnabled === true,
         uid: session.ownerUid,
         entitlements,
         platform: project.platform,
         sessionId: session.id,
         now: new Date(),
+        reservations: tokenReservations,
       });
       // Recorded before the agent touches it: the window that matters is the one
       // where this runner dies with a machine running and holds outstanding.
-      await sessions.attachSandbox(session.id, runnerId, {
+      await sessions.attachSandbox(session.id, authority, {
         sandboxId: acquired.running.externalId,
         reservationIds: acquired.reservations.map((reservation) => reservation.id),
       });
@@ -273,7 +272,31 @@ export class SessionRunner {
         this.#deps.messageHistoryLimit,
       );
 
+      const withValidationSandbox: NonNullable<import('./tools.ts').ToolContext['withValidationSandbox']> = async (run) => {
+        await sessions.assertPersistenceLease(authority);
+        cancellation.signal.throwIfAborted();
+        if (acquired === undefined) throw new Error('The primary sandbox is unavailable.');
+        const copy = await sandboxes.acquire({ uid: session.ownerUid, sessionId: session.id,
+          platform: project!.platform, entitlements: await this.#deps.entitlements.forUser(session.ownerUid, new Date(), true),
+          now: new Date(), reservations: tokenReservations, source: acquired.running });
+        let outcome;
+        let failure: unknown;
+        try { outcome = await run(copy.running); } catch (cause) { failure = cause; }
+        try {
+          await sandboxes.release({ uid: session.ownerUid, acquired: copy, now: new Date(),
+            onStopFailure: (error) => log.error({ err: error, sessionId: session.id }, 'validation disposal failed') });
+          for (const hold of copy.reservations) await tokenReservations.forget(hold.id);
+        } catch (cleanup) {
+          if (failure !== undefined) throw new AggregateError([failure, cleanup], 'Validation and sandbox disposal failed.');
+          throw cleanup;
+        }
+        if (failure !== undefined) throw failure;
+        if (outcome === undefined) throw new Error('Validation returned no result.');
+        return outcome;
+      };
       const run = await runAgentTurn({
+          withValidationSandbox,
+          admission,
         anthropic: this.#deps.anthropic,
         session,
         project,
@@ -325,18 +348,7 @@ export class SessionRunner {
             }),
         },
         signal: cancellation.signal,
-        reservations: {
-          take: (hold) =>
-            sessions.reserveSpecialistTokens(session.id, runnerId, {
-              entitlements: activeEntitlements,
-              meterKey: hold.meterKey,
-              quantity: hold.quantity,
-              operationId: hold.operationId,
-              now: new Date(),
-            }),
-          forget: (reservationId) =>
-            sessions.forgetSpecialistReservation(session.id, runnerId, reservationId),
-        },
+        reservations: tokenReservations,
         onProblem: (error, what) => {
           log.error({ sessionId: session.id, err: error }, what);
         },
@@ -347,7 +359,7 @@ export class SessionRunner {
       // Hot turn chaining: check the queue before releasing the sandbox.
       // If the user enqueued a follow-up while this turn was running, dequeue
       // it and run the next turn in the same live sandbox without cold-booting.
-      let nextQueued = await sessions.dequeueNextMessage(session.id, runnerId);
+      let nextQueued = await sessions.dequeueNextMessage(session.id, authority);
       while (nextQueued !== undefined) {
         await publish('session.queued', { queuedMessageId: nextQueued.id });
         log.info(
@@ -362,6 +374,8 @@ export class SessionRunner {
         );
 
         const chainRun = await runAgentTurn({
+          withValidationSandbox,
+          admission,
           anthropic: this.#deps.anthropic,
           session,
           project,
@@ -409,26 +423,15 @@ export class SessionRunner {
               }),
           },
           signal: cancellation.signal,
-          reservations: {
-            take: (hold) =>
-              sessions.reserveSpecialistTokens(session.id, runnerId, {
-                entitlements: activeEntitlements,
-                meterKey: hold.meterKey,
-                quantity: hold.quantity,
-                operationId: hold.operationId,
-                now: new Date(),
-              }),
-            forget: (reservationId) =>
-              sessions.forgetSpecialistReservation(session.id, runnerId, reservationId),
-          },
-          onProblem: (error, what) => {
+          reservations: tokenReservations,
+        onProblem: (error, what) => {
             log.error({ sessionId: session.id, err: error }, what);
           },
         });
 
         await this.#deliver(session, chainRun, publish);
 
-        nextQueued = await sessions.dequeueNextMessage(session.id, runnerId);
+        nextQueued = await sessions.dequeueNextMessage(session.id, authority);
       }
 
       saveAttempted = true;
@@ -445,7 +448,7 @@ export class SessionRunner {
       await this.#letGo(session, acquired);
       acquired = undefined;
 
-      await sessions.finish(session.id, runnerId, { status: 'IDLE' });
+      await sessions.finish(session.id, authority, { status: 'IDLE' });
       await publish('session.idle', { steps: run.steps, stopReason: run.stopReason });
       log.info({ sessionId: session.id, steps: run.steps }, 'finished a session');
     } catch (error) {
@@ -481,7 +484,7 @@ export class SessionRunner {
       await publish('session.failed', { error: reason });
 
       try {
-        await sessions.finish(session.id, runnerId, { status: 'FAILED', error: reason });
+        await sessions.finish(session.id, authority, { status: 'FAILED', error: reason });
       } catch (cause) {
         // Only reachable when the lease is already gone, in which case another
         // runner owns the session and gets to decide its status.
@@ -517,7 +520,7 @@ export class SessionRunner {
       : run.reply;
 
     if (reply !== '') {
-      await this.#deps.sessions.appendAssistantMessage(session.id, this.#deps.runnerId, reply);
+      await this.#deps.sessions.appendAssistantMessage(session.id, { sessionId: session.id, runnerId: this.#deps.runnerId, token: session.leaseToken }, reply);
     }
     if (blocked) {
       await publish('agent.blocked', {
@@ -607,6 +610,7 @@ export class SessionRunner {
 
   async #letGo(session: ClaimedSession, acquired: AcquiredSandbox): Promise<void> {
     const { sessions, sandboxes, log, runnerId } = this.#deps;
+    const authority = { sessionId: session.id, runnerId, token: session.leaseToken };
     await sandboxes.release({
       uid: session.ownerUid,
       acquired,
@@ -616,7 +620,7 @@ export class SessionRunner {
       },
     });
     try {
-      await sessions.detachSandbox(session.id, runnerId);
+      await sessions.detachSandbox(session.id, authority);
     } catch (error) {
       log.warn({ sessionId: session.id, err: error }, 'could not clear the sandbox record');
     }
@@ -647,10 +651,15 @@ export async function runUntilStopped(
     readonly idlePollSeconds: number;
     readonly shouldContinue: () => boolean;
     readonly log: RunnerLogger;
+    readonly maintenance?: () => Promise<void>;
   },
 ): Promise<void> {
   while (options.shouldContinue()) {
     let didWork = false;
+    if (options.maintenance !== undefined) {
+      try { await options.maintenance(); }
+      catch (error) { options.log.error({ err: error }, 'snapshot cleanup remains pending'); }
+    }
     try {
       didWork = await runner.runOnce();
     } catch (error) {

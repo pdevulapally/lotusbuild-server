@@ -89,6 +89,8 @@ class FakePublisher implements SnapshotPublisher {
     }
   }
 
+  async reserveSnapshotUpload(): Promise<void> {}
+
   async publishSnapshot(
     authority: SessionLease,
     _entitlements: UserEntitlements,
@@ -117,7 +119,8 @@ class FakeSnapshotStorage implements SnapshotStorage {
     throw missingSnapshotError(projectId, snapshot);
   }
 
-  async createUpload(_projectId: string, _leaseToken: string): Promise<SnapshotUpload> {
+  async createUpload(_projectId: string, _leaseToken: string, _bytes: number, beforeSign: (name: string, expires: Date) => Promise<void>): Promise<SnapshotUpload> {
+    await beforeSign(this.uploaded.objectName, new Date(Date.now() + 60000));
     this.createCalls += 1;
     return { objectName: this.uploaded.objectName, url: 'https://storage.invalid/upload' };
   }
@@ -148,7 +151,7 @@ class FakeSandbox implements RunningSandbox {
       assert.match(command, /x-goog-if-generation-match: 0/);
       this.#onUpload();
     }
-    return { exitCode: 0, stdout: 'committed=yes\n', stderr: '' };
+    return { exitCode: 0, stdout: command.includes('stat -c') ? '321\n' : 'committed=yes\n', stderr: '' };
   }
 
   async writeFile(_path: string, _content: string): Promise<void> {}
@@ -197,7 +200,7 @@ test('current lease owner publishes immutable snapshot and accounting', async ()
   assert.equal(publisher.accountedBytes, snapshots.uploaded.bytes);
   assert.equal(snapshots.createCalls, 1);
   assert.equal(snapshots.inspectCalls, 1);
-  assert.deepEqual(snapshots.removed, { kind: 'none' });
+  assert.equal(snapshots.removed, undefined);
 });
 
 test('runner replaced before persistence cannot begin a save', async () => {

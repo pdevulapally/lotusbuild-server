@@ -24,12 +24,14 @@ export function parseStreamId(value: unknown): string | undefined {
  * already seen, or drop ones it has not.
  */
 export function compareStreamIds(left: string, right: string): number {
-  const [leftMs = 0, leftSeq = 0] = left.split('-').map(Number);
-  const [rightMs = 0, rightSeq = 0] = right.split('-').map(Number);
-  return leftMs === rightMs ? leftSeq - rightSeq : leftMs - rightMs;
+  const [leftMs = 0n, leftSeq = 0n] = left.split('-').map(BigInt);
+  const [rightMs = 0n, rightSeq = 0n] = right.split('-').map(BigInt);
+  const difference = leftMs === rightMs ? leftSeq - rightSeq : leftMs - rightMs;
+  return difference < 0n ? -1 : difference > 0n ? 1 : 0;
 }
 
 export interface SessionEventsOptions {
+  readonly maxEventBytes: number;
   /** How long after its last event a session's log is dropped from Redis. */
   readonly retentionSeconds: number;
   /** Ceiling on events held per session, so one runaway build cannot fill RAM. */
@@ -58,10 +60,13 @@ export class SessionEvents {
   readonly #subscriber: Redis;
   readonly #retentionSeconds: number;
   readonly #maxPerSession: number;
+  readonly #maxEventBytes: number;
   readonly #onListenerError: SessionEventsOptions['onListenerError'];
   readonly #listeners = new Map<string, Set<SessionEventListener>>();
 
   constructor(redis: Redis, subscriber: Redis, options: SessionEventsOptions) {
+    if (!Number.isSafeInteger(options.maxEventBytes) || options.maxEventBytes <= 0) throw new Error('Invalid event byte budget.');
+    this.#maxEventBytes = options.maxEventBytes;
     if (!Number.isSafeInteger(options.retentionSeconds) || options.retentionSeconds <= 0) {
       throw new Error(`Event retention must be a positive number of seconds.`);
     }
@@ -93,6 +98,8 @@ export class SessionEvents {
     data: Readonly<Record<string, unknown>>,
   ): Promise<SessionEvent> {
     const key = this.#key(sessionId);
+    const serialized = JSON.stringify(data);
+    if (Buffer.byteLength(serialized) + Buffer.byteLength(type) + 100 > this.#maxEventBytes) throw new Error('Event exceeds the configured byte budget; its authoritative data remains in Firestore.');
     const id = await this.#redis.xadd(
       key,
       'MAXLEN',
@@ -102,7 +109,7 @@ export class SessionEvents {
       'type',
       type,
       'data',
-      JSON.stringify(data),
+      serialized,
     );
     if (id === null) {
       throw new Error(`Redis refused to append a "${type}" event to session ${sessionId}.`);
@@ -133,20 +140,34 @@ export class SessionEvents {
       this.#maxPerSession,
     );
 
-    return entries.map(([id, fields]) => {
-      const values = new Map<string, string>();
-      for (let index = 0; index + 1 < fields.length; index += 2) {
-        values.set(fields[index] as string, fields[index + 1] as string);
-      }
-      const type = values.get('type');
-      const data = values.get('data');
-      if (type === undefined || data === undefined) {
-        // We are the only writer of this stream, so a malformed entry is our own
-        // bug and hiding it would make the next one harder to find.
-        throw new Error(`Session event ${id} is missing its type or data.`);
-      }
-      return { id, type, data: JSON.parse(data) as Record<string, unknown> };
-    });
+    return entries.map(([id, fields]) => this.#parseEntry(id, fields));
+  }
+
+  #parseEntry(id: string, fields: string[]): SessionEvent {
+    if (!parseStreamId(id) || fields.length % 2 !== 0 || fields.reduce((sum, part) => sum + Buffer.byteLength(part), 0) > this.#maxEventBytes) throw new Error('Invalid or oversized stored event.');
+    const values = new Map<string, string>();
+    for (let index = 0; index < fields.length; index += 2) values.set(fields[index]!, fields[index + 1]!);
+    const type = values.get('type');
+    const serialized = values.get('data');
+    if (type === undefined || serialized === undefined) throw new Error('Malformed session event.');
+    const data: unknown = JSON.parse(serialized);
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) throw new Error('Invalid event data.');
+    return { id, type, data: data as Record<string, unknown> };
+  }
+
+  /** Replay one bounded event at a time instead of allocating an entire session's history per socket. */
+  async *replay(sessionId: string, afterId: string | undefined): AsyncGenerator<SessionEvent> {
+    let cursor = afterId;
+    for (let count = 0; count < this.#maxPerSession; count++) {
+      const entries = await this.#redis.xrange(this.#key(sessionId), cursor === undefined ? '-' : `(${cursor}`, '+', 'COUNT', 1);
+      const entry = entries[0];
+      if (entry === undefined) return;
+      const [id, fields] = entry;
+      yield this.#parseEntry(id, fields);
+      cursor = id;
+    }
+    const remaining = await this.#redis.xrange(this.#key(sessionId), `(${cursor}`, '+', 'COUNT', 1);
+    if (remaining.length) throw new Error('Replay page exhausted; reconnect using the last received event ID.');
   }
 
   /**
@@ -182,7 +203,7 @@ export class SessionEvents {
       current.delete(listener);
       if (current.size === 0) {
         this.#listeners.delete(key);
-        void this.#subscriber.unsubscribe(key);
+        void this.#subscriber.unsubscribe(key).catch((cause: unknown) => this.#onListenerError(cause instanceof Error ? cause : new Error(String(cause)), sessionId));
       }
     };
   }
@@ -196,7 +217,9 @@ export class SessionEvents {
 
     let event: SessionEvent;
     try {
+      if (Buffer.byteLength(payload) > this.#maxEventBytes) throw new Error('Oversized live event.');
       event = JSON.parse(payload) as SessionEvent;
+      if (!parseStreamId(event.id) || typeof event.type !== 'string' || event.data === null || typeof event.data !== 'object' || Array.isArray(event.data)) throw new Error('Invalid live event.');
     } catch (cause) {
       this.#onListenerError(
         new Error(`Session ${sessionId} published an unparseable event.`, { cause }),

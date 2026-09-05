@@ -49,6 +49,19 @@ test('INTERSECTION keeps only what every source allows', () => {
   assert.deepEqual([...(resolved.value as readonly string[])].sort(), ['haiku', 'sonnet']);
 });
 
+test('disjoint restrictions fail rather than becoming the unrestricted sentinel', () => {
+  assert.throws(() => resolveCapability(capability('INTERSECTION', 'stringList'), [
+    from('plan', 0, list(['model-a'])), from('restriction', 1, list(['model-b'])),
+  ]), /no permitted value/);
+});
+
+test('an explicitly unrestricted source preserves the other restriction', () => {
+  for (const lists of [[[], ['model-a']], [['model-a'], []]]) {
+    const contributions = lists.map((items, i) => from(String(i), i, list(items)));
+    assert.deepEqual(resolveCapability(capability('INTERSECTION', 'stringList'), contributions).value, ['model-a']);
+  }
+});
+
 test('sources sharing a precedence are refused', () => {
   // Equal precedence makes the winner depend on arrival order, which is a
   // silent and irreproducible authorisation result.

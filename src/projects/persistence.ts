@@ -1,4 +1,5 @@
 import type { SandboxProvider } from '../entitlements/schema.ts';
+import { randomUUID } from 'node:crypto';
 import type { UserEntitlements } from '../entitlements/service.ts';
 import { AppError } from '../http/errors.ts';
 import type { RunningSandbox } from '../sandboxes/provider.ts';
@@ -41,10 +42,13 @@ export interface GitIdentity {
 
 export interface SnapshotPublisher {
   assertPersistenceLease(authority: SessionLease): Promise<void>;
+  reserveSnapshotUpload(authority: SessionLease, entitlements: UserEntitlements,
+    input: { id: string; objectName: string; bytes: number; expiresAt: Date }): Promise<void>;
   publishSnapshot(
     authority: SessionLease,
     entitlements: UserEntitlements,
     snapshot: UploadedSnapshot,
+    uploadId: string,
   ): Promise<{ readonly projectId: string; readonly previous: StoredSnapshot }>;
 }
 
@@ -214,7 +218,13 @@ export class ProjectPersistence {
     );
 
     const committed = stdout.includes('committed=yes');
-    const upload = await this.#snapshots.createUpload(input.project.id, input.authority.token);
+    const size = (await this.#run(input.sandbox, input.provider, `set -eu\nstat -c %s ${archivePath}\n`)).trim();
+    if (!/^[1-9]\d*$/.test(size) || !Number.isSafeInteger(Number(size))) throw new Error('Snapshot archive size is invalid.');
+    const bytes = Number(size);
+    const uploadId = `${input.authority.token}-${randomUUID()}`;
+    const upload = await this.#snapshots.createUpload(input.project.id, uploadId, bytes, async (objectName, expiresAt) => {
+      await this.#publisher.reserveSnapshotUpload(input.authority, input.entitlements, { id: uploadId, objectName, bytes, expiresAt });
+    });
     await input.sandbox.writeFile(urlPath, upload.url);
     await this.#run(
       input.sandbox,
@@ -223,10 +233,11 @@ export class ProjectPersistence {
         'set -eu',
         `url=$(cat ${urlPath})`,
         `rm -f ${urlPath}`,
-        `curl -sf -X PUT -H "Content-Type: ${snapshotContentType}" -H "x-goog-if-generation-match: 0" --upload-file ${archivePath} "$url"`,
+        `curl -sf -X PUT -H "Content-Type: ${snapshotContentType}" -H "x-goog-if-generation-match: 0" -H "Content-Length: $LOTUSBUILD_UPLOAD_BYTES" --upload-file ${archivePath} "$url"`,
         `rm -f ${archivePath}`,
         '',
       ].join('\n'),
+      { LOTUSBUILD_UPLOAD_BYTES: String(bytes) },
     );
 
     // Size and generation come from trusted Storage metadata, not sandbox
@@ -237,18 +248,14 @@ export class ProjectPersistence {
       input.authority,
       input.entitlements,
       uploaded,
+      uploadId,
     );
     // Everything above this line decides whether the save happens; everything
     // below it has already happened. Deleting what the publish superseded is
     // garbage collection against durable state, so its failure is carried back
     // as a fact about the storage rather than thrown as a fact about the save.
-    let cleanupFailure: SaveOutcome['cleanupFailure'];
-    try {
-      await this.#snapshots.removeStored(published.projectId, published.previous);
-    } catch (cause) {
-      cleanupFailure = { superseded: published.previous, cause };
-    }
-
-    return { bytes: uploaded.bytes, committed, cleanupFailure };
+    // The durable upload ledger collects superseded objects after their write
+    // credentials expire. Their bytes remain charged until deletion succeeds.
+    return { bytes: uploaded.bytes, committed, cleanupFailure: undefined };
   }
 }

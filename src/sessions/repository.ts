@@ -8,6 +8,7 @@ import {
 } from 'firebase-admin/firestore';
 
 import type { EntitlementService, UserEntitlements } from '../entitlements/service.ts';
+import { assertBuildAllowed } from '../entitlements/build-admission.ts';
 import type { ConfigurationStore } from '../entitlements/store.ts';
 import { AppError } from '../http/errors.ts';
 import type { MeteringService, Reservation } from '../metering/service.ts';
@@ -254,45 +255,12 @@ export class SessionRepository {
    * creation: a plan can be downgraded, and a mobile project created on pro must
    * not keep building after the subscription lapses.
    */
-  async create(uid: string, projectId: string, input: NewSession): Promise<BuildSession> {
+  async create(uid: string, projectId: string, input: NewSession, idempotencyId?: string): Promise<BuildSession> {
+    if (idempotencyId !== undefined && !/^[A-Za-z0-9_-]{1,128}$/.test(idempotencyId)) throw new Error('Invalid internal session id.');
     const project = await this.#projects.readOwned(uid, projectId);
     const entitlements = await this.#entitlements.forUser(uid);
 
-    if (!entitlements.capabilities.boolean('ai.run')) {
-      throw new AppError({
-        code: 'session/ai-not-permitted',
-        statusCode: 403,
-        message: `The ${entitlements.planName} plan cannot run builds.`,
-        details: { plan: entitlements.planKey },
-      });
-    }
-
-    const platformCapability = `platform.${project.platform}`;
-    if (!entitlements.capabilities.boolean(platformCapability)) {
-      throw new AppError({
-        code: 'session/platform-not-permitted',
-        statusCode: 403,
-        message: `The ${entitlements.planName} plan cannot build ${project.platform} projects.`,
-        details: { platform: project.platform, plan: entitlements.planKey },
-      });
-    }
-
-    // The model arrives from the client and is checked against the plan's
-    // allowlist. It is required rather than defaulted: picking a model on the
-    // user's behalf decides what their build costs, and the allowlist is already
-    // published to them through /me.
-    if (!entitlements.capabilities.allows('ai.model.allowlist', input.model)) {
-      throw new AppError({
-        code: 'session/model-not-permitted',
-        statusCode: 403,
-        message: `The ${entitlements.planName} plan cannot use the model "${input.model}".`,
-        details: {
-          model: input.model,
-          permitted: entitlements.capabilities.stringList('ai.model.allowlist'),
-          plan: entitlements.planKey,
-        },
-      });
-    }
+    assertBuildAllowed(entitlements, project.platform, input.model);
 
     // Effort comes from the plan, never the request: it is what the customer is
     // paying for, so it is not theirs to raise.
@@ -300,10 +268,19 @@ export class SessionRepository {
     const { registry } = await this.#configuration.get();
 
     const now = new Date();
-    const ref = this.#firestore.collection(sessionsCollectionPath).doc();
+    const collection = this.#firestore.collection(sessionsCollectionPath);
+    const ref = idempotencyId === undefined ? collection.doc() : collection.doc(idempotencyId);
     const firstMessage = ref.collection(messagesCollectionName).doc(messageId(0));
 
-    await this.#firestore.runTransaction(async (transaction) => {
+    const existing = await this.#firestore.runTransaction(async (transaction) => {
+      if (idempotencyId !== undefined) {
+        const prior = await transaction.get(ref);
+        if (prior.exists) {
+          const parsed = parseSession(prior.id, prior.data() ?? {}, ref.path);
+          if (parsed.ownerUid !== uid || parsed.projectId !== projectId) throw new Error('Idempotent session scope disagrees.');
+          return parsed;
+        }
+      }
       const currentProject = await this.#projects.readOwnedInTransaction(transaction, uid, project.id);
       this.#assertProjectCanActivate(currentProject);
 
@@ -337,6 +314,8 @@ export class SessionRepository {
         updatedAt: FieldValue.serverTimestamp(),
       });
     });
+
+    if (existing !== undefined) return existing;
 
     return {
       id: ref.id,
@@ -375,6 +354,7 @@ export class SessionRepository {
     if (session.ownerUid !== ownerUid) {
       throw missing;
     }
+    await this.#projects.readOwned(ownerUid, session.projectId);
     return session;
   }
 
@@ -468,6 +448,7 @@ export class SessionRepository {
         current.projectId,
       );
       this.#assertProjectCanActivate(project, current.id);
+      assertBuildAllowed(entitlements, project.platform, current.model);
 
       // A follow-up turn is another build, and is charged as one.
       await this.#metering.consumeIn(transaction, {
@@ -504,36 +485,51 @@ export class SessionRepository {
    * Staging a prompt in the session queue while a turn is active.
    */
   async enqueueMessage(uid: string, sessionId: string, prompt: string): Promise<QueuedMessage> {
-    const session = await this.readOwned(uid, sessionId);
-    const ref = this.#ref(session.id).collection(queuedMessagesCollectionName).doc();
-    const now = new Date();
-
-    await ref.create({
-      prompt,
-      createdAt: FieldValue.serverTimestamp(),
+    const entitlements = await this.#entitlements.forUser(uid);
+    const limit = await this.#queueLimit(entitlements);
+    const parent = this.#ref(sessionId);
+    const ref = parent.collection(queuedMessagesCollectionName).doc();
+    await this.#firestore.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(parent);
+      if (!snapshot.exists || snapshot.data()?.['ownerUid'] !== uid) {
+        throw new AppError({ code: 'session/not-found', statusCode: 404, message: 'No such session.' });
+      }
+      const session = parseSession(snapshot.id, snapshot.data() ?? {}, parent.path);
+      const project = await this.#projects.readOwnedInTransaction(transaction, uid, session.projectId);
+      this.#assertProjectGuard(project, session);
+      assertBuildAllowed(entitlements, project.platform, session.model);
+      const queued = await transaction.get(parent.collection(queuedMessagesCollectionName).limit(limit + 1));
+      if (queued.size >= limit) {
+        throw new AppError({ code: 'session/queue-full', statusCode: 429, message: 'The session message queue is full.' });
+      }
+      transaction.create(ref, { prompt, createdAt: FieldValue.serverTimestamp() });
+      // Enqueue and deletion/dequeue share this parent conflict boundary.
+      transaction.update(parent, { updatedAt: FieldValue.serverTimestamp() });
     });
-
-    return {
-      id: ref.id,
-      sessionId: session.id,
-      prompt,
-      createdAt: now,
-    };
+    return { id: ref.id, sessionId, prompt, createdAt: new Date() };
   }
 
-  /**
-   * Lists all queued messages for a session in order of creation.
-   */
-  async listQueuedMessages(uid: string, sessionId: string): Promise<readonly QueuedMessage[]> {
-    const session = await this.readOwned(uid, sessionId);
-    const snapshot = await this.#ref(session.id)
-      .collection(queuedMessagesCollectionName)
-      .orderBy('createdAt', 'asc')
-      .get();
+  // There is no reason to stage more builds than the plan permits in a whole
+  // billing window. Reuse that configured bound rather than invent a new plan rule.
+  async #queueLimit(entitlements: UserEntitlements): Promise<number> {
+    const { registry } = await this.#configuration.get();
+    const limit = entitlements.meterLimits.get(registry.buildMeterKey);
+    if (limit === undefined) throw new Error('The build meter limit is missing.');
+    return limit.hardLimit;
+  }
 
-    return snapshot.docs.map((doc) =>
-      parseQueuedMessage(doc.id, session.id, doc.data(), doc.ref.path),
-    );
+  async listQueuedMessages(uid: string, sessionId: string, limit = 100, after?: string): Promise<readonly QueuedMessage[]> {
+    const session = await this.readOwned(uid, sessionId);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new Error('Invalid queue page size.');
+    let query = this.#ref(session.id).collection(queuedMessagesCollectionName)
+      .orderBy('createdAt', 'asc').orderBy(FieldPath.documentId(), 'asc');
+    if (after !== undefined) {
+      const cursor = await this.#ref(session.id).collection(queuedMessagesCollectionName).doc(after).get();
+      if (!cursor.exists) throw new AppError({ code: 'session/cursor-missing', statusCode: 400, message: 'Queue cursor no longer exists; restart pagination.' });
+      query = query.startAfter(cursor);
+    }
+    const snapshot = await query.limit(limit).get();
+    return snapshot.docs.map((doc) => parseQueuedMessage(doc.id, session.id, doc.data(), doc.ref.path));
   }
 
   /**
@@ -561,26 +557,20 @@ export class SessionRepository {
    * Dequeues the next message in the queue under the runner's lease,
    * charges the build quota, and appends it to the messages collection.
    */
-  async dequeueNextMessage(sessionId: string, runnerId: string): Promise<QueuedMessage | undefined> {
+  async dequeueNextMessage(sessionId: string, authority: SessionLease): Promise<QueuedMessage | undefined> {
     const ref = this.#ref(sessionId);
-    const queuedSnapshot = await ref
-      .collection(queuedMessagesCollectionName)
-      .orderBy('createdAt', 'asc')
-      .limit(1)
-      .get();
-
-    const nextDoc = queuedSnapshot.docs[0];
-    if (nextDoc === undefined) {
-      return undefined;
-    }
-
-    const nextData = parseQueuedMessage(nextDoc.id, sessionId, nextDoc.data(), nextDoc.ref.path);
     const now = new Date();
-
-    await this.#firestore.runTransaction(async (transaction) => {
-      const session = await this.#requireLease(transaction, ref, runnerId);
+    return this.#firestore.runTransaction(async (transaction) => {
+      const session = await this.#requireLease(transaction, ref, authority);
+      const queuedSnapshot = await transaction.get(ref.collection(queuedMessagesCollectionName)
+        .orderBy('createdAt', 'asc').limit(1));
+      const nextDoc = queuedSnapshot.docs[0];
+      if (nextDoc === undefined) return undefined;
+      const nextData = parseQueuedMessage(nextDoc.id, sessionId, nextDoc.data(), nextDoc.ref.path);
       const entitlements = await this.#entitlements.forUser(session.ownerUid);
       const { registry } = await this.#configuration.get();
+      const project = await this.#projects.readOwnedInTransaction(transaction, session.ownerUid, session.projectId);
+      assertBuildAllowed(entitlements, project.platform, session.model);
 
       // Deduct build meter for this turn
       await this.#metering.consumeIn(transaction, {
@@ -602,18 +592,17 @@ export class SessionRepository {
         messageCount: FieldValue.increment(1),
         updatedAt: FieldValue.serverTimestamp(),
       });
+      return nextData;
     });
-
-    return nextData;
   }
 
   /**
    * Appends a mid-turn steering message directly into the conversation transcript under the runner's lease.
    */
-  async appendSteerMessage(sessionId: string, runnerId: string, prompt: string): Promise<void> {
+  async appendSteerMessage(sessionId: string, authority: SessionLease, prompt: string): Promise<void> {
     const ref = this.#ref(sessionId);
     await this.#firestore.runTransaction(async (transaction) => {
-      const session = await this.#requireLease(transaction, ref, runnerId);
+      const session = await this.#requireLease(transaction, ref, authority);
       const seq = session.messageCount;
       transaction.create(ref.collection(messagesCollectionName).doc(messageId(seq)), {
         role: 'user',
@@ -675,6 +664,7 @@ export class SessionRepository {
         transaction,
         uid,
         current.projectId,
+        true,
       );
       this.#assertProjectGuard(project, current);
 
@@ -684,6 +674,7 @@ export class SessionRepository {
           entitlements,
           meterKey: registry.buildMeterKey,
           quantity: 1,
+          chargedAt: timestampField(snapshot.data() ?? {}, 'claimableAt', ref.path),
           now,
         });
 
@@ -782,6 +773,7 @@ export class SessionRepository {
         transaction,
         session.ownerUid,
         session.projectId,
+        session.status === 'RUNNING',
       );
       this.#assertProjectGuard(project, session);
       transaction.update(ref, {
@@ -812,10 +804,29 @@ export class SessionRepository {
     });
   }
 
+  async reserveSnapshotUpload(authority: SessionLease, entitlements: UserEntitlements,
+    input: { id: string; objectName: string; bytes: number; expiresAt: Date }): Promise<void> {
+    const { registry } = await this.#configuration.get();
+    await this.#firestore.runTransaction(async (transaction) => {
+      const { session, project } = await this.#requirePersistenceLease(transaction, this.#ref(authority.sessionId), authority);
+      if (input.objectName !== `projects/${project.id}/snapshots/${input.id}.tar.gz` || input.expiresAt.getTime() <= Date.now()) {
+        throw new Error('Invalid snapshot upload admission.');
+      }
+      const reservation = await this.#metering.reserveIn(transaction, { uid: session.ownerUid, entitlements,
+        meterKey: registry.storageMeterKey, quantity: input.bytes, operationId: `snapshot:${input.id}`, now: new Date() });
+      transaction.create(this.#firestore.doc(`snapshotUploads/${input.id}`), {
+        ownerUid: session.ownerUid, projectId: project.id, leaseToken: authority.token,
+        objectName: input.objectName, bytes: input.bytes, expiresAt: Timestamp.fromDate(input.expiresAt),
+        status: 'CANDIDATE', reservationId: reservation.id, createdAt: FieldValue.serverTimestamp(),
+      });
+    });
+  }
+
   async publishSnapshot(
     authority: SessionLease,
     entitlements: UserEntitlements,
     snapshot: UploadedSnapshot,
+    uploadId: string,
   ): Promise<{ readonly projectId: string; readonly previous: StoredSnapshot }> {
     const { registry } = await this.#configuration.get();
     const ref = this.#ref(authority.sessionId);
@@ -826,18 +837,31 @@ export class SessionRepository {
         ref,
         authority,
       );
-      await this.#metering.setGaugeIn(transaction, {
-        uid: session.ownerUid,
-        entitlements,
-        meterKey: registry.storageMeterKey,
-        previousQuantity: project.snapshotBytes,
-        quantity: snapshot.bytes,
-        now: new Date(),
-      });
+      const uploadRef = this.#firestore.doc(`snapshotUploads/${uploadId}`);
+      const upload = await transaction.get(uploadRef);
+      const fields = upload.data() ?? {};
+      if (fields['status'] !== 'CANDIDATE' || fields['leaseToken'] !== authority.token
+        || fields['objectName'] !== snapshot.objectName || fields['bytes'] !== snapshot.bytes
+        || timestampField(fields, 'expiresAt', uploadRef.path).getTime() <= Date.now()) {
+        throw new Error('Snapshot does not match its live upload admission.');
+      }
+      await this.#metering.commitStorageIn(transaction, session.ownerUid,
+        stringField(fields, 'reservationId', uploadRef.path), snapshot.bytes);
+      transaction.update(uploadRef, { status: 'CURRENT', generation: snapshot.generation });
+      if (project.snapshotUploadId !== undefined) {
+        transaction.update(this.#firestore.doc(`snapshotUploads/${project.snapshotUploadId}`), { status: 'OBSOLETE' });
+      } else if (project.snapshot.kind !== 'none') {
+        transaction.create(this.#firestore.collection('snapshotUploads').doc(), {
+          ownerUid: session.ownerUid, projectId: project.id, bytes: project.snapshotBytes,
+          status: 'OBSOLETE', expiresAt: Timestamp.fromMillis(0), legacy: project.snapshot.kind === 'legacy',
+          ...(project.snapshot.kind === 'immutable' ? { objectName: project.snapshot.objectName, generation: project.snapshot.generation } : {}),
+        });
+      }
       transaction.update(this.#projects.refFor(project.id), {
         snapshotBytes: snapshot.bytes,
         snapshotObjectName: snapshot.objectName,
         snapshotObjectGeneration: snapshot.generation,
+        snapshotUploadId: uploadId,
         snapshotUpdatedAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });
@@ -850,8 +874,8 @@ export class SessionRepository {
    * whose session was taken while it was busy must stop, or two runners write
    * the same transcript.
    */
-  async heartbeat(sessionId: string, runnerId: string, now: Date = new Date()): Promise<void> {
-    await this.#withLease(sessionId, runnerId, (transaction, ref) => {
+  async heartbeat(sessionId: string, authority: SessionLease, now: Date = new Date()): Promise<void> {
+    await this.#withLease(sessionId, authority, (transaction, ref) => {
       transaction.update(ref, {
         heartbeatAt: Timestamp.fromDate(now),
         claimableAt: this.#leaseExpiry(now),
@@ -869,10 +893,10 @@ export class SessionRepository {
    */
   async attachSandbox(
     sessionId: string,
-    runnerId: string,
+    authority: SessionLease,
     held: { readonly sandboxId: string; readonly reservationIds: readonly string[] },
   ): Promise<void> {
-    await this.#withLease(sessionId, runnerId, (transaction, ref) => {
+    await this.#withLease(sessionId, authority, (transaction, ref) => {
       transaction.update(ref, {
         sandboxId: held.sandboxId,
         reservationIds: [...held.reservationIds],
@@ -891,12 +915,12 @@ export class SessionRepository {
    */
   async appendAssistantMessage(
     sessionId: string,
-    runnerId: string,
+    authority: SessionLease,
     content: string,
   ): Promise<void> {
     const ref = this.#ref(sessionId);
     await this.#firestore.runTransaction(async (transaction) => {
-      const session = await this.#requireLease(transaction, ref, runnerId);
+      const session = await this.#requireLease(transaction, ref, authority);
       transaction.create(
         ref.collection(messagesCollectionName).doc(messageId(session.messageCount)),
         { role: 'assistant', content, createdAt: FieldValue.serverTimestamp() },
@@ -924,6 +948,7 @@ export class SessionRepository {
     sessionId: string,
     runnerId: string,
     input: {
+      readonly leaseToken: string;
       readonly entitlements: UserEntitlements;
       readonly meterKey: string;
       readonly quantity: number;
@@ -936,7 +961,9 @@ export class SessionRepository {
       // Reads first, and all of them: the lease and project guard, then the
       // usage document inside reserveIn. Firestore forbids reading after
       // writing, so nothing may be written before this point.
-      const { session } = await this.#requireLeaseState(transaction, ref, runnerId);
+      const { session, project } = await this.#requirePersistenceLease(transaction, ref,
+        { sessionId, runnerId, token: input.leaseToken });
+      assertBuildAllowed(input.entitlements, project.platform, session.model);
       const reservation = await this.#metering.reserveIn(transaction, {
         uid: session.ownerUid,
         entitlements: input.entitlements,
@@ -961,12 +988,12 @@ export class SessionRepository {
    */
   async forgetSpecialistReservation(
     sessionId: string,
-    runnerId: string,
+    authority: SessionLease,
     reservationId: string,
   ): Promise<void> {
     await this.#withLease(
       sessionId,
-      runnerId,
+      authority,
       (transaction, ref) => {
         transaction.update(ref, {
           specialistReservationIds: FieldValue.arrayRemove(reservationId),
@@ -978,8 +1005,8 @@ export class SessionRepository {
   }
 
   /** Forgets the sandbox and holds once they have actually been given back. */
-  async detachSandbox(sessionId: string, runnerId: string): Promise<void> {
-    await this.#withLease(sessionId, runnerId, (transaction, ref) => {
+  async detachSandbox(sessionId: string, authority: SessionLease): Promise<void> {
+    await this.#withLease(sessionId, authority, (transaction, ref) => {
       transaction.update(ref, {
         sandboxId: FieldValue.delete(),
         reservationIds: FieldValue.delete(),
@@ -995,13 +1022,13 @@ export class SessionRepository {
   */
   async finish(
     sessionId: string,
-    runnerId: string,
+    authority: SessionLease,
     outcome: SessionOutcome,
     now: Date = new Date(),
   ): Promise<void> {
     const ref = this.#ref(sessionId);
     await this.#firestore.runTransaction(async (transaction) => {
-      const { session } = await this.#requireLeaseState(transaction, ref, runnerId, true);
+      const { session } = await this.#requireLeaseState(transaction, ref, authority, true);
       if (session.cancelRequested === true && outcome.status === 'IDLE') {
         throw new AppError({
           code: 'session/cancelled',
@@ -1050,16 +1077,16 @@ export class SessionRepository {
   async #requireLease(
     transaction: Transaction,
     ref: DocumentReference,
-    runnerId: string,
+    authority: SessionLease,
     allowCancelled = false,
   ): Promise<BuildSession> {
-    return (await this.#requireLeaseState(transaction, ref, runnerId, allowCancelled)).session;
+    return (await this.#requireLeaseState(transaction, ref, authority, allowCancelled)).session;
   }
 
   async #requireLeaseState(
     transaction: Transaction,
     ref: DocumentReference,
-    runnerId: string,
+    authority: SessionLease,
     allowCancelled = false,
   ): Promise<{ readonly session: BuildSession; readonly project: Project }> {
     const snapshot = await transaction.get(ref);
@@ -1079,11 +1106,14 @@ export class SessionRepository {
         details: { sessionId: session.id },
       });
     }
-    if (session.status !== 'RUNNING' || session.claimedBy !== runnerId) {
+    const expiresAt = optionalTimestampField(snapshot.data() ?? {}, 'claimableAt', ref.path);
+    if (session.id !== authority.sessionId || session.status !== 'RUNNING' ||
+        session.claimedBy !== authority.runnerId || session.leaseToken !== authority.token ||
+        expiresAt === undefined || expiresAt.getTime() <= Date.now()) {
       throw new AppError({
         code: 'session/lease-lost',
         statusCode: 409,
-        message: `This session is ${session.status} and is not held by ${runnerId}.`,
+        message: `This session is ${session.status} and is not held by ${authority.runnerId}.`,
         details: { status: session.status, claimedBy: session.claimedBy },
       });
     }
@@ -1091,6 +1121,7 @@ export class SessionRepository {
       transaction,
       session.ownerUid,
       session.projectId,
+      allowCancelled,
     );
     this.#assertProjectGuard(project, session);
     return { session, project };
@@ -1101,7 +1132,7 @@ export class SessionRepository {
     ref: DocumentReference,
     authority: SessionLease,
   ): Promise<{ readonly session: BuildSession; readonly project: Project }> {
-    const state = await this.#requireLeaseState(transaction, ref, authority.runnerId);
+    const state = await this.#requireLeaseState(transaction, ref, authority);
     const { session } = state;
     if (session.leaseToken !== authority.token) {
       throw new AppError({
@@ -1116,13 +1147,13 @@ export class SessionRepository {
 
   async #withLease(
     sessionId: string,
-    runnerId: string,
+    authority: SessionLease,
     write: (transaction: Transaction, ref: DocumentReference, session: BuildSession) => void,
     allowCancelled = false,
   ): Promise<void> {
     const ref = this.#ref(sessionId);
     await this.#firestore.runTransaction(async (transaction) => {
-      const session = await this.#requireLease(transaction, ref, runnerId, allowCancelled);
+      const session = await this.#requireLease(transaction, ref, authority, allowCancelled);
       write(transaction, ref, session);
     });
   }

@@ -52,6 +52,14 @@ function body(
 export function registerErrorHandler(app: FastifyInstance): void {
   app.setErrorHandler((error: FastifyError | AppError, request: FastifyRequest, reply: FastifyReply) => {
     if (error instanceof AppError) {
+      if (error.statusCode >= 500) {
+        // Internal configuration values and provider diagnostics are not public
+        // domain errors. Keep a stable code for support without echoing data.
+        request.log.error({ code: error.code, requestId: request.id }, 'internal request failure');
+        return reply.code(error.statusCode).send(
+          body(error.code, 'The request could not be completed. Contact support with this request ID.', request.id),
+        );
+      }
       request.log.info(
         { code: error.code, statusCode: error.statusCode },
         'request rejected',

@@ -18,6 +18,7 @@ import { SandboxService } from '../sandboxes/service.ts';
 import { SessionEvents } from '../sessions/events.ts';
 import { SessionRepository } from '../sessions/repository.ts';
 import { SnapshotStore } from '../storage/snapshots.ts';
+import { SnapshotMaintenance } from '../storage/maintenance.ts';
 import { UserRepository } from '../users/repository.ts';
 import { SessionRunner, runUntilStopped } from './loop.ts';
 
@@ -81,7 +82,7 @@ async function main(): Promise<void> {
   // what this deployment is able to start. A platform pointing at something
   // absent fails loudly when a build asks for it, never silently elsewhere.
   const adapters = new Map<string, SandboxAdapter>([
-    ['e2b', new E2BAdapter(config.E2B_API_KEY, config.E2B_DOMAIN, config.E2B_VALIDATE_API_KEY)],
+    ['e2b', new E2BAdapter(config.E2B_API_KEY, config.E2B_DOMAIN, config.E2B_VALIDATE_API_KEY, config.AGENT_TOOL_OUTPUT_MAX_CHARS * 4)],
   ]);
 
   const snapshots = new SnapshotStore(
@@ -112,6 +113,7 @@ async function main(): Promise<void> {
       config.AGENT_COMMAND_TIMEOUT_SECONDS * 1000,
     ),
     events: new SessionEvents(redis, subscriber, {
+      maxEventBytes: config.SESSION_EVENT_MAX_BYTES,
       retentionSeconds: config.SESSION_EVENT_RETENTION_SECONDS,
       maxPerSession: config.SESSION_EVENT_MAX_PER_SESSION,
       onListenerError: (error, sessionId) => {
@@ -147,6 +149,7 @@ async function main(): Promise<void> {
 
   log.info({ runnerId }, 'runner started');
   await runUntilStopped(runner, {
+    maintenance: () => new SnapshotMaintenance(firebase.firestore, metering, snapshots).sweep(),
     idlePollSeconds: config.RUNNER_IDLE_POLL_SECONDS,
     shouldContinue: () => running,
     log,

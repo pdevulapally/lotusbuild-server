@@ -2,7 +2,7 @@ import type { OutgoingHttpHeaders } from 'node:http';
 
 import type { FastifyBaseLogger, FastifyInstance, FastifyReply } from 'fastify';
 
-import { authenticatedUser } from '../auth/plugin.ts';
+import { authenticatedUser, bearerToken } from '../auth/plugin.ts';
 import { AppError } from '../http/errors.ts';
 import {
   type SessionEvent,
@@ -45,6 +45,9 @@ export interface SessionRouteOptions {
    * bounds how fast they are opened, not how many exist.
    */
   readonly maxConnections: number;
+  readonly maxConnectionsPerUser: number;
+  readonly maxBufferedBytes: number;
+  readonly reauthenticate: (token: string) => Promise<void>;
 }
 
 function toResponse(session: BuildSession) {
@@ -304,11 +307,15 @@ export function registerSessionRoutes(
     },
   );
 
-  app.get<{ Params: { sessionId: string } }>(
+  app.get<{ Params: { sessionId: string }; Querystring: { limit?: number; after?: string } }>(
     '/sessions/:sessionId/queued-messages',
     {
       preHandler: [app.requireAuth, app.enforceRateLimit('read')],
       schema: {
+        querystring: { type: 'object', additionalProperties: false, properties: {
+          limit: { type: 'integer', minimum: 1, maximum: 200, default: 100 },
+          after: { type: 'string', pattern: documentId },
+        } },
         params: {
           type: 'object',
           required: ['sessionId'],
@@ -319,9 +326,10 @@ export function registerSessionRoutes(
     },
     async (request) => {
       const user = authenticatedUser(request);
-      const queuedMessages = await sessions.listQueuedMessages(user.uid, request.params.sessionId);
+      const queuedMessages = await sessions.listQueuedMessages(user.uid, request.params.sessionId, request.query.limit ?? 100, request.query.after);
       return {
         queuedMessages: queuedMessages.map(toQueuedMessageResponse),
+        nextCursor: queuedMessages.length === (request.query.limit ?? 100) ? queuedMessages.at(-1)!.id : null,
       };
     },
   );
@@ -387,6 +395,7 @@ export function registerSessionRoutes(
   );
 
   let openStreams = 0;
+  const streamsByUser = new Map<string, number>();
 
 
   /**
@@ -415,6 +424,10 @@ export function registerSessionRoutes(
       const user = authenticatedUser(request);
       const session = await sessions.readOwned(user.uid, request.params.sessionId);
 
+      if ((streamsByUser.get(user.uid) ?? 0) >= options.maxConnectionsPerUser) {
+        throw new AppError({ code: 'stream/account-capacity-reached', statusCode: 429,
+          message: 'Close an existing event stream before opening another.' });
+      }
       if (openStreams >= options.maxConnections) {
         throw new AppError({
           code: 'stream/capacity-reached',
@@ -429,6 +442,7 @@ export function registerSessionRoutes(
       const resumeFrom = parseStreamId(request.headers['last-event-id']);
 
       openStreams += 1;
+      streamsByUser.set(user.uid, (streamsByUser.get(user.uid) ?? 0) + 1);
       // Past this point the reply is ours: Fastify will not serialise, log a
       // status, or run onSend hooks for it, so every exit has to close the socket
       // itself. The headers Fastify's plugins already set — CORS, helmet — are
@@ -444,17 +458,25 @@ export function registerSessionRoutes(
       socket.writeHead(200, {
         ...headers,
         'content-type': 'text/event-stream; charset=utf-8',
-        'cache-control': 'no-cache, no-transform',
+        'cache-control': 'no-store, no-transform',
         connection: 'keep-alive',
         // nginx buffers a proxied response by default, which holds every event
         // until the buffer fills — for a live log, that is the whole point lost.
         'x-accel-buffering': 'no',
       });
+      socket.flushHeaders();
 
       let finished = false;
+      const authorizationWindow = options.heartbeatSeconds * 2000;
+      const tokenExpiry = user.expiresAt === undefined ? Number.POSITIVE_INFINITY : user.expiresAt * 1000;
+      let authorizedUntil = Math.min(Date.now() + authorizationWindow, tokenExpiry);
       const write = (chunk: string): void => {
-        if (!finished && socket.writable) {
-          socket.write(chunk);
+        if (finished) return;
+        if (!socket.writable || Date.now() >= authorizedUntil) { finish(); return; }
+        if (socket.writable) {
+          // Close slow readers at backpressure instead of accumulating bytes.
+          // The client can resume from its last received event ID.
+          if (Buffer.byteLength(chunk) > options.maxBufferedBytes || !socket.write(chunk)) finish();
         }
       };
 
@@ -462,10 +484,25 @@ export function registerSessionRoutes(
       // so the client never sees the future before the past.
       let replaying = true;
       const pending: SessionEvent[] = [];
+      let pendingBytes = 0;
       let release: (() => void) | undefined;
 
+      let authenticating = false;
       const heartbeat = setInterval(() => {
-        write(': keep-alive\n\n');
+        if (finished) return;
+        if (Date.now() >= authorizedUntil) { finish(); return; }
+        if (authenticating) return;
+        authenticating = true;
+        void (async () => {
+          try {
+            await options.reauthenticate(bearerToken(request.headers.authorization));
+            await sessions.readOwned(user.uid, session.id);
+            authorizedUntil = Math.min(Date.now() + authorizationWindow, tokenExpiry);
+            write(': keep-alive\n\n');
+          } catch {
+            finish();
+          } finally { authenticating = false; }
+        })();
       }, options.heartbeatSeconds * 1000);
       // Never a reason to hold the process open at shutdown.
       heartbeat.unref();
@@ -476,17 +513,27 @@ export function registerSessionRoutes(
         }
         finished = true;
         openStreams -= 1;
+        const remaining = (streamsByUser.get(user.uid) ?? 1) - 1;
+        if (remaining === 0) streamsByUser.delete(user.uid);
+        else streamsByUser.set(user.uid, remaining);
         clearInterval(heartbeat);
-        release?.();
-        socket.end();
+        pending.length = 0;
+        try { release?.(); } catch { request.log.warn({ sessionId: session.id }, 'event listener cleanup failed'); }
+        finally { socket.destroy(); }
       };
 
       request.raw.on('close', finish);
       request.raw.on('error', finish);
+      socket.on('close', finish);
+      socket.on('error', finish);
+      if (socket.destroyed || request.raw.aborted) { finish(); return; }
 
       try {
         release = await events.subscribe(session.id, (event) => {
+          if (finished) return;
           if (replaying) {
+            pendingBytes += Buffer.byteLength(frame(event));
+            if (pendingBytes > options.maxBufferedBytes) { finish(); return; }
             pending.push(event);
             return;
           }
@@ -499,12 +546,12 @@ export function registerSessionRoutes(
           return;
         }
 
-        const history = await events.history(session.id, resumeFrom);
-        for (const event of history) {
+        let lastReplayed: string | undefined;
+        for await (const event of events.replay(session.id, resumeFrom)) {
+          if (finished) break;
           write(frame(event));
+          lastReplayed = event.id;
         }
-
-        const lastReplayed = history.at(-1)?.id;
         replaying = false;
         for (const event of pending) {
           // Whatever arrived during the replay and was already in it.

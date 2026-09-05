@@ -38,11 +38,22 @@ function toResponse(project: Project) {
     description: project.description,
     platform: project.platform,
     status: project.status,
+    publicPreviewEnabled: project.publicPreviewEnabled === true,
     createdAt: project.createdAt.toISOString(),
   };
 }
 
 export function registerProjectRoutes(app: FastifyInstance, projects: ProjectRepository): void {
+  app.patch<{ Params: { projectId: string }; Body: { enabled: boolean } }>('/projects/:projectId/public-preview', {
+    preHandler: [app.requireAuth, app.enforceRateLimit('write')],
+    schema: { params: { type: 'object', required: ['projectId'], additionalProperties: false, properties: { projectId: { type: 'string', pattern: documentId } } },
+      body: { type: 'object', required: ['enabled'], additionalProperties: false, properties: { enabled: { type: 'boolean' } } } },
+  }, async (request, reply) => {
+    const result = await projects.setPublicPreview(authenticatedUser(request).uid, request.params.projectId, request.body.enabled);
+    return reply.code(result.terminationPending ? 202 : 200).send({ ...result,
+      message: result.terminationPending ? 'Public preview access is being revoked by terminating the active session. Access may persist until sandbox termination succeeds.'
+        : result.enabled ? 'Future build previews will be publicly accessible. Anyone with the URL may view and copy their content.' : 'Future build previews will remain private.' });
+  });
   app.post<{ Body: CreateProjectBody }>(
     '/projects',
     {
@@ -185,4 +196,3 @@ export function registerProjectRoutes(app: FastifyInstance, projects: ProjectRep
     },
   );
 }
-

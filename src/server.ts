@@ -29,7 +29,13 @@ import { redisKeyPrefixes } from './redis/client.ts';
  * building the app never opens a connection and `src/index.ts` stays the one
  * place that decides what talks to what.
  */
+import { registerPrivacyRoutes, type PrivacyRequests } from './privacy/requests.ts';
+import { registerFamilyRoutes } from './family/routes.ts';
+import type { FamilyService } from './family/service.ts';
+
 export interface Dependencies {
+  readonly privacyRequests: PrivacyRequests;
+  readonly family: FamilyService;
   readonly firebaseAuth: Auth;
   readonly redis: Redis;
   readonly entitlements: EntitlementService;
@@ -50,7 +56,7 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     logger: { level: config.LOG_LEVEL },
     // Trust the reverse proxy in front of us for client IP and protocol, which
     // rate limiting and redirect construction both depend on being correct.
-    trustProxy: true,
+    trustProxy: 'loopback',
     // Reject oversized bodies at the parser rather than buffering them; this
     // process shares a box with build sandboxes and cannot afford the memory.
     bodyLimit: 1_048_576,
@@ -62,7 +68,11 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
   void app.register(rateLimit, {
     // Applied per route through enforceRateLimit, so that the counter can be
     // keyed by an already-verified uid rather than by an IP.
-    global: false,
+    global: true,
+    hook: 'onRequest',
+    max: config.HTTP_MAX_REQUESTS_PER_MINUTE,
+    timeWindow: 60_000,
+    keyGenerator: (request) => `ip:${request.ip}`,
     redis,
     nameSpace: redisKeyPrefixes.rateLimit,
     // A rate limiter that lets everything through when its store is unreachable
@@ -159,9 +169,14 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
 
 
   registerProjectRoutes(app, projects);
+  registerPrivacyRoutes(app, dependencies.privacyRequests);
+  registerFamilyRoutes(app, dependencies.family, projects, sessions);
   registerSessionRoutes(app, sessions, sessionEvents, {
     heartbeatSeconds: config.SSE_HEARTBEAT_SECONDS,
     maxConnections: config.SSE_MAX_CONNECTIONS,
+    maxConnectionsPerUser: config.SSE_MAX_CONNECTIONS_PER_USER,
+    maxBufferedBytes: config.SSE_BUFFER_MAX_BYTES,
+    reauthenticate: async (token) => { await firebaseAuth.verifyIdToken(token, true); },
   });
   registerBillingRoutes(app, {
     stripe: dependencies.stripe,
