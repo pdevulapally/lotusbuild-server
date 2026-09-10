@@ -71,7 +71,9 @@ export class SandboxService {
     readonly source?: RunningSandbox;
     readonly publicPreviewEnabled?: boolean;
   }): Promise<AcquiredSandbox> {
-    const { registry } = await this.#configuration.get();
+    const { registry, plans } = await this.#configuration.get();
+    const plan = plans.get(input.entitlements.planKey);
+    if (plan === undefined) throw new Error('The sandbox plan is not configured.');
     const provider = await this.providerFor(input.platform);
     // Resolved before anything is reserved: a provider with no adapter must fail
     // before it costs the user a hold.
@@ -103,7 +105,8 @@ export class SandboxService {
         // something is stuck, without putting anything private on it.
         metadata: { sessionId: input.sessionId, platform: provider.platform },
         publicPreviewEnabled: input.publicPreviewEnabled === true,
-      }) : await input.source.forkForValidation!(provider.timeoutSeconds * 1000);
+        networkPolicy: plan.sandboxNetwork,
+      }) : await input.source.forkForValidation!(provider.timeoutSeconds * 1000, plan.sandboxNetwork);
 
       try {
         if (running.lifetime === undefined) throw new Error('The provider does not expose authoritative sandbox lifetime metadata.');

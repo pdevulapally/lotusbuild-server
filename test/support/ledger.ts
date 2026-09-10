@@ -41,6 +41,7 @@ export function ledger() {
         const result = await work({
           get: async (ref: { path: string; id: string }) => { if (writing) throw new Error('Firestore read after write'); return snapshot(ref, pending); },
           set: write,
+          delete: (ref: { path: string }) => { writing = true; pending.delete(ref.path); },
           create: (ref: { path: string }, fields: Data) => { if (pending.has(ref.path)) throw new Error('Document exists'); write(ref, fields); },
           update: (ref: { path: string }, fields: Data) => { if (!pending.has(ref.path)) throw new Error('Document missing'); write(ref, fields, true); },
         });

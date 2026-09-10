@@ -1,13 +1,24 @@
 #!/usr/bin/env bash
-# Ships a committed candidate; preflight precedes an atomic directory exchange.
+# Promotes a CI-built release; never install dependencies or compile with secrets.
 set -euo pipefail
 HOST="${DEPLOY_HOST:-lotusbuild-vps}"
-revision=$(git rev-parse --verify HEAD)
+[[ $# == 3 ]] || { echo 'Usage: deploy.sh RELEASE_TAR SHA256 COMMIT_SHA' >&2; exit 1; }
+artifact=$1
+digest=$2
+revision=$3
+test -f "$artifact"
+[[ "$digest" =~ ^[0-9a-f]{64}$ ]] || exit 1
 [[ "$revision" =~ ^[0-9a-f]{40,64}$ ]] || exit 1
+# Reject wrong/corrupt input before contacting the server. No artifact code runs.
+actual=$(sha256sum "$artifact" | cut -d ' ' -f 1)
+[[ "$actual" == "$digest" ]] || { echo 'Release checksum mismatch.' >&2; exit 1; }
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+[[ "$(git -C "$script_dir" rev-parse --verify HEAD)" == "$revision" ]] || { echo 'Deploy checkout revision mismatch.' >&2; exit 1; }
 candidate="/home/preet/apps/.lotusbuild-candidate-${revision}-$$"
-npm run build
 ssh "$HOST" "umask 077; mkdir '$candidate'"
-git archive --format=tar HEAD | ssh "$HOST" "tar -x -C '$candidate'"
+ssh "$HOST" "umask 077; cat > '$candidate/release.tar.gz'" < "$artifact"
+# Execute the validator from this trusted checkout, never from the artifact.
+ssh "$HOST" python3 - "$candidate/release.tar.gz" "$digest" "$revision" "$candidate" < "$script_dir/deploy/unpack-release.py"
 ssh "$HOST" bash -s -- "$candidate" <<'REMOTE'
 set -euo pipefail
 candidate=$1
@@ -16,14 +27,16 @@ active=/home/preet/apps/lotusbuild-server
 exec 9>/home/preet/apps/.lotusbuild-deploy.lock
 flock -n 9 || { echo 'Another deployment is active.' >&2; exit 1; }
 test -d "$active" && test ! -L "$active"
+test -f "$candidate/dist/index.js"
+test -f "$candidate/dist/runner/index.js"
+test -f "$candidate/dist/preflight.js"
+rm -- "$candidate/release.tar.gz"
 test -f "$active/.env"
 install -m 600 "$active/.env" "$candidate/.env"
 if test -f "$active/service-account.json"; then
   install -m 600 "$active/service-account.json" "$candidate/service-account.json"
 fi
 cd "$candidate"
-npm ci --silent
-npm run build
 node --env-file=.env dist/preflight.js
 python3 deploy/exchange-directories.py --check "$active" "$candidate"
 switched=0

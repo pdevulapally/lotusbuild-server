@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import {
   DocumentShapeError,
   type Fields,
@@ -155,6 +156,7 @@ export interface Plan {
   readonly name: string;
   readonly status: (typeof planStatuses)[number];
   readonly rank: number;
+  readonly sandboxNetwork: SandboxNetworkPolicy;
   /**
    * What this plan costs. Absent for a plan nobody buys — the default one
    * everybody already has, or one kept only to honour subscriptions that
@@ -170,6 +172,30 @@ export interface Plan {
   readonly entitlements: ReadonlyMap<string, EntitlementValue>;
   readonly meterLimits: ReadonlyMap<string, MeterLimit>;
   readonly rateLimits: ReadonlyMap<RateLimitClass, RateLimit>;
+}
+
+export type SandboxNetworkPolicy =
+  | { readonly mode: 'unrestricted' }
+  | { readonly mode: 'restricted'; readonly allowedDomains: readonly string[] };
+
+/** Operator-owned plan policy. No absent-policy or malformed-domain fallback. */
+export function parseSandboxNetwork(value: unknown, where: string): SandboxNetworkPolicy {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new DocumentShapeError(`${where}: sandboxNetwork must be explicitly configured.`);
+  }
+  const fields = value as Fields;
+  if (fields['mode'] === 'unrestricted' && Object.keys(fields).length === 1) return { mode: 'unrestricted' };
+  const domains = fields['allowedDomains'];
+  if (fields['mode'] !== 'restricted' || !Array.isArray(domains)
+    || Object.keys(fields).some((key) => key !== 'mode' && key !== 'allowedDomains')) {
+    throw new DocumentShapeError(`${where}: expected unrestricted mode or restricted mode with allowedDomains.`);
+  }
+  const validDomain = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+  if (domains.some((domain) => typeof domain !== 'string' || domain.length > 253
+    || !validDomain.test(domain) || isIP(domain) !== 0) || new Set(domains).size !== domains.length) {
+    throw new DocumentShapeError(`${where}: allowedDomains must contain unique exact lowercase DNS names, without URLs, IP addresses or wildcards.`);
+  }
+  return { mode: 'restricted', allowedDomains: [...domains] as string[] };
 }
 
 /**
@@ -483,6 +509,7 @@ export function parsePlan(fields: Fields, where: string, registry: Registry): Pl
     name: stringField(fields, 'name', where),
     status: enumField(fields, 'status', where, planStatuses),
     rank: integerField(fields, 'rank', where, { min: 0 }),
+    sandboxNetwork: parseSandboxNetwork(fields['sandboxNetwork'], where),
     price: parsePlanPrice(fields, where),
     entitlements,
     meterLimits,

@@ -159,6 +159,7 @@ export const registryDocument = {
 export const planDocuments = [
   {
     key: "free",
+    sandboxNetwork: { mode: 'unrestricted' },
     name: "Free",
     status: "ACTIVE",
     rank: 0,
@@ -194,6 +195,7 @@ export const planDocuments = [
   },
   {
     key: "pro",
+    sandboxNetwork: { mode: 'unrestricted' },
     name: "Pro",
     // £24.00. Stripe publishes this on demand; nothing is pasted from a dashboard.
     price: { amountMinor: 2400, currency: "gbp", interval: "month" },
@@ -227,6 +229,9 @@ export const planDocuments = [
   },
   {
     key: "business",
+    // Operator-approved exact domains belong here. Empty deliberately denies
+    // outbound internet until the business policy has been configured.
+    sandboxNetwork: { mode: 'restricted', allowedDomains: [] },
     name: "Business",
     // £72.00.
     price: { amountMinor: 7200, currency: "gbp", interval: "month" },

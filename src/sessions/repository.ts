@@ -23,6 +23,7 @@ import {
 import type { StoredSnapshot, UploadedSnapshot } from '../storage/snapshots.ts';
 import {
   type Fields,
+  booleanField,
   enumField,
   integerField,
   optionalStringField,
@@ -70,6 +71,10 @@ export interface BuildSession {
   readonly heartbeatAt: Date | undefined;
   readonly error: string | undefined;
   readonly cancelRequested?: boolean | undefined;
+  /** A late follow-up has not yet been appended or charged as a new turn. */
+  readonly queuedTurnPending?: boolean | undefined;
+  /** Latest accepted steering instruction, consumed under the runner lease. */
+  readonly pendingSteer?: string | undefined;
   /**
    * Meter holds the claiming runner took out. Recorded on the session so that
    * whoever inherits an expired lease can give them back: a hold nobody returns
@@ -145,6 +150,8 @@ function parseSession(id: string, fields: Fields, where: string): BuildSession {
     heartbeatAt: optionalTimestampField(fields, 'heartbeatAt', where),
     error: optionalStringField(fields, 'error'),
     cancelRequested: fields['cancelRequested'] === true ? true : undefined,
+    queuedTurnPending: fields['queuedTurnPending'] === undefined ? undefined : booleanField(fields, 'queuedTurnPending', where),
+    pendingSteer: fields['pendingSteer'] === undefined ? undefined : stringField(fields, 'pendingSteer', where),
     reservationIds: stringArrayField(fields, 'reservationIds', where),
     specialistReservationIds: stringArrayField(fields, 'specialistReservationIds', where),
     messageCount: integerField(fields, 'messageCount', where, { min: 1 }),
@@ -256,6 +263,7 @@ export class SessionRepository {
    * not keep building after the subscription lapses.
    */
   async create(uid: string, projectId: string, input: NewSession, idempotencyId?: string): Promise<BuildSession> {
+    this.#validatePrompt(input.prompt);
     if (idempotencyId !== undefined && !/^[A-Za-z0-9_-]{1,128}$/.test(idempotencyId)) throw new Error('Invalid internal session id.');
     const project = await this.#projects.readOwned(uid, projectId);
     const entitlements = await this.#entitlements.forUser(uid);
@@ -410,6 +418,7 @@ export class SessionRepository {
    * neither is something the user can see happening.
    */
   async appendPrompt(uid: string, sessionId: string, prompt: string): Promise<BuildSession> {
+    this.#validatePrompt(prompt);
     const session = await this.readOwned(uid, sessionId);
     const entitlements = await this.#entitlements.forUser(uid);
     const { registry } = await this.#configuration.get();
@@ -469,6 +478,7 @@ export class SessionRepository {
         status: 'QUEUED',
         messageCount: FieldValue.increment(1),
         claimableAt: Timestamp.fromDate(now),
+        cancelRequested: FieldValue.delete(),
         error: FieldValue.delete(),
         updatedAt: FieldValue.serverTimestamp(),
       });
@@ -477,7 +487,7 @@ export class SessionRepository {
         updatedAt: FieldValue.serverTimestamp(),
       });
 
-      return { ...current, status: 'QUEUED' as const, error: undefined, messageCount: seq + 1 };
+      return { ...current, status: 'QUEUED' as const, error: undefined, cancelRequested: undefined, messageCount: seq + 1 };
     });
   }
 
@@ -485,6 +495,7 @@ export class SessionRepository {
    * Staging a prompt in the session queue while a turn is active.
    */
   async enqueueMessage(uid: string, sessionId: string, prompt: string): Promise<QueuedMessage> {
+    this.#validatePrompt(prompt);
     const entitlements = await this.#entitlements.forUser(uid);
     const limit = await this.#queueLimit(entitlements);
     const parent = this.#ref(sessionId);
@@ -495,6 +506,9 @@ export class SessionRepository {
         throw new AppError({ code: 'session/not-found', statusCode: 404, message: 'No such session.' });
       }
       const session = parseSession(snapshot.id, snapshot.data() ?? {}, parent.path);
+      if (!isActiveSessionStatus(session.status) || session.cancelRequested === true) {
+        throw new AppError({ code: 'session/not-active', statusCode: 409, message: 'This session is no longer accepting queued messages.' });
+      }
       const project = await this.#projects.readOwnedInTransaction(transaction, uid, session.projectId);
       this.#assertProjectGuard(project, session);
       assertBuildAllowed(entitlements, project.platform, session.model);
@@ -596,13 +610,40 @@ export class SessionRepository {
     });
   }
 
-  /**
-   * Appends a mid-turn steering message directly into the conversation transcript under the runner's lease.
-   */
-  async appendSteerMessage(sessionId: string, authority: SessionLease, prompt: string): Promise<void> {
+  #validatePrompt(prompt: string): void {
+    if (prompt.trim() === '' || prompt.length > promptMaxLength) {
+      throw new AppError({ code: 'session/invalid-prompt', statusCode: 400, message: 'Prompt must contain text within the permitted length.' });
+    }
+  }
+
+  /** Redis is only a notification: acceptance commits before the API acknowledges. */
+  async queueSteerMessage(uid: string, sessionId: string, prompt: string): Promise<void> {
+    this.#validatePrompt(prompt);
+    const entitlements = await this.#entitlements.forUser(uid);
     const ref = this.#ref(sessionId);
     await this.#firestore.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(ref);
+      if (!snapshot.exists || snapshot.data()?.['ownerUid'] !== uid) {
+        throw new AppError({ code: 'session/not-found', statusCode: 404, message: 'No such session.' });
+      }
+      const session = parseSession(snapshot.id, snapshot.data() ?? {}, ref.path);
+      if (session.status !== 'RUNNING' || session.cancelRequested === true) {
+        throw new AppError({ code: 'session/not-running', statusCode: 409, message: 'This session is no longer accepting steering instructions.' });
+      }
+      const project = await this.#projects.readOwnedInTransaction(transaction, uid, session.projectId);
+      this.#assertProjectGuard(project, session);
+      assertBuildAllowed(entitlements, project.platform, session.model);
+      transaction.update(ref, { pendingSteer: prompt, updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+
+  /** Consume the latest steering instruction and persist its conversation position atomically. */
+  async drainSteerMessage(sessionId: string, authority: SessionLease): Promise<string | undefined> {
+    const ref = this.#ref(sessionId);
+    return this.#firestore.runTransaction(async (transaction) => {
       const session = await this.#requireLease(transaction, ref, authority);
+      const prompt = session.pendingSteer;
+      if (prompt === undefined) return undefined;
       const seq = session.messageCount;
       transaction.create(ref.collection(messagesCollectionName).doc(messageId(seq)), {
         role: 'user',
@@ -610,9 +651,40 @@ export class SessionRepository {
         createdAt: FieldValue.serverTimestamp(),
       });
       transaction.update(ref, {
+        pendingSteer: FieldValue.delete(),
         messageCount: FieldValue.increment(1),
         updatedAt: FieldValue.serverTimestamp(),
       });
+      return prompt;
+    });
+  }
+
+  /** Start work accepted during finalization, after claiming and recovering old resources. */
+  async startPendingTurn(sessionId: string, authority: SessionLease): Promise<boolean> {
+    const ref = this.#ref(sessionId);
+    return this.#firestore.runTransaction(async (transaction) => {
+      const session = await this.#requireLease(transaction, ref, authority);
+      if (session.queuedTurnPending !== true) throw new Error('Session has no pending turn to start.');
+      const queued = await transaction.get(ref.collection(queuedMessagesCollectionName).orderBy('createdAt', 'asc').limit(1));
+      const next = queued.docs[0];
+      const prompt = session.pendingSteer ?? (next === undefined ? undefined : parseQueuedMessage(next.id, sessionId, next.data(), next.ref.path).prompt);
+      if (prompt === undefined) return false; // The owner removed the last queued message.
+      const entitlements = await this.#entitlements.forUser(session.ownerUid);
+      const project = await this.#projects.readOwnedInTransaction(transaction, session.ownerUid, session.projectId);
+      assertBuildAllowed(entitlements, project.platform, session.model);
+      if (session.pendingSteer === undefined) {
+        if (next === undefined) throw new Error('Pending message disappeared inside the transaction.');
+        const { registry } = await this.#configuration.get();
+        await this.#metering.consumeIn(transaction, { uid: session.ownerUid, entitlements,
+          meterKey: registry.buildMeterKey, quantity: 1, now: new Date() });
+        transaction.delete(next.ref);
+      }
+      transaction.create(ref.collection(messagesCollectionName).doc(messageId(session.messageCount)), {
+        role: 'user', content: prompt, createdAt: FieldValue.serverTimestamp(),
+      });
+      transaction.update(ref, { queuedTurnPending: FieldValue.delete(), pendingSteer: FieldValue.delete(),
+        messageCount: FieldValue.increment(1), updatedAt: FieldValue.serverTimestamp() });
+      return true;
     });
   }
 
@@ -621,7 +693,8 @@ export class SessionRepository {
 
    *
    * If the session is QUEUED, it is immediately marked FAILED with 'Cancelled by user',
-   * claimableAt is deleted so no runner will claim it, and the builds.started counter is refunded.
+   * claimableAt is deleted so no runner will claim it. A prepaid turn is refunded;
+   * late follow-ups awaiting admission have no new charge to refund.
    * If the session is RUNNING, cancelRequested is set to true so the active runner halts on its
    * next step, tears down resources, and transitions the session to FAILED.
    */
@@ -669,7 +742,7 @@ export class SessionRepository {
       this.#assertProjectGuard(project, current);
 
       if (current.status === 'QUEUED') {
-        await this.#metering.refundIn(transaction, {
+        if (current.queuedTurnPending !== true) await this.#metering.refundIn(transaction, {
           uid,
           entitlements,
           meterKey: registry.buildMeterKey,
@@ -683,6 +756,8 @@ export class SessionRepository {
           error: 'Cancelled by user',
           leaseToken: FieldValue.delete(),
           claimableAt: FieldValue.delete(),
+          queuedTurnPending: FieldValue.delete(),
+          pendingSteer: FieldValue.delete(),
           updatedAt: FieldValue.serverTimestamp(),
         });
         transaction.update(this.#projects.refFor(current.projectId), {
@@ -1016,18 +1091,17 @@ export class SessionRepository {
   }
 
   /**
-   * Releases the session. `claimableAt` is removed rather than pushed far into
-   * the future: absent means no runner will ever look at it again, which is the
-   * truth until the user says something else.
+   * Releases the current lease. Successful completion with accepted pending work
+   * stays queued under the same project guard; otherwise scheduling is removed.
   */
   async finish(
     sessionId: string,
     authority: SessionLease,
     outcome: SessionOutcome,
     now: Date = new Date(),
-  ): Promise<void> {
+  ): Promise<'IDLE' | 'FAILED' | 'QUEUED'> {
     const ref = this.#ref(sessionId);
-    await this.#firestore.runTransaction(async (transaction) => {
+    return this.#firestore.runTransaction(async (transaction) => {
       const { session } = await this.#requireLeaseState(transaction, ref, authority, true);
       if (session.cancelRequested === true && outcome.status === 'IDLE') {
         throw new AppError({
@@ -1037,6 +1111,13 @@ export class SessionRepository {
           details: { sessionId: session.id },
         });
       }
+
+      // Enqueue and steering both write this session document, so a concurrent
+      // acceptance forces a retry before the scheduler/guard can be cleared.
+      const queued = outcome.status === 'IDLE'
+        ? await transaction.get(ref.collection(queuedMessagesCollectionName).limit(1)) : undefined;
+      const pending = outcome.status === 'IDLE' && (session.pendingSteer !== undefined || (queued !== undefined && queued.size > 0));
+      const status = pending ? 'QUEUED' : outcome.status;
 
       // Terminal means `claimableAt` is deleted, and a session without it is
       // never claimed again by anyone — so this is the last moment any hold it
@@ -1054,18 +1135,21 @@ export class SessionRepository {
       }
 
       transaction.update(ref, {
-        status: outcome.status,
+        status,
         error: outcome.status === 'FAILED' ? outcome.error : FieldValue.delete(),
         claimedBy: FieldValue.delete(),
         leaseToken: FieldValue.delete(),
-        claimableAt: FieldValue.delete(),
+        claimableAt: pending ? Timestamp.fromDate(now) : FieldValue.delete(),
+        queuedTurnPending: pending ? true : FieldValue.delete(),
+        ...(!pending ? { pendingSteer: FieldValue.delete() } : {}),
         specialistReservationIds: FieldValue.delete(),
         updatedAt: FieldValue.serverTimestamp(),
       });
       transaction.update(this.#projects.refFor(session.projectId), {
-        activeSessionId: null,
+        activeSessionId: pending ? session.id : null,
         updatedAt: FieldValue.serverTimestamp(),
       });
+      return status;
     });
   }
 

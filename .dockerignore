@@ -1,0 +1,21 @@
+# Only build inputs enter the context. Local dependencies, dist, Git history,
+# tests, deployment configuration and root-level credentials stay outside it.
+**
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!src/**
+
+# Also exclude credential-shaped files accidentally placed under src/.
+**/.env
+**/.env.*
+**/.npmrc
+**/*firebase-adminsdk*.json
+**/*service-account*.json
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/secrets/**
+**/.git/**

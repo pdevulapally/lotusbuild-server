@@ -96,7 +96,7 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     // browser never needs to attach credentials to a cross-origin request.
     credentials: false,
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
-    allowedHeaders: ['Authorization', 'Content-Type'],
+    allowedHeaders: ['Authorization', 'Content-Type', 'Last-Event-ID'],
   });
 
   // Resolves configuration rather than only proving the process is listening.

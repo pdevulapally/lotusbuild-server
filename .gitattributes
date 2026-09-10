@@ -1,9 +1,8 @@
 * text=auto eol=lf
 
-# Never shipped to a server. `deploy.sh` builds the payload with `git archive`,
-# which honours export-ignore, so these are a CI gate and nothing more —
-# production holds no test files, workflows or service-unit installation files.
-# The atomic exchange helper is required by deploy.sh and must be shipped.
+# Exclude development and service-installation files from source archives.
+# CI deployment now packages an explicit allowlist of compiled output and
+# production dependencies; its validator rejects tests and workflow roots.
 /test export-ignore
 /.github export-ignore
 /deploy/*.service export-ignore

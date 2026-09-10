@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   # A newer push makes an in-flight run irrelevant, but never interrupt a
   # deploy — cancelling one mid-restart leaves the server on a half-shipped tree.
@@ -16,15 +19,20 @@ jobs:
   check:
     name: Typecheck, build and test
     runs-on: ubuntu-latest
+    outputs:
+      release-id: ${{ steps.upload.outputs.artifact-id }}
+      release-sha256: ${{ steps.package.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts --no-audit --no-fund
 
       # Covers src and test together; the build config alone would not see the
       # tests, and a test that no longer compiles is a test that stopped running.
@@ -36,6 +44,9 @@ jobs:
 
       - name: Test
         run: npm test
+
+      - name: Test release validation
+        run: python3 -m unittest discover -s test -p 'deploy_release_test.py'
 
       - name: Verify no secret is committed
         run: |
@@ -51,16 +62,34 @@ jobs:
           fi
           echo "No tracked secrets."
 
-      - name: Verify the deploy payload carries no tests
+      - name: Package the checked release without production credentials
+        id: package
         run: |
           set -euo pipefail
-          # deploy.sh ships `git archive`, which honours export-ignore. If this
-          # ever lists a test file, production is about to receive one.
-          if git archive HEAD | tar -tf - | grep -E '^(test/|\.github/)'; then
-            echo "::error::The deploy payload includes test or CI files."
-            exit 1
-          fi
-          echo "Deploy payload is production-only."
+          release="$RUNNER_TEMP/release"
+          mkdir "$release"
+          cp package.json package-lock.json "$release/"
+          npm ci --prefix "$release" --omit=dev --ignore-scripts --no-audit --no-fund
+          (cd "$release" && node --input-type=module -e 'import fs from "node:fs"; const names = Object.keys(JSON.parse(fs.readFileSync("package.json", "utf8")).dependencies); for (const name of names) await import(name);')
+          cp -R dist "$release/dist"
+          mkdir "$release/deploy"
+          cp deploy/exchange-directories.py "$release/deploy/"
+          python3 deploy/unpack-release.py --metadata "$GITHUB_SHA" > "$release/release.json"
+          # Dereference npm's internal links; the receiver rejects all links.
+          tar --dereference --hard-dereference -czf "$RUNNER_TEMP/release.tar.gz" -C "$release" package.json package-lock.json release.json dist node_modules deploy
+          digest=$(sha256sum "$RUNNER_TEMP/release.tar.gz" | cut -d ' ' -f 1)
+          python3 deploy/unpack-release.py "$RUNNER_TEMP/release.tar.gz" "$digest" "$GITHUB_SHA" --check-only
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the immutable release
+        id: upload
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ github.sha }}
+          path: ${{ runner.temp }}/release.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
   deploy:
     name: Deploy to production
@@ -74,17 +103,24 @@ jobs:
       group: deploy-production
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      # A fresh hosted runner: no npm, build, tests or application imports here.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          # deploy.sh builds the payload from git history, not the checkout.
-          fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - name: Require an exact release reference
+        env:
+          RELEASE_ID: ${{ needs.check.outputs.release-id }}
+          RELEASE_SHA256: ${{ needs.check.outputs.release-sha256 }}
+        run: |
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          [[ "$RELEASE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          node-version: 22
-          cache: npm
-
-      - run: npm ci
+          artifact-ids: ${{ needs.check.outputs.release-id }}
+          path: ${{ runner.temp }}/deployment
+          merge-multiple: true
 
       - name: Authorise SSH
         env:
@@ -101,7 +137,12 @@ jobs:
       - name: Deploy
         env:
           DEPLOY_HOST: preet@194.164.94.249
-        run: ./deploy.sh
+          RELEASE_SHA256: ${{ needs.check.outputs.release-sha256 }}
+        run: bash deploy.sh "$RUNNER_TEMP/deployment/release.tar.gz" "$RELEASE_SHA256" "$GITHUB_SHA"
+
+      - name: Remove the deployment key
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519
 
       - name: Confirm the API is serving
         run: |

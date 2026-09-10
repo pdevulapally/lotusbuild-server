@@ -1,5 +1,5 @@
 import type { Auth } from 'firebase-admin/auth';
-import { FieldValue, type Firestore } from 'firebase-admin/firestore';
+import { FieldValue, type DocumentReference, type Firestore } from 'firebase-admin/firestore';
 import type { ProjectRepository } from '../projects/repository.ts';
 import type { SessionRepository } from '../sessions/repository.ts';
 import { AppError } from '../http/errors.ts';
@@ -51,9 +51,7 @@ export class AccountErasure {
       const links = await this.#db.collection('familyLinks').where('parentUid', '==', uid).limit(100).get();
       if (links.empty) break;
       for (const link of links.docs) {
-        await link.ref.update({ status: 'REVOKED', parentUid: FieldValue.delete(), childEmail: FieldValue.delete() });
-        await this.#db.recursiveDelete(link.ref.collection('projects'));
-        await this.#db.recursiveDelete(link.ref.collection('buildRequests'));
+        await this.#eraseFamilyLink(uid, link.ref);
       }
     }
     await this.#db.recursiveDelete(this.#db.doc(`familyLinks/${uid}`));
@@ -65,6 +63,39 @@ export class AccountErasure {
     await this.#db.doc(`users/${uid}`).delete();
     await ref.update({ status: 'LIVE_CONTENT_ERASED_VENDOR_CONFIRMATION_PENDING', updatedAt: FieldValue.serverTimestamp() });
     return { status: 'LIVE_CONTENT_ERASED_VENDOR_CONFIRMATION_PENDING', retained: ['reviewed financial records', 'minimal erasure/rights record', 'provider copies pending verified deletion or expiry'] };
+  }
+  async #eraseFamilyLink(parentUid: string, ref: DocumentReference): Promise<void> {
+    const revoked = await this.#db.runTransaction(async (tx) => {
+      const link = await tx.get(ref);
+      if (link.data()?.['parentUid'] !== parentUid) return false;
+      tx.update(ref, { status: 'REVOKED' });
+      return true;
+    });
+    if (!revoked) return;
+    // These collections contain leaf documents. Keep parentUid until both are
+    // empty so interrupted cleanup remains discoverable. Every delete reads the
+    // link in its transaction: another worker may finish and the child may relink
+    // after our query, but that makes our old page ineligible for deletion.
+    for (const collection of ['projects', 'buildRequests']) {
+      for (;;) {
+        const page = await this.#db.collection(`${ref.path}/${collection}`).limit(100).get();
+        if (page.empty) break;
+        const removed = await this.#db.runTransaction(async (tx) => {
+          const link = await tx.get(ref);
+          if (link.data()?.['parentUid'] !== parentUid) return false;
+          if (link.data()?.['status'] !== 'REVOKED') throw new Error('Family erasure lost its revocation fence.');
+          for (const document of page.docs) tx.delete(document.ref);
+          return true;
+        });
+        if (!removed) return;
+      }
+    }
+    await this.#db.runTransaction(async (tx) => {
+      const link = await tx.get(ref);
+      if (link.data()?.['parentUid'] !== parentUid) return;
+      if (link.data()?.['status'] !== 'REVOKED') throw new Error('Family erasure lost its revocation fence.');
+      tx.update(ref, { parentUid: FieldValue.delete(), childEmail: FieldValue.delete() });
+    });
   }
   async #ignoreAbsent(work: () => Promise<unknown>) {
     try { await work(); } catch (error) { if ((error as { code?: string }).code !== 'auth/user-not-found') throw error; }

@@ -50,7 +50,7 @@ export class SnapshotMaintenance {
     if (claimed === undefined) return;
     const projectId = stringField(claimed, 'projectId', ref.path);
     if (claimed['legacy'] === true) await this.snapshots.removeStored(projectId, { kind: 'legacy' });
-    else await this.snapshots.retireUpload(stringField(claimed, 'objectName', ref.path));
+    else await this.snapshots.removeRetiredUpload(stringField(claimed, 'objectName', ref.path));
     await this.firestore.runTransaction(async (tx) => {
       const snapshot = await tx.get(ref);
       const fields = snapshot.data() ?? {};

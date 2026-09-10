@@ -47,3 +47,43 @@ test('erasure pages historic content generations, preserving zero-byte barriers'
     assert.ok(requests.every((r) => r['versions'] === true && r['autoPaginate'] === false && r['maxResults'] === 100 && r['prefix'] === 'projects/p/'));
   } finally { await deleteApp(app); }
 });
+
+test('retired uploads remove every content generation and keep the replay barrier on retry', async (t) => {
+  const app = initializeApp({ projectId: 'test-offline' }, 'snapshot-cleanup-versions');
+  const storage = getStorage(app);
+  const objectName = 'projects/p/snapshots/upload.tar.gz';
+  const content = new Set(['7', '8']);
+  let fail = true;
+  let barrier = false;
+  t.mock.method(storage, 'bucket', () => ({
+    getFiles: async (options: Record<string, unknown>) => {
+      assert.equal(options['prefix'], objectName);
+      assert.equal(options['versions'], true);
+      return options['pageToken'] === undefined
+        ? [[...Array.from(content, (generation) => ({ name: objectName, metadata: { size: '12', generation } }))], { pageToken: 'barriers' }]
+        : [[{ name: objectName, metadata: { size: '0', generation: '9' } },
+            { name: `${objectName}-other`, metadata: { size: '99', generation: '10' } }], null];
+    },
+    file: (name: string, options?: { generation: string }) => ({
+      getMetadata: async () => [{ generation: barrier ? '9' : '8' }],
+      save: async (bytes: Buffer) => { assert.equal(bytes.length, 0); barrier = true; },
+      delete: async (preconditions: { ifGenerationMatch: string }) => {
+        assert.equal(name, objectName);
+        assert.equal(preconditions.ifGenerationMatch, options?.generation);
+        assert.ok(options?.generation === '7' || options?.generation === '8');
+        if (options.generation === '8' && fail) { fail = false; throw new Error('Generation delete failed'); }
+        content.delete(options.generation);
+      },
+    }),
+  }));
+  try {
+    const store = new SnapshotStore(app, 'offline-test', 60);
+    await assert.rejects(store.removeRetiredUpload(objectName), /Generation delete failed/);
+    assert.equal(barrier, true);
+    assert.deepEqual([...content], ['8']);
+    await store.removeRetiredUpload(objectName);
+    await store.removeRetiredUpload(objectName);
+    assert.equal(content.size, 0);
+    assert.equal(barrier, true);
+  } finally { await deleteApp(app); }
+});

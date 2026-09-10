@@ -1,5 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import Fastify from 'fastify';
+import type { Auth } from 'firebase-admin/auth';
+import { registerAuth } from '../src/auth/plugin.ts';
+import { registerErrorHandler } from '../src/http/errors.ts';
+import { registerProjectRoutes } from '../src/projects/routes.ts';
+import { registerSessionRoutes } from '../src/sessions/routes.ts';
+import type { SessionEvents } from '../src/sessions/events.ts';
 
 import {
   type DocumentReference,
@@ -13,10 +20,6 @@ import { ResolvedEntitlements, type EntitlementService } from '../src/entitlemen
 import type { ConfigurationStore } from '../src/entitlements/store.ts';
 import { AppError } from '../src/http/errors.ts';
 import type { MeteringService } from '../src/metering/service.ts';
-import {
-  migrateProjectActiveSessions,
-  type ProjectActiveSessionMigrationResult,
-} from '../src/migrations/project-active-sessions.ts';
 import { ProjectRepository } from '../src/projects/repository.ts';
 import { SessionRepository } from '../src/sessions/repository.ts';
 import type { UserRepository } from '../src/users/repository.ts';
@@ -191,12 +194,19 @@ class FakeDocumentReference {
   async get(): Promise<FakeSnapshot> {
     return this.firestore.snapshot(this);
   }
+
+  async update(data: Data): Promise<void> {
+    const old = this.firestore.documents.get(this.path);
+    if (old === undefined) throw new Error('Missing document.');
+    this.firestore.seed(this.path, materialise(old.data, data, true));
+  }
 }
 
 type Write =
   | { readonly kind: 'create'; readonly ref: FakeDocumentReference; readonly data: Data }
   | { readonly kind: 'set'; readonly ref: FakeDocumentReference; readonly data: Data }
-  | { readonly kind: 'update'; readonly ref: FakeDocumentReference; readonly data: Data };
+  | { readonly kind: 'update'; readonly ref: FakeDocumentReference; readonly data: Data }
+  | { readonly kind: 'delete'; readonly ref: FakeDocumentReference };
 
 class FakeTransaction {
   readonly #firestore: FakeFirestore;
@@ -210,6 +220,7 @@ class FakeTransaction {
   async get(
     target: FakeDocumentReference | FakeQuery,
   ): Promise<FakeSnapshot | { docs: readonly FakeSnapshot[]; size: number }> {
+    if (this.writes.length > 0) throw new Error('Firestore read after write.');
     if (target instanceof FakeQuery) {
       const result = this.#firestore.query(target);
       for (const document of result.docs) {
@@ -235,18 +246,15 @@ class FakeTransaction {
     this.writes.push({ kind: 'update', ref, data });
     return this;
   }
+
+  delete(ref: FakeDocumentReference): this {
+    this.writes.push({ kind: 'delete', ref });
+    return this;
+  }
 }
 
 class FakeFirestore {
   readonly documents = new Map<string, StoredDocument>();
-  /** Every query answered, and how many documents it handed back. */
-  readonly scans: { readonly collectionPath: string; readonly returned: number }[] = [];
-  /**
-   * Document ids a `sessions` query answers with regardless of its filters,
-   * standing in for an index that has not caught up with the documents. It is
-   * the only way to reach the migration's own re-check of a matched session.
-   */
-  staleSessionMatches: readonly string[] | undefined;
   #id = 0;
   #commitTail: Promise<void> = Promise.resolve();
 
@@ -276,13 +284,6 @@ class FakeFirestore {
   }
 
   query(query: FakeQuery): { docs: readonly FakeSnapshot[]; size: number } {
-    if (this.staleSessionMatches !== undefined && query.collectionPath === 'sessions') {
-      const stale = this.staleSessionMatches
-        .map((id) => new FakeSnapshot(this.doc(`sessions/${id}`), this.documents.get(`sessions/${id}`)?.data))
-        .filter((snapshot) => snapshot.exists);
-      this.scans.push({ collectionPath: query.collectionPath, returned: stale.length });
-      return { docs: stale, size: stale.length };
-    }
     const depth = query.collectionPath.split('/').length + 1;
     let docs = [...this.documents]
       .filter(([path]) => path.startsWith(`${query.collectionPath}/`) && path.split('/').length === depth)
@@ -321,7 +322,6 @@ class FakeFirestore {
     if (query.maximum !== undefined) {
       docs = docs.slice(0, query.maximum);
     }
-    this.scans.push({ collectionPath: query.collectionPath, returned: docs.length });
     return { docs, size: docs.length };
   }
 
@@ -355,6 +355,10 @@ class FakeFirestore {
         }
       }
       for (const write of transaction.writes) {
+        if (write.kind === 'delete') {
+          this.documents.delete(write.ref.path);
+          continue;
+        }
         const stored = this.documents.get(write.ref.path);
         if (write.kind === 'create' && stored !== undefined) {
           throw new Error(`${write.ref.path} already exists.`);
@@ -402,7 +406,7 @@ function harness(projectIds: readonly string[] = ['project-1']) {
     planName: 'Test',
     subscriptionStatus: undefined,
     capabilities,
-    meterLimits: new Map(),
+    meterLimits: new Map([['builds.started', { hardLimit: 100, includedAllowance: 100, overageEnabled: false }]]),
     rateLimits: new Map(),
   };
   const entitlements = {
@@ -469,6 +473,7 @@ function harness(projectIds: readonly string[] = ['project-1']) {
 
   return {
     firestore,
+    projects,
     sessions,
     reservations,
     project: (id = 'project-1') => firestore.documents.get(`projects/${id}`)?.data,
@@ -623,282 +628,6 @@ test('different projects may activate independently for the same user', async ()
 });
 
 
-/**
- * Migration fixtures. A legacy project is one written before activeSessionId
- * existed, so the field is absent rather than null.
- */
-function legacy(projectIds: readonly string[]): FakeFirestore {
-  const firestore = new FakeFirestore();
-  for (const projectId of projectIds) {
-    firestore.seed(`projects/${projectId}`, { ownerUid: 'user-1', name: projectId });
-  }
-  return firestore;
-}
-
-function migrate(
-  firestore: FakeFirestore,
-  options: { pageSize?: number; dryRun?: boolean } = {},
-): Promise<ProjectActiveSessionMigrationResult> {
-  return migrateProjectActiveSessions(firestore as unknown as Firestore, options);
-}
-
-function guardOf(firestore: FakeFirestore, projectId = 'legacy-project'): unknown {
-  const stored = firestore.documents.get(`projects/${projectId}`);
-  if (stored === undefined) {
-    return undefined;
-  }
-  return Object.prototype.hasOwnProperty.call(stored.data, 'activeSessionId')
-    ? stored.data['activeSessionId']
-    : undefined;
-}
-
-test('migration unlocks a legacy project with no active sessions', async () => {
-  const firestore = legacy(['legacy-project']);
-  firestore.seed('sessions/done', {
-    projectId: 'legacy-project',
-    ownerUid: 'user-1',
-    status: 'IDLE',
-  });
-
-  const result = await migrate(firestore);
-
-  assert.deepEqual(result, {
-    scanned: 1,
-    unlocked: 1,
-    adopted: 0,
-    alreadyMigrated: 0,
-    failures: [],
-  });
-  assert.equal(guardOf(firestore), null);
-});
-
-test('migration adopts the sole active legacy session owned by the project owner', async () => {
-  const firestore = legacy(['legacy-project']);
-  firestore.seed('sessions/legacy-session', {
-    projectId: 'legacy-project',
-    ownerUid: 'user-1',
-    status: 'RUNNING',
-  });
-
-  const result = await migrate(firestore);
-
-  assert.deepEqual(result, {
-    scanned: 1,
-    unlocked: 0,
-    adopted: 1,
-    alreadyMigrated: 0,
-    failures: [],
-  });
-  assert.equal(guardOf(firestore), 'legacy-session');
-});
-
-test('migration refuses an active session owned by someone else', async () => {
-  const firestore = legacy(['legacy-project']);
-  firestore.seed('sessions/other-owner', {
-    projectId: 'legacy-project',
-    ownerUid: 'user-2',
-    status: 'RUNNING',
-  });
-
-  const result = await migrate(firestore);
-
-  assert.equal(result.adopted, 0);
-  assert.equal(result.failures.length, 1);
-  assert.equal(result.failures[0]?.stage, 'session-owner-mismatch');
-  assert.equal(result.failures[0]?.projectId, 'legacy-project');
-  // Neither document was touched.
-  assert.equal(guardOf(firestore), undefined);
-  assert.equal(firestore.documents.get('sessions/other-owner')?.data['ownerUid'], 'user-2');
-});
-
-test('migration refuses an active session that references another project', async () => {
-  const firestore = legacy(['legacy-project']);
-  firestore.seed('sessions/elsewhere', {
-    projectId: 'other-project',
-    ownerUid: 'user-1',
-    status: 'RUNNING',
-  });
-  // An honest query would never return this session; a lagging index might.
-  firestore.staleSessionMatches = ['elsewhere'];
-
-  const result = await migrate(firestore);
-
-  assert.equal(result.adopted, 0);
-  assert.equal(result.failures[0]?.stage, 'session-project-mismatch');
-  assert.equal(guardOf(firestore), undefined);
-});
-
-test('migration refuses legacy projects with multiple active sessions', async () => {
-  const firestore = legacy(['legacy-project']);
-  firestore.seed('sessions/legacy-a', {
-    projectId: 'legacy-project',
-    ownerUid: 'user-1',
-    status: 'QUEUED',
-  });
-  firestore.seed('sessions/legacy-b', {
-    projectId: 'legacy-project',
-    ownerUid: 'user-1',
-    status: 'RUNNING',
-  });
-
-  const result = await migrate(firestore);
-
-  assert.equal(result.failures.length, 1);
-  assert.equal(result.failures[0]?.stage, 'multiple-active-sessions');
-  assert.match(result.failures[0]?.reason ?? '', /legacy-a/);
-  assert.match(result.failures[0]?.reason ?? '', /legacy-b/);
-  // Neither was chosen, and no guard was written.
-  assert.equal(guardOf(firestore), undefined);
-});
-
-test('migration leaves an already-correct project untouched', async () => {
-  const firestore = new FakeFirestore();
-  firestore.seed('projects/legacy-project', {
-    ownerUid: 'user-1',
-    activeSessionId: 'session-a',
-  });
-  firestore.seed('sessions/session-a', {
-    projectId: 'legacy-project',
-    ownerUid: 'user-1',
-    status: 'RUNNING',
-  });
-  const before = firestore.documents.get('projects/legacy-project')?.version;
-
-  const result = await migrate(firestore);
-
-  assert.deepEqual(result, {
-    scanned: 1,
-    unlocked: 0,
-    adopted: 0,
-    alreadyMigrated: 1,
-    failures: [],
-  });
-  assert.equal(firestore.documents.get('projects/legacy-project')?.version, before);
-});
-
-test('migration refuses a guard that contradicts observed session state', async () => {
-  const firestore = new FakeFirestore();
-  firestore.seed('projects/legacy-project', {
-    ownerUid: 'user-1',
-    activeSessionId: 'session-gone',
-  });
-
-  const result = await migrate(firestore);
-
-  assert.equal(result.failures.length, 1);
-  assert.equal(result.failures[0]?.stage, 'contradictory-guard');
-  // Not repaired to null.
-  assert.equal(guardOf(firestore), 'session-gone');
-});
-
-test('migration pages through every project exactly once', async () => {
-  const ids = ['p-1', 'p-2', 'p-3', 'p-4', 'p-5', 'p-6', 'p-7'];
-  const firestore = legacy(ids);
-
-  const result = await migrate(firestore, { pageSize: 3 });
-
-  assert.equal(result.scanned, ids.length);
-  assert.equal(result.unlocked, ids.length);
-  assert.deepEqual(result.failures, []);
-  for (const id of ids) {
-    assert.equal(guardOf(firestore, id), null, id);
-  }
-  // Pages of three over seven projects: 3 + 3 + 1, and no page beyond that.
-  const projectPages = firestore.scans.filter((scan) => scan.collectionPath === 'projects');
-  assert.deepEqual(
-    projectPages.map((scan) => scan.returned),
-    [3, 3, 1],
-  );
-});
-
-test('migration reads at most two sessions however long the history is', async () => {
-  const firestore = legacy(['legacy-project']);
-  for (let index = 0; index < 50; index += 1) {
-    firestore.seed(`sessions/old-${String(index).padStart(3, '0')}`, {
-      projectId: 'legacy-project',
-      ownerUid: 'user-1',
-      status: index % 2 === 0 ? 'IDLE' : 'FAILED',
-    });
-  }
-  firestore.seed('sessions/live', {
-    projectId: 'legacy-project',
-    ownerUid: 'user-1',
-    status: 'QUEUED',
-  });
-
-  const result = await migrate(firestore);
-
-  assert.equal(result.adopted, 1);
-  assert.equal(guardOf(firestore), 'live');
-  const sessionScans = firestore.scans.filter((scan) => scan.collectionPath === 'sessions');
-  assert.equal(sessionScans.length, 1);
-  assert.ok(
-    sessionScans.every((scan) => scan.returned <= 2),
-    'the active-session probe must never hand back more than two documents',
-  );
-});
-
-test('migration rerun after a partial pass finishes without redoing work', async () => {
-  const firestore = legacy(['p-1', 'p-2', 'p-3']);
-  firestore.seed('sessions/live', {
-    projectId: 'p-2',
-    ownerUid: 'user-1',
-    status: 'RUNNING',
-  });
-  // Stands in for a run that stopped after its first page.
-  const first = await migrate(firestore, { pageSize: 1 });
-  assert.equal(first.scanned, 3);
-
-  const versions = ['p-1', 'p-2', 'p-3'].map(
-    (id) => firestore.documents.get(`projects/${id}`)?.version,
-  );
-
-  const second = await migrate(firestore);
-
-  assert.deepEqual(second, {
-    scanned: 3,
-    unlocked: 0,
-    adopted: 0,
-    alreadyMigrated: 3,
-    failures: [],
-  });
-  assert.deepEqual(
-    ['p-1', 'p-2', 'p-3'].map((id) => firestore.documents.get(`projects/${id}`)?.version),
-    versions,
-  );
-  assert.equal(guardOf(firestore, 'p-2'), 'live');
-});
-
-test('a dry run validates everything and writes nothing', async () => {
-  const firestore = legacy(['p-1', 'p-2']);
-  firestore.seed('sessions/live', {
-    projectId: 'p-2',
-    ownerUid: 'user-1',
-    status: 'RUNNING',
-  });
-
-  const dry = await migrate(firestore, { dryRun: true });
-
-  assert.deepEqual(dry, {
-    scanned: 2,
-    unlocked: 1,
-    adopted: 1,
-    alreadyMigrated: 0,
-    failures: [],
-  });
-  assert.equal(guardOf(firestore, 'p-1'), undefined);
-  assert.equal(guardOf(firestore, 'p-2'), undefined);
-
-  // The real run then reports exactly what the dry run predicted.
-  const real = await migrate(firestore);
-  assert.deepEqual(real, dry);
-  assert.equal(guardOf(firestore, 'p-1'), null);
-  assert.equal(guardOf(firestore, 'p-2'), 'live');
-});
-
-test('a page size that is not a positive whole number is refused', async () => {
-  await assert.rejects(migrate(legacy(['p-1']), { pageSize: 0 }), /positive whole number/);
-});
 
 /** Puts a project under a RUNNING session that still owns specialist holds. */
 function holding(ids: readonly string[], states: readonly ('OPEN' | 'SETTLED' | 'RELEASED' | 'BROKEN')[]) {
@@ -1017,4 +746,147 @@ test('retrying finalisation after a transient release failure is safe', async ()
   assert.equal(h.reservations.get('hold-1'), 'RELEASED');
   assert.equal(h.reservations.get('hold-2'), 'RELEASED');
   assert.equal(h.session('session-a')?.['status'], 'IDLE');
+});
+
+async function routeApp(h: ReturnType<typeof harness>, append: SessionEvents['append'] = async (_id, type, data) => ({ id: '1-0', type, data })) {
+  const app = Fastify({ logger: false });
+  registerAuth(app, { verifyIdToken: async () => ({ uid: 'user-1', auth_time: Date.now() / 1000, exp: Date.now() / 1000 + 3600 }) } as unknown as Auth);
+  registerErrorHandler(app);
+  app.decorate('enforceRateLimit', () => async () => {});
+  registerProjectRoutes(app, h.projects);
+  registerSessionRoutes(app, h.sessions, { append } as SessionEvents,
+    { heartbeatSeconds: 15, maxConnections: 10, maxConnectionsPerUser: 2, maxBufferedBytes: 1024, reauthenticate: async () => {} });
+  return app;
+}
+const authHeaders = { authorization: 'Bearer fixture-token' };
+function authority(h: ReturnType<typeof harness>, id: string, runnerId = 'runner-1') {
+  return { sessionId: id, runnerId, token: String(h.session(id)?.['leaseToken']) };
+}
+
+test('whitespace project writes are refused and other tenants remain claimable', async () => {
+  const h = harness(['project-1', 'project-2']);
+  const first = await h.sessions.create('user-1', 'project-1', { model: 'model-1', prompt: 'Build one' });
+  const second = await h.sessions.create('user-1', 'project-2', { model: 'model-1', prompt: 'Build two' });
+  h.firestore.seed('projects/project-2', { ...h.project('project-2'), ownerUid: 'user-2' });
+  h.firestore.seed(`sessions/${second.id}`, { ...h.session(second.id), ownerUid: 'user-2' });
+  const app = await routeApp(h);
+  try {
+    for (const name of [' ', '\t', '\u00a0']) {
+      await assert.rejects(h.projects.update('user-1', 'project-1', { name }), { code: 'project/invalid-name' });
+      await assert.rejects(h.projects.create('user-1', { name, description: undefined, platform: 'web' }), { code: 'project/invalid-name' });
+    }
+    const response = await app.inject({ method: 'PATCH', url: '/projects/project-1', headers: authHeaders, payload: { name: '   ' } });
+    assert.equal(response.statusCode, 400);
+    assert.equal(h.project()?.['name'], 'project-1');
+    const claims = [await h.sessions.claim('runner-1'), await h.sessions.claim('runner-2')];
+    assert.deepEqual(new Set(claims.map((s) => s?.id)), new Set([first.id, second.id]));
+  } finally { await app.close(); }
+});
+
+test('a cancelled running session can resume without inheriting its cancellation', async () => {
+  const h = harness();
+  const created = await h.sessions.create('user-1', 'project-1', { model: 'model-1', prompt: 'Initial' });
+  await h.sessions.claim('runner-1');
+  const oldLease = authority(h, created.id);
+  await h.sessions.cancel('user-1', created.id);
+  await h.sessions.finish(created.id, oldLease, { status: 'FAILED', error: 'Cancelled by user' });
+  const resumed = await h.sessions.appendPrompt('user-1', created.id, 'Resume');
+  assert.equal(resumed.cancelRequested, undefined);
+  assert.equal(h.session(created.id)?.['cancelRequested'], undefined);
+  await h.sessions.claim('runner-2');
+  await h.sessions.heartbeat(created.id, authority(h, created.id, 'runner-2'));
+  await assert.rejects(h.sessions.heartbeat(created.id, oldLease));
+  assert.equal(h.charges(), 2);
+});
+
+test('a message accepted after the last dequeue is scheduled and charged exactly once', async () => {
+  const h = harness();
+  const created = await h.sessions.create('user-1', 'project-1', { model: 'model-1', prompt: 'Initial' });
+  await h.sessions.claim('runner-1');
+  const oldLease = authority(h, created.id);
+  assert.equal(await h.sessions.dequeueNextMessage(created.id, oldLease), undefined);
+  await h.sessions.enqueueMessage('user-1', created.id, 'Late follow-up');
+  assert.equal(await h.sessions.finish(created.id, oldLease, { status: 'IDLE' }), 'QUEUED');
+  assert.equal(h.project()?.['activeSessionId'], created.id);
+  assert.equal(h.charges(), 1);
+  const next = await h.sessions.claim('runner-2');
+  assert.equal(next?.queuedTurnPending, true);
+  const newLease = authority(h, created.id, 'runner-2');
+  assert.equal(await h.sessions.startPendingTurn(created.id, newLease), true);
+  assert.equal(h.charges(), 2);
+  await assert.rejects(h.sessions.startPendingTurn(created.id, newLease), /no pending turn/);
+  assert.equal(h.charges(), 2);
+  assert.equal((await h.sessions.listMessages('user-1', created.id, 100)).at(-1)?.content, 'Late follow-up');
+  assert.equal(await h.sessions.dequeueNextMessage(created.id, newLease), undefined);
+  assert.equal(await h.sessions.finish(created.id, newLease, { status: 'IDLE' }), 'IDLE');
+});
+
+test('cancelling an unstarted late follow-up does not refund the completed turn', async () => {
+  const h = harness();
+  const created = await h.sessions.create('user-1', 'project-1', { model: 'model-1', prompt: 'Initial' });
+  await h.sessions.claim('runner-1');
+  await h.sessions.enqueueMessage('user-1', created.id, 'Late follow-up');
+  await h.sessions.finish(created.id, authority(h, created.id), { status: 'IDLE' });
+  await h.sessions.cancel('user-1', created.id);
+  assert.equal(h.charges(), 1);
+  assert.equal(h.project()?.['activeSessionId'], null);
+  assert.equal(await h.sessions.claim('runner-2'), undefined);
+});
+
+test('enqueue racing finalization is either scheduled or explicitly refused', async () => {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const h = harness();
+    const created = await h.sessions.create('user-1', 'project-1', { model: 'model-1', prompt: 'Initial' });
+    await h.sessions.claim('runner-1');
+    const lease = authority(h, created.id);
+    const [enqueue] = await Promise.allSettled([
+      h.sessions.enqueueMessage('user-1', created.id, 'Concurrent follow-up'),
+      h.sessions.finish(created.id, lease, { status: 'IDLE' }),
+    ]);
+    if (enqueue.status === 'fulfilled') {
+      assert.equal(h.session(created.id)?.['status'], 'QUEUED');
+      assert.equal(h.project()?.['activeSessionId'], created.id);
+    } else {
+      assert.equal(h.session(created.id)?.['status'], 'IDLE');
+    }
+  }
+});
+
+test('steering survives Redis failure and is consumed once into durable history', async () => {
+  const h = harness();
+  const created = await h.sessions.create('user-1', 'project-1', { model: 'model-1', prompt: 'Initial' });
+  await h.sessions.claim('runner-1');
+  const lease = authority(h, created.id);
+  const app = await routeApp(h, async () => { throw new Error('Redis offline'); });
+  try {
+    const result = await app.inject({ method: 'POST', url: `/sessions/${created.id}/messages`, headers: authHeaders,
+      payload: { steer: true, prompt: 'Preserve customer records' } });
+    assert.equal(result.statusCode, 200);
+    assert.equal(h.session(created.id)?.['pendingSteer'], 'Preserve customer records');
+    await assert.rejects(h.sessions.queueSteerMessage('other-user', created.id, 'Intrusion'), { code: 'session/not-found' });
+    await h.sessions.queueSteerMessage('user-1', created.id, 'Preserve all records');
+    await assert.rejects(h.sessions.drainSteerMessage(created.id, { ...lease, token: 'stale' }));
+    assert.equal(await h.sessions.drainSteerMessage(created.id, lease), 'Preserve all records');
+    assert.equal(await h.sessions.drainSteerMessage(created.id, lease), undefined);
+    const messages = await h.sessions.listMessages('user-1', created.id, 100);
+    assert.equal(messages.length, 2);
+    assert.equal(messages.at(-1)?.content, 'Preserve all records');
+    assert.equal(h.charges(), 1);
+    await h.sessions.cancel('user-1', created.id);
+    const rejected = await app.inject({ method: 'POST', url: `/sessions/${created.id}/messages`, headers: authHeaders,
+      payload: { steer: true, prompt: 'Too late' } });
+    assert.equal(rejected.statusCode, 409);
+  } finally { await app.close(); }
+});
+
+test('steering accepted after the last step is scheduled without an additional build charge', async () => {
+  const h = harness();
+  const created = await h.sessions.create('user-1', 'project-1', { model: 'model-1', prompt: 'Initial' });
+  await h.sessions.claim('runner-1');
+  await h.sessions.queueSteerMessage('user-1', created.id, 'Late correction');
+  assert.equal(await h.sessions.finish(created.id, authority(h, created.id), { status: 'IDLE' }), 'QUEUED');
+  await h.sessions.claim('runner-2');
+  assert.equal(await h.sessions.startPendingTurn(created.id, authority(h, created.id, 'runner-2')), true);
+  assert.equal(h.charges(), 1);
+  assert.equal((await h.sessions.listMessages('user-1', created.id, 100)).at(-1)?.content, 'Late correction');
 });

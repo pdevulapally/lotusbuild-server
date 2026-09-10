@@ -172,6 +172,7 @@ export class ProjectRepository {
    * a customer pays for is bypassed by the simplest possible retry.
    */
   async create(ownerUid: string, input: NewProject): Promise<Project> {
+    this.#validateName(input.name);
     const entitlements = await this.#entitlements.forUser(ownerUid);
 
     // The capability key is derived from the requested platform, so supporting a
@@ -238,6 +239,7 @@ export class ProjectRepository {
    * Updates an existing project's name and/or description.
    */
   async update(ownerUid: string, projectId: string, input: UpdateProject): Promise<Project> {
+    if (input.name !== undefined) this.#validateName(input.name);
     const existing = await this.readOwned(ownerUid, projectId);
     if (input.name === undefined && input.description === undefined) {
       return existing;
@@ -267,6 +269,13 @@ export class ProjectRepository {
             : input.description
           : existing.description,
     };
+  }
+
+  #validateName(name: string): void {
+    if (name.trim() === '') {
+      throw new AppError({ code: 'project/invalid-name', statusCode: 400,
+        message: 'Project name must contain a non-whitespace character.' });
+    }
   }
 
   async setPublicPreview(ownerUid: string, projectId: string, enabled: boolean): Promise<{ enabled: boolean; terminationPending: boolean }> {

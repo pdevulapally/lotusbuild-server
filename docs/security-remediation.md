@@ -57,6 +57,61 @@ These rows map the original audit IDs to code changes, not to production certifi
 | O04 | Private provider ingress by default; owner-only public opt-in; cancellation on revocation | Private browser preview integration, outbound traffic and actual ingress/termination behavior |
 | O05, L01 | Generic internal errors and fail-closed disjoint allowlists | Local regression coverage |
 
+## AI instruction and network hardening — 10 September 2026
+
+One instruction/data policy now covers primary and specialist agents. Project metadata no longer enters system instructions. The primary receives JSON-encoded task metadata; specialists receive only their review task and suggested paths. Existing tool grants enforce specialist permissions independently of model behaviour. This reduces injection exposure; it does not make a model jailbreak-proof.
+
+Local verification for this change: typecheck and production build passed; the full suite reported 381 tests, 379 passed, 2 platform-dependent skips, zero failures. The 13 new cases cover prompt boundaries, adversarial tool use, plan policy selection, malformed policies and provider network handoff/failure. No live model or provider was contacted by these tests.
+
+Every existing `plans/{key}` document must explicitly contain `sandboxNetwork` before deployment:
+
+| Plan | Required field value |
+| --- | --- |
+| Free | `{"mode":"unrestricted"}` |
+| Pro | `{"mode":"unrestricted"}` |
+| Business | `{"mode":"restricted","allowedDomains":[]}` with approved exact DNS names populated before enabling required external services |
+
+The Business seed deliberately denies outbound internet until approved domains are configured. This blocks package downloads and sandbox snapshot transfers unless their actual destination hosts are approved. No domains are inferred or silently added. Names must be unique, lowercase and exact; URLs, IP addresses, wildcards and malformed entries are rejected. This checkout has no separate Teams plan or organisation-admin policy editor; this change uses operator-owned plan configuration.
+
+Patch only this field in live plans, then run the existing read-only preflight. Missing policy fails configuration loading. Do not rerun the full seed over live plans, as it overwrites unrelated settings. No production configuration was changed in this work.
+
+E2B receives network policy at VM creation, independently of public-preview ingress. Validation applies the selected policy to the source before forking and the child before use; failed child policy application triggers termination. Verify the deployed provider preserves containment during fork startup, including resumed background processes. Policy changes apply on sandbox acquisition/validation acquisition, not as instantaneous billing-webhook revocation of existing VMs. Stop and recreate active sessions when immediate changes are required.
+
+Free/Pro unrestricted access is the operator's requested product choice and retains outbound exfiltration risk if an injection succeeds. Domain filtering controls destinations, not content: an approved shared host may accept uploads or serve hostile content. The primary retains shell access inside its VM; file-tool confinement is not an OS jail for arbitrary commands. Verify template isolation, credentials, real egress including DNS/IPv6/redirects, and live-model adversarial cases before asserting production containment. Offline tests verify prompt placement, tool denial, plan parsing and SDK requests, not those provider/model guarantees.
+
+### UK/EU legal boundary
+
+These changes support risk-appropriate security and data protection by design; they are not compliance certification. EU GDPR Articles 5, 25 and 32 require assessment of actual processing and appropriate measures. ICO AI guidance likewise addresses security and minimisation and is under review following the Data (Use and Access) Act. Neither source mandates this subscription-tier network split. [EU GDPR](https://eur-lex.europa.eu/eli/reg/2016/679/2016-05-04), [ICO AI security and minimisation](https://ico.org.uk/for-organisations/uk-gdpr-guidance-and-resources/artificial-intelligence/guidance-on-ai-and-data-protection/how-should-we-assess-security-and-data-minimisation-in-ai/).
+
+Complete the existing privacy assessments below: actual controller/processor roles, lawful bases, retention, vendor contracts/locations/transfers and any required DPIA. An approved destination does not establish a lawful international transfer. Assess EU AI Act Article 50 transparency against the product, roles and applicable dates; a backend instruction to identify as AI does not prove UI disclosure or output-marking compliance. The Commission's current guidance addresses obligations applying from 2 August 2026 and applicable transitional provisions. [Commission Article 50 guidance](https://digital-strategy.ec.europa.eu/en/policies/guidelines-ai-transparency-obligations).
+
+## CI/CD review — 10 September 2026
+
+This review covers `.github/workflows/ci.yml`, `deploy.sh` and the checked-in service definitions. The two high-risk build/credential findings have been fixed in the working tree. These changes have not been deployed; container packaging remains separate from SSH/systemd deployment.
+
+| Severity | Finding | Correction required |
+| --- | --- | --- |
+| High — fixed in code | Dependency lifecycle code could remain in the deployment runner until its SSH key arrived. | Build/test/package in the check job without production secrets. A fresh hosted deploy runner downloads that same run's immutable artifact by ID and runs no npm commands, build tools, tests or application imports. |
+| High — fixed in code | VPS dependency installation and compilation could read the live production credentials through the deployment OS identity. | Both operations have been removed from `deploy.sh`. The VPS checks the checksum, revision, archive boundaries and runtime compatibility, then loads credentials only for runtime preflight and service startup. There is no on-server build fallback. |
+| Medium — fixed in code | Inherited token permissions, persisted checkout credentials and movable action references. | Added `contents: read`, disabled persisted checkout credentials and pinned all four actions to commits verified against their official GitHub repositories. |
+| Medium | The secret-content scan prints matching lines into CI logs, excludes all workflow files and treats a failed scan like no match. | Use redacted results, cover workflow content, distinguish scanner errors from clean results, and use a maintained scanner with reviewable updates. Existing signatures are not comprehensive secret detection. |
+
+Positive controls: deployment is limited to pushes on master, depends on checks, uses a production environment, serialises deployment, pins the SSH host key, and performs candidate preflight plus health/rollback handling. Environment review requirements, branch protection, organisation action policies, actual host identity separation and deployed service-unit hardening cannot be established from these files alone.
+
+### Release promotion and remaining verification
+
+The check job installs from the lockfile with lifecycle scripts disabled, runs the existing typecheck/build/tests and the release validator tests, installs production dependencies into a fresh directory, and smoke-imports the direct dependencies without application startup. Packaging and validation run on pull requests too; only a successful master push uploads a deployment artifact. The payload allowlist contains `dist`, `node_modules`, package manifests, a runtime/revision manifest and the existing atomic exchange helper. It excludes source, tests, workflows and runtime credentials.
+
+The deploy job uses the artifact ID and SHA-256 from its own check job; it never discovers an artifact by a mutable latest name or another workflow. The trusted checkout supplies the unpacker, rather than executing an unpacker from the artifact. Validation rejects checksum/revision mismatches, links, traversal, unexpected roots, duplicate entries and incompatible runtime metadata before writing payload files. Existing candidate content is protected. The server must have the same Linux architecture, Node major and Node ABI as the builder, and a glibc version at least as new. A mismatch stops promotion before credential copying or cutover. Other OS/library compatibility still needs a Linux staging rehearsal.
+
+Manual invocation now requires the CI archive, its expected checksum from the successful check job, and the matching commit: `bash deploy.sh RELEASE_TAR SHA256 COMMIT_SHA`. Run it from the trusted checkout of that commit with the existing `DEPLOY_HOST` configuration. A bare invocation fails rather than building locally. Preserve the existing production-environment review gate when retrieving or promoting releases.
+
+Build execution is now outside the production credential boundary. The deploy and runtime identities on the host have not been reconfigured. Runtime dependencies necessarily execute during preflight/startup and may read runtime credentials; artifact checksums and job separation do not prove dependency code benign or protect against a compromised approved source commit. Review and dependency provenance remain necessary. Failed candidates and previous releases retain the existing manual cleanup policy.
+
+Local verification: all 13 release/credential-boundary tests, typecheck, source build and Bash syntax checks passed. The full application suite passed 379 tests with 2 platform skips and no failures. A fresh locked production install with lifecycle scripts disabled succeeded, and all 10 direct dependencies imported successfully; this smoke check ran on local Windows/Node 24, while CI uses Linux/Node 22. GitHub Actions execution, Linux artifact deployment, Docker execution and live cutover/rollback remain unverified. A read-only SSH query for Node/CPU/glibc could not authenticate, so production runtime compatibility is unknown and must be checked before promotion. No production changes were made.
+
+The new [container build](containers.md) uses a pinned Node image, lockfile installs without dependency lifecycle scripts, an allowlisted context and a non-root production runtime. It is ready for a Docker-capable environment to build and test; it has not been built here and is not wired into the production workflow. Reuse this image for artifact promotion when undertaking the deployment migration. [GitHub workflow security guidance](https://docs.github.com/en/actions/reference/security/secure-use), [Docker build guidance](https://docs.docker.com/build/building/best-practices/).
+
 ## Handoff documents and launch blockers
 
 - [Staging checks](staging-security-checklist.md): required configuration, IAM/rules/indexes, provider tests and deployment rehearsal.

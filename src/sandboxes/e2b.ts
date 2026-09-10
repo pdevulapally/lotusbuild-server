@@ -1,9 +1,16 @@
 import { projectFilesScript } from './project-files.ts';
-import { CommandExitError, Sandbox } from 'e2b';
+import { ALL_TRAFFIC, CommandExitError, Sandbox } from 'e2b';
 
-import type { SandboxProvider } from '../entitlements/schema.ts';
+import { parseSandboxNetwork, type SandboxNetworkPolicy, type SandboxProvider } from '../entitlements/schema.ts';
 import type { CommandOutcome, RunningSandbox, SandboxAdapter } from './provider.ts';
 import { outputLimiter, readBoundedText, readTextWindow } from './bounded-output.ts';
+
+function networkRules(policy: SandboxNetworkPolicy) {
+  const checked = parseSandboxNetwork(policy, 'sandbox network');
+  return checked.mode === 'restricted'
+    ? { denyOut: [ALL_TRAFFIC], allowOut: [...checked.allowedDomains] }
+    : { denyOut: [], allowOut: [ALL_TRAFFIC] };
+}
 
 /**
  * E2B's microVMs.
@@ -49,7 +56,8 @@ export class E2BAdapter implements SandboxAdapter {
 
   async start(
     provider: SandboxProvider,
-    context: { readonly metadata: Readonly<Record<string, string>>; readonly publicPreviewEnabled?: boolean },
+    context: { readonly metadata: Readonly<Record<string, string>>; readonly publicPreviewEnabled?: boolean;
+      readonly networkPolicy: SandboxNetworkPolicy },
   ): Promise<RunningSandbox> {
     const sandbox = await Sandbox.create(provider.template, {
       ...this.#connection(),
@@ -58,7 +66,7 @@ export class E2BAdapter implements SandboxAdapter {
       timeoutMs: provider.timeoutSeconds * 1000,
       metadata: { ...context.metadata },
       secure: true,
-      network: { allowPublicTraffic: context.publicPreviewEnabled === true },
+      network: { ...networkRules(context.networkPolicy), allowPublicTraffic: context.publicPreviewEnabled === true },
     });
 
     // The template decides what exists on disk and the registry decides where we
@@ -187,11 +195,22 @@ class E2BSandbox implements RunningSandbox {
     return readTextWindow(stream, offset, limit);
   }
 
-  async forkForValidation(timeoutMs: number): Promise<RunningSandbox> {
+  async forkForValidation(timeoutMs: number, networkPolicy: SandboxNetworkPolicy): Promise<RunningSandbox> {
+    const rules = networkRules(networkPolicy);
+    // Apply current plan restrictions before copying running processes. The
+    // provider must preserve network containment across the fork; verify this
+    // with the deployed provider as well as setting the child's policy below.
+    await this.#sandbox.updateNetwork(rules);
     const results = await this.#sandbox.fork({ count: 1, timeoutMs });
     const fork = results[0];
     if (results.length !== 1 || fork === undefined) throw new Error('The provider returned no validation sandbox.');
     if (fork instanceof Error) throw fork;
+    try { await fork.updateNetwork(rules); }
+    catch (cause) {
+      try { await fork.kill(); }
+      catch (cleanup) { throw new AggregateError([cause, cleanup], 'Validation network policy and cleanup failed.'); }
+      throw cause;
+    }
     return new E2BSandbox(fork, this.#maxOutputBytes);
   }
 }

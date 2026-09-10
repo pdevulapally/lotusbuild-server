@@ -267,6 +267,7 @@ export function registerSessionRoutes(
 
       if (request.body.steer === true) {
         if (current.status === 'RUNNING') {
+          await sessions.queueSteerMessage(user.uid, current.id, prompt);
           publish(request.log, current.id, 'session.steer', { prompt });
           return reply.code(200).send({ steered: true, sessionId: current.id });
         }

@@ -148,11 +148,12 @@ export class EntitlementService {
       return cached.subscription;
     }
 
+    const fillToken = fresh ? undefined : await this.#cache.beginFill(uid);
     const path = `${subscriptionsCollectionPath}/${uid}`;
     const snapshot = await this.#firestore.doc(path).get();
     const subscription = snapshot.exists ? parseSubscription(snapshot.data() ?? {}, path) : null;
 
-    if (!fresh) await this.#cache.write(uid, subscription);
+    if (fillToken !== undefined) await this.#cache.write(uid, subscription, fillToken);
     return subscription;
   }
 

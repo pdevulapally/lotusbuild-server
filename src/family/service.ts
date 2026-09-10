@@ -47,6 +47,14 @@ export class FamilyService {
       const parentErasure = await tx.get(this.#db.doc(`accountErasures/${parentUid}`));
       const childErasure = await tx.get(this.#db.doc(`accountErasures/${child.uid}`));
       if (parentErasure.exists || childErasure.exists) throw denied();
+      // A revoked link may still be a discoverable erasure job. Replacing it
+      // before cleanup completes would orphan old data or erase the new link.
+      const previous = old.data();
+      if (previous?.['parentUid'] !== undefined) {
+        const previousParent = stringField(previous, 'parentUid', link.path);
+        const previousErasure = await tx.get(this.#db.doc(`accountErasures/${previousParent}`));
+        if (previousErasure.exists) throw denied();
+      }
       if ((childAccount.data()?.['projectCount'] ?? 0) !== 0 || childAccount.data()?.['stripeCustomerId'] !== undefined || priorParentDeclaration.exists) throw denied();
       const fields = invite.data() ?? {};
       if (fields['status'] !== 'PENDING' || fields['tokenHash'] !== createHash('sha256').update(token).digest('hex')

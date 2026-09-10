@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { Redis } from 'ioredis';
 
 import { redisKeyPrefixes } from '../redis/client.ts';
@@ -20,6 +21,15 @@ interface Wire {
   readonly currentPeriodStart: string;
   readonly currentPeriodEnd: string;
 }
+
+// The token lives in the cache key itself, so invalidation, expiry and Redis
+// loss all revoke it. Compare and replace atomically; never recreate a lost fill.
+const completeFill = `
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+return 1
+`;
+const fillPrefix = 'filling:';
 
 /**
  * Holds each user's subscription lookup for a short window.
@@ -47,7 +57,7 @@ export class SubscriptionCache {
 
   async read(uid: string): Promise<CachedSubscription | undefined> {
     const raw = await this.#redis.get(this.#key(uid));
-    if (raw === null) {
+    if (raw === null || raw.startsWith(fillPrefix)) {
       return undefined;
     }
     if (raw === 'none') {
@@ -88,7 +98,15 @@ export class SubscriptionCache {
     };
   }
 
-  async write(uid: string, subscription: Subscription | null): Promise<void> {
+  /** Acquire before reading Firestore. Other readers may read without filling. */
+  async beginFill(uid: string): Promise<string | undefined> {
+    const token = `${fillPrefix}${randomUUID()}`;
+    const result = await this.#redis.set(this.#key(uid), token, 'EX', this.#ttlSeconds, 'NX');
+    if (result !== 'OK' && result !== null) throw new Error('Unexpected subscription cache fill response.');
+    return result === 'OK' ? token : undefined;
+  }
+
+  async write(uid: string, subscription: Subscription | null, token: string): Promise<void> {
     const payload =
       subscription === null
         ? 'none'
@@ -99,7 +117,8 @@ export class SubscriptionCache {
             currentPeriodEnd: subscription.currentPeriodEnd.toISOString(),
           } satisfies Wire);
 
-    await this.#redis.set(this.#key(uid), payload, 'EX', this.#ttlSeconds);
+    const result = await this.#redis.eval(completeFill, 1, this.#key(uid), token, payload, this.#ttlSeconds);
+    if (result !== 0 && result !== 1) throw new Error('Unexpected subscription cache write response.');
   }
 
   /** Call when a subscription changes and the change must be visible at once. */

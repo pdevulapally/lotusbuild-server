@@ -63,3 +63,16 @@ test('child build requests need explicit parent approval and reuse one durable s
   await Promise.all(Array.from({ length: 3 }, () => family.decideBuild(user('parent'), 'child', 'p', request.requestId, true, sessions)));
   assert.equal(new Set(ids).size, 1);
 });
+
+test('a child cannot replace a revoked link while its previous parent erasure is pending', async () => {
+  const { db, data } = ledger();
+  const family = new FamilyService(db, 600);
+  const invitation = await family.invite(user('new-parent'), { adultConfirmed: true, parentalResponsibilityConfirmed: true });
+  data.set('familyLinks/child', { status: 'REVOKED', parentUid: 'old-parent' });
+  data.set('accountErasures/old-parent', { status: 'PENDING' });
+  await assert.rejects(family.accept(user('child'), 'new-parent', invitation.token), { code: 'family/access-denied' });
+  assert.equal(data.get('familyLinks/child')?.['parentUid'], 'old-parent');
+  data.set('familyLinks/child', { status: 'REVOKED' });
+  await family.accept(user('child'), 'new-parent', invitation.token);
+  assert.equal(data.get('familyLinks/child')?.['parentUid'], 'new-parent');
+});

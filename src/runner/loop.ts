@@ -141,9 +141,8 @@ export class SessionRunner {
     }, this.#deps.heartbeatSeconds * 1000);
 
     let unsubscribeCancel: (() => void) | undefined;
-    // The latest steer prompt queued by the user. Replaced atomically so
-    // the agent always sees the most recent instruction mid-turn.
-    let pendingSteer: string | undefined;
+    // Cancellation has an immediate Redis notification as well as durable state.
+    // Steering is consumed from Firestore before each model step.
 
     try {
       unsubscribeCancel = await events.subscribe(session.id, (event) => {
@@ -157,12 +156,6 @@ export class SessionRunner {
             }),
           );
           log.info({ sessionId: session.id }, 'received cancellation request for session');
-        } else if (event.type === 'session.steer') {
-          const prompt = (event.data as Record<string, unknown>)['prompt'];
-          if (typeof prompt === 'string' && prompt.length > 0) {
-            pendingSteer = prompt;
-            log.info({ sessionId: session.id }, 'received steer prompt for session');
-          }
         }
       });
     } catch (err) {
@@ -230,6 +223,12 @@ export class SessionRunner {
         });
         for (const id of session.specialistReservationIds) await sessions.forgetSpecialistReservation(session.id, authority, id);
         await sessions.detachSandbox(session.id, authority);
+      }
+
+      if (session.queuedTurnPending === true && !await sessions.startPendingTurn(session.id, authority)) {
+        const status = await sessions.finish(session.id, authority, { status: 'IDLE' });
+        await publish(status === 'QUEUED' ? 'session.queued' : 'session.idle', {});
+        return;
       }
 
       await publish('session.running', { runnerId, model: session.model, effort: session.effort });
@@ -312,11 +311,7 @@ export class SessionRunner {
             throw leaseLost;
           }
         },
-        drainSteer: () => {
-          const prompt = pendingSteer;
-          pendingSteer = undefined;
-          return prompt;
-        },
+        drainSteer: () => sessions.drainSteerMessage(session.id, authority),
         events: {
           // Text arrives as it is generated. Not awaited: the model does not
           // wait for Redis, and back-pressure here would stall generation.
@@ -391,11 +386,7 @@ export class SessionRunner {
               throw leaseLost;
             }
           },
-          drainSteer: () => {
-            const prompt = pendingSteer;
-            pendingSteer = undefined;
-            return prompt;
-          },
+          drainSteer: () => sessions.drainSteerMessage(session.id, authority),
           events: {
             text: (delta) => {
               void publish('agent.text', { delta });
@@ -448,8 +439,8 @@ export class SessionRunner {
       await this.#letGo(session, acquired);
       acquired = undefined;
 
-      await sessions.finish(session.id, authority, { status: 'IDLE' });
-      await publish('session.idle', { steps: run.steps, stopReason: run.stopReason });
+      const status = await sessions.finish(session.id, authority, { status: 'IDLE' });
+      await publish(status === 'QUEUED' ? 'session.queued' : 'session.idle', { steps: run.steps, stopReason: run.stopReason });
       log.info({ sessionId: session.id, steps: run.steps }, 'finished a session');
     } catch (error) {
       const reason = this.#reason(error);

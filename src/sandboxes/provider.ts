@@ -1,4 +1,4 @@
-import type { SandboxProvider } from '../entitlements/schema.ts';
+import type { SandboxNetworkPolicy, SandboxProvider } from '../entitlements/schema.ts';
 import { AppError } from '../http/errors.ts';
 
 export interface CommandOutcome {
@@ -42,14 +42,15 @@ export interface RunningSandbox {
   stop(): Promise<void>;
   lifetime?(): Promise<{ startedAt: Date; endAt: Date }>;
   /** Provider VM copy. Never implemented as a second directory in the same VM. */
-  forkForValidation?(timeoutMs: number): Promise<RunningSandbox>;
+  forkForValidation?(timeoutMs: number, networkPolicy: SandboxNetworkPolicy): Promise<RunningSandbox>;
 }
 
 export interface SandboxAdapter {
   terminate?(externalId: string): Promise<boolean>;
   start(
     provider: SandboxProvider,
-    context: { readonly metadata: Readonly<Record<string, string>>; readonly publicPreviewEnabled?: boolean },
+    context: { readonly metadata: Readonly<Record<string, string>>; readonly publicPreviewEnabled?: boolean;
+      readonly networkPolicy: SandboxNetworkPolicy },
   ): Promise<RunningSandbox>;
   /** Reconnects to an existing sandbox, so a successor can shut an orphan down. */
   connect(externalId: string): Promise<RunningSandbox>;

@@ -249,6 +249,26 @@ export class SnapshotStore implements SnapshotStorage {
     throw new Error('Snapshot retirement raced an upload; cleanup remains pending.');
   }
 
+  /** Retire an upload without leaving billable content generations outside the ledger. */
+  async removeRetiredUpload(objectName: string): Promise<void> {
+    await this.retireUpload(objectName);
+    let pageToken: string | undefined;
+    do {
+      const [files, next] = await this.#bucket().getFiles({ prefix: objectName, versions: true,
+        autoPaginate: false, maxResults: 100, ...(pageToken === undefined ? {} : { pageToken }) });
+      for (const file of files) {
+        if (file.name !== objectName) continue;
+        const bytes = Number(file.metadata.size);
+        if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error('Invalid object size during snapshot cleanup.');
+        if (bytes === 0) continue; // Retain the create-only upload replay barrier.
+        const generation = String(file.metadata.generation ?? '');
+        if (!/^[1-9]\d*$/.test(generation)) throw new Error('Missing object generation during snapshot cleanup.');
+        await this.#bucket().file(objectName, { generation }).delete({ ignoreNotFound: true, ifGenerationMatch: generation });
+      }
+      pageToken = next?.pageToken;
+    } while (pageToken !== undefined);
+  }
+
   /** Also covers archives created before the durable upload ledger existed. */
   async eraseProjectContent(projectId: string): Promise<void> {
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(projectId)) throw new Error('Invalid project id.');

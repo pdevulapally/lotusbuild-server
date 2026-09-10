@@ -42,7 +42,7 @@ test('failed candidate cleanup preserves quota; retry releases it once', async (
   const hold = await h.metering.reserve({ uid: 'u', entitlements: h.entitlements, meterKey: 'storage', quantity: 300, operationId: 'upload', now: new Date() });
   h.data.set('snapshotUploads/upload', { ownerUid: 'u', projectId: 'p', objectName: 'projects/p/snapshots/upload.tar.gz', bytes: 300, reservationId: hold.id, status: 'CANDIDATE', expiresAt: Timestamp.fromMillis(0) });
   let fail = true;
-  const cleanup = new SnapshotMaintenance(h.db, h.metering, { retireUpload: async () => { if (fail) throw new Error('offline'); } } as unknown as SnapshotStore);
+  const cleanup = new SnapshotMaintenance(h.db, h.metering, { removeRetiredUpload: async () => { if (fail) throw new Error('offline'); } } as unknown as SnapshotStore);
   await assert.rejects(cleanup.sweep(), (error: unknown) => error instanceof AggregateError && error.errors.some((cause) => cause.message === 'offline'));
   assert.equal(h.data.get('users/u/usage/storage')?.['reserved'], 300);
   fail = false;
@@ -59,4 +59,23 @@ test('unknown in-flight usage cannot be released and recorded overruns survive r
   await h.metering.reconcile('u', hold.id);
   assert.equal(h.data.get(`users/u/reservations/${hold.id}`)?.['overrunQuantity'], 5);
   assert.equal(h.data.get('users/u/usage/input')?.['consumed'], 15);
+});
+
+test('failed obsolete-generation cleanup keeps its charged bytes and identifiers until success', async () => {
+  const h = fixture();
+  h.data.set('users/u/usage/storage', { consumed: 300, reserved: 0, periodStart: Timestamp.fromMillis(0) });
+  h.data.set('snapshotUploads/old', { ownerUid: 'u', projectId: 'p', objectName: 'projects/p/old', bytes: 300,
+    status: 'OBSOLETE', expiresAt: Timestamp.fromMillis(0) });
+  let fail = true;
+  const cleanup = new SnapshotMaintenance(h.db, h.metering, { removeRetiredUpload: async () => {
+    if (fail) throw new Error('Generation still exists');
+  } } as unknown as SnapshotStore);
+  await assert.rejects(cleanup.sweep());
+  assert.equal(h.data.get('users/u/usage/storage')?.['consumed'], 300);
+  assert.equal(h.data.get('snapshotUploads/old')?.['objectName'], 'projects/p/old');
+  fail = false;
+  await cleanup.sweep();
+  await cleanup.sweep();
+  assert.equal(h.data.get('users/u/usage/storage')?.['consumed'], 0);
+  assert.equal(h.data.get('snapshotUploads/old')?.['objectName'], undefined);
 });
