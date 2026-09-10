@@ -63,9 +63,9 @@ One instruction/data policy now covers primary and specialist agents. Project me
 
 Local verification for this change: typecheck and production build passed; the full suite reported 381 tests, 379 passed, 2 platform-dependent skips, zero failures. The 13 new cases cover prompt boundaries, adversarial tool use, plan policy selection, malformed policies and provider network handoff/failure. No live model or provider was contacted by these tests.
 
-Every existing `plans/{key}` document must explicitly contain `sandboxNetwork` before deployment:
+Existing `free`, `pro` and `business` documents without `sandboxNetwork` use the policies already defined for those plans. The schema and seed share that definition; no Firestore backfill is required:
 
-| Plan | Required field value |
+| Plan | Policy when the field is absent |
 | --- | --- |
 | Free | `{"mode":"unrestricted"}` |
 | Pro | `{"mode":"unrestricted"}` |
@@ -73,7 +73,7 @@ Every existing `plans/{key}` document must explicitly contain `sandboxNetwork` b
 
 The Business seed deliberately denies outbound internet until approved domains are configured. This blocks package downloads and sandbox snapshot transfers unless their actual destination hosts are approved. No domains are inferred or silently added. Names must be unique, lowercase and exact; URLs, IP addresses, wildcards and malformed entries are rejected. This checkout has no separate Teams plan or organisation-admin policy editor; this change uses operator-owned plan configuration.
 
-Patch only this field in live plans, then run the existing read-only preflight. Missing policy fails configuration loading. Do not rerun the full seed over live plans, as it overwrites unrelated settings. No production configuration was changed in this work.
+An explicit `sandboxNetwork` field takes precedence and is strictly validated, including null or malformed values. Other plan keys still require an explicit policy. No other fields are filled from seed data, and parsing does not mutate Firestore. Do not rerun the full seed over live plans, as it overwrites unrelated settings. No production configuration was changed in this work.
 
 E2B receives network policy at VM creation, independently of public-preview ingress. Validation applies the selected policy to the source before forking and the child before use; failed child policy application triggers termination. Verify the deployed provider preserves containment during fork startup, including resumed background processes. Policy changes apply on sandbox acquisition/validation acquisition, not as instantaneous billing-webhook revocation of existing VMs. Stop and recreate active sessions when immediate changes are required.
 

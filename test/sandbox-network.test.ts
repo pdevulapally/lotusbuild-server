@@ -43,10 +43,32 @@ test('plan network policy implements unrestricted Free/Pro and restricted Busine
   }
 });
 
-test('missing network policy cannot silently give an existing plan unrestricted access', () => {
-  const document = { ...planDocuments[0] } as Record<string, unknown>;
-  delete document['sandboxNetwork'];
-  assert.throws(() => parsePlan(document, 'plans/free', registry), /explicitly configured/);
+test('existing plan documents without network policy use their existing catalog policy', () => {
+  for (const seeded of planDocuments) {
+    const document: Record<string, unknown> = { ...seeded };
+    delete document['sandboxNetwork'];
+    const plan = parsePlan(document, `plans/${seeded.key}`, registry);
+    assert.deepEqual(plan.sandboxNetwork, seeded.sandboxNetwork);
+    assert.deepEqual(document, Object.fromEntries(Object.entries(seeded).filter(([key]) => key !== 'sandboxNetwork')));
+  }
+});
+
+test('explicit plan network settings override the catalog and malformed settings still fail', () => {
+  const policy = { mode: 'restricted', allowedDomains: ['registry.npmjs.org'] };
+  for (const seeded of planDocuments) {
+    assert.deepEqual(parsePlan({ ...seeded, sandboxNetwork: policy }, `plans/${seeded.key}`, registry).sandboxNetwork, policy);
+    for (const invalid of [null, undefined, {}, { mode: 'restricted', allowedDomains: ['*'] }]) {
+      assert.throws(() => parsePlan({ ...seeded, sandboxNetwork: invalid }, `plans/${seeded.key}`, registry));
+    }
+  }
+});
+
+test('unknown plan keys cannot inherit a known plan network policy', () => {
+  for (const key of ['custom', 'constructor', '__proto__']) {
+    const document: Record<string, unknown> = { ...planDocuments[0], key };
+    delete document['sandboxNetwork'];
+    assert.throws(() => parsePlan(document, `plans/${key}`, registry), /explicitly configured/);
+  }
 });
 
 test('restricted policy refuses ambiguous domains and accepts exact approved names', () => {

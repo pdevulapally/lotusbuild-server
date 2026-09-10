@@ -12,6 +12,14 @@ import {
 import { type CapabilityDefinition, isMergeStrategy, mergeStrategies } from './merge.ts';
 import { type EntitlementValue, entitlementValueKinds, parseEntitlementValue } from './values.ts';
 
+/** Existing plan policies, shared by legacy document parsing and new seeds. */
+export const planNetworkPolicies = {
+  free: { mode: 'unrestricted' },
+  pro: { mode: 'unrestricted' },
+  // No approved destinations have been configured for Business yet.
+  business: { mode: 'restricted', allowedDomains: [] },
+} as const satisfies Readonly<Record<string, SandboxNetworkPolicy>>;
+
 export const meterKinds = ['COUNTER', 'GAUGE'] as const;
 export const resetPeriods = ['NEVER', 'DAILY', 'MONTHLY'] as const;
 export const planStatuses = ['ACTIVE', 'DEPRECATED'] as const;
@@ -178,7 +186,7 @@ export type SandboxNetworkPolicy =
   | { readonly mode: 'unrestricted' }
   | { readonly mode: 'restricted'; readonly allowedDomains: readonly string[] };
 
-/** Operator-owned plan policy. No absent-policy or malformed-domain fallback. */
+/** Validate an explicit policy without accepting missing or malformed values. */
 export function parseSandboxNetwork(value: unknown, where: string): SandboxNetworkPolicy {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new DocumentShapeError(`${where}: sandboxNetwork must be explicitly configured.`);
@@ -509,7 +517,12 @@ export function parsePlan(fields: Fields, where: string, registry: Registry): Pl
     name: stringField(fields, 'name', where),
     status: enumField(fields, 'status', where, planStatuses),
     rank: integerField(fields, 'rank', where, { min: 0 }),
-    sandboxNetwork: parseSandboxNetwork(fields['sandboxNetwork'], where),
+    sandboxNetwork: parseSandboxNetwork(
+      !Object.hasOwn(fields, 'sandboxNetwork') && Object.hasOwn(planNetworkPolicies, key)
+        ? planNetworkPolicies[key as keyof typeof planNetworkPolicies]
+        : fields['sandboxNetwork'],
+      where,
+    ),
     price: parsePlanPrice(fields, where),
     entitlements,
     meterLimits,

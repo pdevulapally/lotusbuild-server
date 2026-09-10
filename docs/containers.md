@@ -35,7 +35,7 @@ docker run --rm --env-file /absolute/path/to/runner.env \
 
 The paths above are examples to replace with actual approved runtime files. Redis and Firebase addresses must be reachable from the container network; a host's `localhost` address is not the container's host. Size stop-grace periods for the runner's existing behaviour: it finishes its current session after SIGTERM. Do not rely on Docker's default short stop timeout for long builds. The image runs the backend; user-generated commands continue running in E2B, not in this backend container.
 
-Existing read-only preflight is available as `node dist/preflight.js` using the required API and runner preflight configuration. Run it only against the deliberately selected environment. The previous network-policy change still requires `sandboxNetwork` on live plan documents before startup; restricted Business plans need their actual approved package and snapshot hosts.
+Existing read-only preflight is available as `node dist/preflight.js` using the required API and runner preflight configuration. Run it only against the deliberately selected environment. Existing Free/Pro/Business documents can omit `sandboxNetwork` and use their existing catalog policy; explicit settings remain strictly validated. Restricted Business plans need their actual approved package and snapshot hosts to reach those services.
 
 ## Verification limits
 
