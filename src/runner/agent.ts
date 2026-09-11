@@ -2,6 +2,7 @@ import type { CallAdmission } from './call-admission.ts';
 import type Anthropic from '@anthropic-ai/sdk';
 import type {
   ContentBlockParam,
+  Message,
   MessageParam,
   MessageStreamEvent,
   Tool,
@@ -481,8 +482,13 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
       ...(input.outputReservationId === undefined ? {} : { outputReservationId: input.outputReservationId }),
     });
     const usage = new UsageAccumulator();
-    const stream = input.anthropic.messages.stream(
-      {
+    let providerDispatchStarted = false;
+    let message: Message | undefined;
+    let callError: unknown;
+    try {
+      input.assertStillOurs();
+      input.signal.throwIfAborted();
+      const params = {
         // From the session, which took it from the plan's allowlist. Never a
         // literal: which model a plan may use is a commercial decision.
         model: input.model,
@@ -491,31 +497,33 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
         // again on every step. Caching the last cacheable block means each step
         // writes the prefix once and the next step reads it at a fraction of the
         // rate — the same tokens, most of the cost removed.
-        cache_control: { type: 'ephemeral' },
+        cache_control: { type: 'ephemeral' as const },
         system: input.system,
         tools: [...specs],
         messages: input.conversation,
-      },
-      // A cancelled session stops paying for the stream it is in, rather than
-      // waiting for the next step boundary to notice.
-      { signal: input.signal },
-    );
-    if (input.onText !== undefined) {
-      stream.on('text', input.onText);
-    }
-    // Watched as the call runs, so a cancelled stream still knows what the
-    // provider already told us. Cached reads and writes are input tokens this
-    // turn actually consumed, so they are metered like any other: counting only
-    // `input_tokens` would let caching silently uncap every plan, because the
-    // cached majority of the prefix arrives under those fields and would never
-    // be charged. What the three cost differs; that is margin, not allowance.
-    stream.on('streamEvent', (event) => {
-      usage.observe(event);
-    });
+      };
+      // Only the generation SDK invocation crosses this boundary, not admission,
+      // parameter preparation or the marker. A synchronous SDK throw is uncertain.
+      providerDispatchStarted = true;
+      const stream = input.anthropic.messages.stream(
+        params,
+        // A cancelled session stops paying for the stream it is in, rather than
+        // waiting for the next step boundary to notice.
+        { signal: input.signal },
+      );
+      if (input.onText !== undefined) {
+        stream.on('text', input.onText);
+      }
+      // Watched as the call runs, so a cancelled stream still knows what the
+      // provider already told us. Cached reads and writes are input tokens this
+      // turn actually consumed, so they are metered like any other: counting only
+      // `input_tokens` would let caching silently uncap every plan, because the
+      // cached majority of the prefix arrives under those fields and would never
+      // be charged. What the three cost differs; that is margin, not allowance.
+      stream.on('streamEvent', (event) => {
+        usage.observe(event);
+      });
 
-    let message: Awaited<ReturnType<typeof stream.finalMessage>> | undefined;
-    let callError: unknown;
-    try {
       message = await stream.finalMessage();
     } catch (error) {
       callError = error;
@@ -526,7 +534,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
     // already reported. There is no path that charges both.
     const spend: AuthoritativeUsage =
       message === undefined
-        ? usage.snapshot()
+        ? providerDispatchStarted ? usage.snapshot() : { input: 0, output: 0 }
         : {
             input: total(
               message.usage.input_tokens,
@@ -564,6 +572,8 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
     if (chargeError !== undefined) {
       throw chargeError;
     }
+    input.assertStillOurs();
+    input.signal.throwIfAborted();
     if (message === undefined) {
       // Unreachable: a call with no error produced a message.
       throw new Error('The model call produced neither a message nor an error.');
@@ -598,6 +608,8 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
       input.assertStillOurs();
       input.signal.throwIfAborted();
       const result = await runTool(toolUse.name, toolInput, input.toolContext, input.tools);
+      input.assertStillOurs();
+      input.signal.throwIfAborted();
       await input.onToolResult?.(toolUse.name, result);
       return {
         type: 'tool_result',
@@ -769,6 +781,8 @@ interface SpecialistCall {
 async function consultSpecialist(
   call: SpecialistCall,
 ): Promise<{ readonly review: SpecialistReview } | { readonly failure: string }> {
+  call.assertStillOurs();
+  call.signal.throwIfAborted();
   const ceiling = call.limits.specialistMaxSteps * call.limits.maxOutputTokens;
   let reservation;
   try {
@@ -1016,6 +1030,7 @@ export async function runAgentTurn(input: {
   readonly drainSteer: () => string | undefined | Promise<string | undefined>;
 }): Promise<AgentRun> {
   const toolContext: ToolContext = {
+    signal: input.signal,
     publicPreviewEnabled: input.project.publicPreviewEnabled === true,
     ...(input.withValidationSandbox === undefined ? {} : { withValidationSandbox: input.withValidationSandbox }),
     sandbox: input.sandbox,

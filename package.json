@@ -2,6 +2,7 @@
   "name": "lotusbuild-server",
   "version": "0.1.0",
   "private": true,
+  "runnerRecoveryProtocol": 1,
   "type": "module",
   "engines": {
     "node": ">=22.0.0"

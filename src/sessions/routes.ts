@@ -3,7 +3,7 @@ import type { OutgoingHttpHeaders } from 'node:http';
 import type { FastifyBaseLogger, FastifyInstance, FastifyReply } from 'fastify';
 
 import { authenticatedUser, bearerToken } from '../auth/plugin.ts';
-import { AppError } from '../http/errors.ts';
+import { AppError, safeErrorDiagnostic } from '../http/errors.ts';
 import {
   type SessionEvent,
   type SessionEvents,
@@ -108,7 +108,7 @@ export function registerSessionRoutes(
     data: Readonly<Record<string, unknown>>,
   ): void => {
     events.append(sessionId, type, data).catch((error: unknown) => {
-      log.error({ err: error, sessionId, type }, 'session event was not published');
+      log.error({ diagnostic: safeErrorDiagnostic(error), sessionId, type }, 'session event was not published');
     });
   };
 
@@ -566,7 +566,7 @@ export function registerSessionRoutes(
         // The response is hijacked, so the error handler can no longer reply.
         // All that is left is to log it and hang up, which the client sees as a
         // dropped stream and retries.
-        request.log.error({ err: error, sessionId: session.id }, 'event stream failed to start');
+        request.log.error({ diagnostic: safeErrorDiagnostic(error), sessionId: session.id }, 'event stream failed to start');
         finish();
       }
     },

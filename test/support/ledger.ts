@@ -1,4 +1,4 @@
-import { FieldValue, Timestamp, type Firestore } from 'firebase-admin/firestore';
+import { FieldPath, FieldValue, Timestamp, type Firestore } from 'firebase-admin/firestore';
 type Data = Record<string, unknown>;
 export function ledger() {
   const data = new Map<string, Data>();
@@ -9,17 +9,31 @@ export function ledger() {
     delete: async () => { data.delete(path); },
     update: async (fields: Data) => { const old = data.get(path); if (!old) throw new Error('Document missing'); const next = { ...old, ...fields }; for (const [key, value] of Object.entries(next)) if (value instanceof FieldValue && value.isEqual(FieldValue.delete())) delete next[key]; data.set(path, next); },
     collection: (name: string) => collection(`${path}/${name}`) });
-  const collection = (path: string, filters: { key: string; op: string; value: unknown }[] = [], maximum = 100) => ({
+  const collection = (path: string, filters: { key: string; op: string; value: unknown }[] = [], maximum = 100, ordered: string | false = false, after?: string, direction = 'asc') => ({
     path,
     doc: (id = `id-${++sequence}`) => doc(`${path}/${id}`),
-    where: (key: string, op: string, value: unknown) => collection(path, [...filters, { key, op, value }], maximum),
-    limit: (size: number) => collection(path, filters, size),
-    get: async () => {
-      const docs = [...data].filter(([key, fields]) => key.startsWith(path + '/') && key.split('/').length === path.split('/').length + 1
+    where: (key: string, op: string, value: unknown) => collection(path, [...filters, { key, op, value }], maximum, ordered, after, direction),
+    orderBy: (field: FieldPath | string, order = 'asc') => {
+      if (typeof field !== 'string' && !field.isEqual(FieldPath.documentId())) throw new Error('Unsupported ledger field.');
+      return collection(path, filters, maximum, typeof field === 'string' ? field : '__name__', after, order);
+    },
+    startAfter: (id: string) => {
+      if (!ordered) throw new Error('Ledger cursor requires document ID order.');
+      return collection(path, filters, maximum, ordered, id, direction);
+    },
+    limit: (size: number) => collection(path, filters, size, ordered, after, direction),
+    get: async (source = data) => {
+      const matches = [...source].filter(([key, fields]) => key.startsWith(path + '/') && key.split('/').length === path.split('/').length + 1
         && filters.every((filter) => filter.op === '==' ? fields[filter.key] === filter.value
           : filter.op === 'in' ? (filter.value as unknown[]).includes(fields[filter.key])
-            : (fields[filter.key] as Timestamp).toMillis() <= (filter.value as Timestamp).toMillis()))
-        .slice(0, maximum).map(([key]) => snapshot(doc(key)));
+            : fields[filter.key] instanceof Timestamp && (fields[filter.key] as Timestamp).toMillis() <= (filter.value as Timestamp).toMillis()));
+      if (ordered) matches.sort(([left, a], [right, b]) => {
+        const comparison = ordered === '__name__' ? Buffer.compare(Buffer.from(left), Buffer.from(right))
+          : (a[ordered] as Timestamp).toMillis() - (b[ordered] as Timestamp).toMillis();
+        return direction === 'desc' ? -comparison : comparison;
+      });
+      const docs = matches.filter(([key]) => after === undefined || Buffer.compare(Buffer.from(key), Buffer.from(`${path}/${after}`)) > 0)
+        .slice(0, maximum).map(([key]) => snapshot(doc(key), source));
       return { docs, empty: docs.length === 0, size: docs.length };
     },
   });
@@ -35,11 +49,17 @@ export function ledger() {
           for (const [key, value] of Object.entries(next)) {
             if (value instanceof FieldValue && value.isEqual(FieldValue.delete())) delete next[key];
             else if (value instanceof FieldValue && value.isEqual(FieldValue.serverTimestamp())) next[key] = Timestamp.now();
+            else if (value?.constructor?.name === 'NumericIncrementTransform') next[key] = Number(pending.get(ref.path)?.[key] ?? 0) + (value as { operand: number }).operand;
+            else if (value?.constructor?.name === 'ArrayUnionTransform') next[key] = [...new Set([...(pending.get(ref.path)?.[key] as unknown[] ?? []), ...(value as { elements: unknown[] }).elements])];
+            else if (value?.constructor?.name === 'ArrayRemoveTransform') next[key] = (pending.get(ref.path)?.[key] as unknown[] ?? []).filter((item) => !(value as { elements: unknown[] }).elements.includes(item));
           }
           pending.set(ref.path, next);
         };
         const result = await work({
-          get: async (ref: { path: string; id: string }) => { if (writing) throw new Error('Firestore read after write'); return snapshot(ref, pending); },
+          get: async (ref: { path: string; id?: string; get: (source: Map<string, Data>) => unknown }) => {
+            if (writing) throw new Error('Firestore read after write');
+            return ref.id === undefined ? ref.get(pending) : snapshot({ path: ref.path, id: ref.id }, pending);
+          },
           set: write,
           delete: (ref: { path: string }) => { writing = true; pending.delete(ref.path); },
           create: (ref: { path: string }, fields: Data) => { if (pending.has(ref.path)) throw new Error('Document exists'); write(ref, fields); },

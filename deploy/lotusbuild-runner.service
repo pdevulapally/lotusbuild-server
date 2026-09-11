@@ -10,6 +10,9 @@ WorkingDirectory=/home/preet/apps/lotusbuild-server
 ExecStart=/usr/bin/env node --env-file=.env dist/runner/index.js
 Restart=always
 RestartSec=3
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=120s
 
 [Install]
 WantedBy=multi-user.target

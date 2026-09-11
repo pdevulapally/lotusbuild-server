@@ -94,7 +94,7 @@ export const asInteger = (
   parse: (raw) => {
     const value = Number(raw.trim());
     if (!Number.isSafeInteger(value) || value < min || value > max) {
-      throw new Error(`expected an integer between ${min} and ${max}, got "${raw}"`);
+      throw new Error(`expected an integer between ${min} and ${max}`);
     }
     return value;
   },
@@ -105,7 +105,7 @@ export const asPort = (description: string): EnvVarSpec<number> => ({
   parse: (raw) => {
     const value = Number(raw.trim());
     if (!Number.isInteger(value) || value < 1 || value > 65535) {
-      throw new Error(`expected an integer TCP port 1-65535, got "${raw}"`);
+      throw new Error('expected an integer TCP port 1-65535');
     }
     return value;
   },
@@ -119,7 +119,7 @@ export const asEnum = <const T extends readonly [string, ...string[]]>(
   parse: (raw) => {
     const value = raw.trim();
     if (!allowed.includes(value)) {
-      throw new Error(`expected one of ${allowed.join(', ')}, got "${value}"`);
+      throw new Error(`expected one of ${allowed.join(', ')}`);
     }
     return value as T[number];
   },
@@ -135,7 +135,7 @@ export const asBoolean = (description: string): EnvVarSpec<boolean> => ({
   parse: (raw) => {
     const value = raw.trim().toLowerCase();
     if (value !== 'true' && value !== 'false') {
-      throw new Error(`expected true or false, got "${raw.trim()}"`);
+      throw new Error('expected true or false');
     }
     return value === 'true';
   },
@@ -151,10 +151,10 @@ export const asUrl = (
     try {
       url = new URL(raw.trim());
     } catch {
-      throw new Error(`expected an absolute URL, got "${raw}"`);
+      throw new Error('expected an absolute URL');
     }
     if (!protocols.includes(url.protocol)) {
-      throw new Error(`expected protocol ${protocols.join(' or ')}, got "${url.protocol}"`);
+      throw new Error(`expected protocol ${protocols.join(' or ')}`);
     }
     return url;
   },

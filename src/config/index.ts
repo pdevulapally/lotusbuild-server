@@ -101,6 +101,10 @@ const apiSpec = {
 } as const;
 
 const runnerSpec = {
+  RUNNER_DRAIN_TIMEOUT_SECONDS: asInteger(
+    'maximum total runner shutdown drain; LotusBuild policy is 90s with a 120s systemd stop budget',
+    { min: 1, max: 90 },
+  ),
   ANTHROPIC_API_KEY: asString('key the agent calls the Anthropic API with'),
   ANTHROPIC_BASE_URL: asUrl('Anthropic API base URL', { protocols: ['https:'] }),
   ANTHROPIC_MAX_OUTPUT_TOKENS: asInteger(
@@ -154,6 +158,11 @@ const runnerSpec = {
 } as const;
 
 /** What both processes need, and all that the shared plumbing may depend on. */
+/** Safe diagnostic names, derived from the authoritative specs rather than duplicated. */
+export const configurationKeys: readonly string[] = Object.freeze([...new Set([
+  ...Object.keys(sharedSpec), ...Object.keys(apiSpec), ...Object.keys(runnerSpec),
+])]);
+
 export type SharedConfig = LoadedEnv<typeof sharedSpec>;
 export type Config = ReturnType<typeof loadConfig>;
 export type RunnerConfig = ReturnType<typeof loadRunnerConfig>;

@@ -1,3 +1,4 @@
+import { safeErrorDiagnostic, safeProviderLogger } from '../http/errors.ts';
 import { hostname } from 'node:os';
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -20,7 +21,7 @@ import { SessionRepository } from '../sessions/repository.ts';
 import { SnapshotStore } from '../storage/snapshots.ts';
 import { SnapshotMaintenance } from '../storage/maintenance.ts';
 import { UserRepository } from '../users/repository.ts';
-import { SessionRunner, runUntilStopped } from './loop.ts';
+import { SessionRunner, runUntilStopped, withDrainDeadline } from './loop.ts';
 
 /**
  * The build runner.
@@ -32,7 +33,7 @@ import { SessionRunner, runUntilStopped } from './loop.ts';
  */
 async function main(): Promise<void> {
   const config = loadRunnerConfig();
-  const log = pino({ level: config.LOG_LEVEL });
+  const log = pino({ level: config.LOG_LEVEL, serializers: { err: safeErrorDiagnostic } });
 
   // Derived rather than configured: two runners on one box must not share an
   // identity, and a restarted process must not inherit the lease its predecessor
@@ -43,15 +44,16 @@ async function main(): Promise<void> {
   const redis = await connectRedis(
     config,
     (error) => {
-      log.error({ err: error }, 'redis');
+      log.error({ diagnostic: safeErrorDiagnostic(error) }, 'redis');
     },
     runnerId,
   );
   const subscriber = redis.duplicate({ connectionName: `${runnerId}-events` });
-  subscriber.on('error', (error: Error) => {
-    log.error({ err: error }, 'redis subscriber');
+  subscriber.on('error', () => {
+    log.error('REDIS_URL subscriber connection error.');
   });
-  await subscriber.connect();
+  try { await subscriber.connect(); }
+  catch { throw new EnvironmentError(['REDIS_URL subscriber connection failed.']); }
 
   const configuration = new ConfigurationStore(
     firebase.firestore,
@@ -97,6 +99,7 @@ async function main(): Promise<void> {
   const runner = new SessionRunner({
     runnerId,
     anthropic: new Anthropic({
+      logger: safeProviderLogger(log, 'anthropic'),
       apiKey: config.ANTHROPIC_API_KEY,
       baseURL: config.ANTHROPIC_BASE_URL.toString(),
     }),
@@ -117,7 +120,7 @@ async function main(): Promise<void> {
       retentionSeconds: config.SESSION_EVENT_RETENTION_SECONDS,
       maxPerSession: config.SESSION_EVENT_MAX_PER_SESSION,
       onListenerError: (error, sessionId) => {
-        log.error({ err: error, sessionId }, 'session event delivery failed');
+        log.error({ diagnostic: safeErrorDiagnostic(error), sessionId }, 'session event delivery failed');
       },
     }),
     limits: {
@@ -137,33 +140,31 @@ async function main(): Promise<void> {
     log,
   });
 
-  // A signal stops us taking new work. The session in hand is finished first —
-  // killing it would leave a sandbox running and a lease to wait out.
-  let running = true;
+  const shutdown = new AbortController();
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-    process.once(signal, () => {
-      log.info({ signal }, 'finishing the current session, then stopping');
-      running = false;
+    process.on(signal, () => {
+      if (shutdown.signal.aborted) return;
+      log.info({ signal }, 'runner shutdown requested; cancelling active work');
+      shutdown.abort(new Error('Runner shutdown requested.'));
     });
   }
 
   log.info({ runnerId }, 'runner started');
-  await runUntilStopped(runner, {
-    maintenance: () => new SnapshotMaintenance(firebase.firestore, metering, snapshots).sweep(),
-    idlePollSeconds: config.RUNNER_IDLE_POLL_SECONDS,
-    shouldContinue: () => running,
-    log,
-  });
+  await withDrainDeadline(shutdown.signal, config.RUNNER_DRAIN_TIMEOUT_SECONDS * 1000, async () => {
+    await runUntilStopped(runner, {
+      maintenance: () => new SnapshotMaintenance(firebase.firestore, metering, snapshots).sweep(),
+      idlePollSeconds: config.RUNNER_IDLE_POLL_SECONDS,
+      shouldContinue: () => !shutdown.signal.aborted,
+      signal: shutdown.signal,
+      log,
+    });
 
-  await Promise.all([redis.quit(), subscriber.quit()]);
-  log.info({ runnerId }, 'runner stopped');
+    await Promise.all([redis.quit(), subscriber.quit()]);
+  }, log);
+  log.info({ runnerId }, 'runner drain completed');
 }
 
 main().catch((error: unknown) => {
-  if (error instanceof EnvironmentError) {
-    process.stderr.write(`${error.message}\n`);
-  } else {
-    process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
-  }
+  process.stderr.write(JSON.stringify({ diagnostic: safeErrorDiagnostic(error), operation: 'process-failure' }) + '\n');
   process.exit(1);
 });

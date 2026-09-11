@@ -123,16 +123,14 @@ export class SnapshotStore implements SnapshotStorage {
     let exists: boolean;
     try {
       [exists] = await bucket.exists();
-    } catch (cause) {
+    } catch {
       throw new EnvironmentError([
-        `FIREBASE_STORAGE_BUCKET "${this.#bucketName}" could not be reached — ` +
-          `${cause instanceof Error ? cause.message : String(cause)}`,
+        'FIREBASE_STORAGE_BUCKET could not be reached; check its configuration and access permissions.',
       ]);
     }
     if (!exists) {
       throw new EnvironmentError([
-        `FIREBASE_STORAGE_BUCKET "${this.#bucketName}" does not exist, so no project could be ` +
-          'saved.',
+        'FIREBASE_STORAGE_BUCKET does not exist, so no project could be saved.',
       ]);
     }
     const [metadata] = await bucket.getMetadata();

@@ -21,9 +21,9 @@ function readServiceAccount(path: string, expectedProjectId: string): ServiceAcc
   let raw: string;
   try {
     raw = readFileSync(path, 'utf8');
-  } catch (cause) {
+  } catch {
     throw new EnvironmentError([
-      `FIREBASE_SERVICE_ACCOUNT_FILE cannot be read at ${path} — ${cause instanceof Error ? cause.message : String(cause)}`,
+      'FIREBASE_SERVICE_ACCOUNT_FILE cannot be read; check the configured path and permissions.',
     ]);
   }
 
@@ -32,13 +32,13 @@ function readServiceAccount(path: string, expectedProjectId: string): ServiceAcc
     parsed = JSON.parse(raw);
   } catch (cause) {
     throw new EnvironmentError([
-      `FIREBASE_SERVICE_ACCOUNT_FILE at ${path} is not valid JSON.`,
+      'FIREBASE_SERVICE_ACCOUNT_FILE is not valid JSON.',
     ]);
   }
 
   if (typeof parsed !== 'object' || parsed === null) {
     throw new EnvironmentError([
-      `FIREBASE_SERVICE_ACCOUNT_FILE at ${path} is not a JSON object.`,
+      'FIREBASE_SERVICE_ACCOUNT_FILE is not a JSON object.',
     ]);
   }
 
@@ -48,7 +48,7 @@ function readServiceAccount(path: string, expectedProjectId: string): ServiceAcc
   );
   if (missing.length > 0) {
     throw new EnvironmentError(
-      missing.map((field) => `FIREBASE_SERVICE_ACCOUNT_FILE at ${path} is missing "${field}".`),
+      missing.map((field) => `FIREBASE_SERVICE_ACCOUNT_FILE is missing "${field}".`),
     );
   }
 
@@ -59,8 +59,7 @@ function readServiceAccount(path: string, expectedProjectId: string): ServiceAcc
   // different project entirely.
   if (account.project_id !== expectedProjectId) {
     throw new EnvironmentError([
-      `FIREBASE_SERVICE_ACCOUNT_FILE at ${path} belongs to project "${account.project_id}", ` +
-        `but FIREBASE_PROJECT_ID is "${expectedProjectId}".`,
+      'FIREBASE_SERVICE_ACCOUNT_FILE project_id does not match FIREBASE_PROJECT_ID.',
     ]);
   }
 

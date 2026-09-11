@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import type { App } from 'firebase-admin/app';
 import type { Auth } from 'firebase-admin/auth';
@@ -69,6 +71,7 @@ function validEnv(): Record<string, string> {
     E2B_VALIDATE_API_KEY: 'false',
     PREVIEW_READY_TIMEOUT_SECONDS: '30',
     RUNNER_IDLE_POLL_SECONDS: '5',
+    RUNNER_DRAIN_TIMEOUT_SECONDS: '90',
     RUNNER_HEARTBEAT_SECONDS: '10',
   };
 }
@@ -151,6 +154,7 @@ function baseDeps(overrides: Partial<PreflightDependencies> = {}): PreflightDepe
   const redisCalls: RedisCalls = { connected: false, quit: 0, writes: [] };
   return {
     env: validEnv(),
+    assertReleaseCompatibility: () => {},
     initialiseFirebase: () => fakeFirebaseServices(),
     connectRedis: async () => {
       redisCalls.connected = true;
@@ -166,6 +170,32 @@ function baseDeps(overrides: Partial<PreflightDependencies> = {}): PreflightDepe
 test('fully-valid API + runner env proceeds', async () => {
   const result = await runPreflight(baseDeps());
   assert.equal(result.ok, true);
+});
+
+test('runner drain budget is required and cannot encroach on the 30-second service-manager margin', async () => {
+  for (const value of [undefined, '0', '91', 'not-a-number']) {
+    const result = await runPreflight(baseDeps({ env: withEnv({ RUNNER_DRAIN_TIMEOUT_SECONDS: value }) }));
+    assert.ok(!result.ok && result.stage === 'config' && result.problems.some((problem) => problem.includes('RUNNER_DRAIN_TIMEOUT_SECONDS')));
+  }
+});
+
+test('malformed credential URL fails the actual config and preflight path without exposing values', async () => {
+  const secrets = ['fixture-user-sensitive', 'fixture-password-sensitive', 'fixture-query-sensitive', 'fixture-fragment-sensitive'];
+  const env = withEnv({ REDIS_URL: `redis://${secrets[0]}:${secrets[1]}@[invalid?token=${secrets[2]}#${secrets[3]}` });
+  const result = await runPreflight(baseDeps({ env, initialiseFirebase: () => { throw new Error('Config failure must precede Firebase'); } }));
+  assert.ok(!result.ok && result.stage === 'config');
+  assert.ok(!result.ok && result.problems.some((problem) => problem.includes('REDIS_URL') && problem.includes('absolute URL')));
+  for (const secret of secrets) assert.equal(JSON.stringify(result).includes(secret), false, 'Preflight diagnostic contains a sensitive value');
+  // Exercise the real CLI renderer and both real startup error handlers, with an
+  // isolated environment that fails before any external service is contacted.
+  for (const entry of ['preflight.ts', 'index.ts', 'runner/index.ts']) {
+    const child = spawnSync(process.execPath, ['--experimental-strip-types', fileURLToPath(new URL(`../src/${entry}`, import.meta.url))], {
+      env, encoding: 'utf8', timeout: 15000,
+    });
+    assert.equal(child.status, 1);
+    assert.ok(child.stderr.includes('REDIS_URL'));
+    for (const secret of secrets) assert.equal((child.stdout + child.stderr).includes(secret), false, 'Startup output contains a sensitive value');
+  }
 });
 
 test('missing API-required env rejects', async () => {
@@ -492,7 +522,7 @@ test('no sandbox is acquired/created, no Anthropic generation occurs, no Stripe 
   // client anywhere in it: nothing exists to call, by construction.
   const deps = baseDeps();
   const keys = Object.keys(deps).sort();
-  assert.deepEqual(keys, ['connectRedis', 'env', 'initialiseFirebase', 'makeSnapshotStore']);
+  assert.deepEqual(keys, ['assertReleaseCompatibility', 'connectRedis', 'env', 'initialiseFirebase', 'makeSnapshotStore']);
 });
 
 test('no seed/migration function is invoked', async () => {
@@ -528,4 +558,28 @@ test('diagnostics contain no secret values', async () => {
   ]) {
     assert.ok(!text.includes(secret), `diagnostic leaked a secret: ${secret}`);
   }
+});
+
+test('release protocol preflight rejects missing, malformed and future manifests before provider access', async (t) => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { pathToFileURL } = await import('node:url');
+  const { assertReleaseRecoveryProtocol, runnerRecoveryProtocol } = await import('../src/sessions/recovery-protocol.ts');
+  const root = mkdtempSync(join(tmpdir(), 'lotus-release-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const url = pathToFileURL(root + '/');
+  let providers = 0;
+  const deps = baseDeps({ assertReleaseCompatibility: () => assertReleaseRecoveryProtocol(url),
+    initialiseFirebase: () => { providers++; throw new Error('Must not initialize'); } });
+  for (const contents of [undefined, '{private-invalid', '{}', 'null',
+    JSON.stringify({ runnerRecoveryProtocol: runnerRecoveryProtocol() + 1 }),
+    JSON.stringify({ runnerRecoveryProtocol: String(runnerRecoveryProtocol()) })]) {
+    if (contents !== undefined) writeFileSync(join(root, 'release.json'), contents);
+    const result = await runPreflight(deps);
+    assert.deepEqual(result, { ok: false, stage: 'release', problems: ['release/recovery-protocol-incompatible'] });
+  }
+  assert.equal(providers, 0);
+  writeFileSync(join(root, 'release.json'), JSON.stringify({ runnerRecoveryProtocol: runnerRecoveryProtocol() }));
+  assertReleaseRecoveryProtocol(url);
 });

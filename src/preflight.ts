@@ -7,6 +7,7 @@ import { type Configuration, ConfigurationStore } from './entitlements/store.ts'
 import { type FirebaseServices, initialiseFirebase } from './firebase.ts';
 import { connectRedis } from './redis/client.ts';
 import { SnapshotStore } from './storage/snapshots.ts';
+import { assertReleaseRecoveryProtocol } from './sessions/recovery-protocol.ts';
 
 /**
  * Proves a candidate build is compatible with the environment/configuration it
@@ -23,7 +24,7 @@ import { SnapshotStore } from './storage/snapshots.ts';
  */
 
 /** Which stage first found the candidate incompatible. */
-export type PreflightStage = 'config' | 'firebase' | 'redis' | 'registry' | 'storage' | 'cleanup';
+export type PreflightStage = 'config' | 'release' | 'firebase' | 'redis' | 'registry' | 'storage' | 'cleanup';
 
 export interface PreflightSuccess {
   readonly ok: true;
@@ -46,6 +47,7 @@ export interface PreflightFailure {
 export type PreflightResult = PreflightSuccess | PreflightFailure;
 
 export interface PreflightDependencies {
+  readonly assertReleaseCompatibility: () => void;
   readonly env: Readonly<Record<string, string | undefined>>;
   readonly initialiseFirebase: typeof initialiseFirebase;
   readonly connectRedis: typeof connectRedis;
@@ -176,6 +178,8 @@ export async function runPreflight(deps: PreflightDependencies): Promise<Preflig
   if (!configResult.ok) {
     return { ok: false, stage: 'config', problems: configResult.problems };
   }
+  try { deps.assertReleaseCompatibility(); }
+  catch { return { ok: false, stage: 'release', problems: ['release/recovery-protocol-incompatible'] }; }
   // `Config` (API) carries every field `SharedConfig` does, plus the API's
   // own — structurally a superset, so it satisfies `SharedConfig` directly.
   // `loadRunnerConfig` succeeded too (checked above) and parses the identical
@@ -266,6 +270,7 @@ function printResult(result: PreflightResult): void {
 
 async function main(): Promise<void> {
   const result = await runPreflight({
+    assertReleaseCompatibility: assertReleaseRecoveryProtocol,
     env: process.env,
     initialiseFirebase,
     connectRedis,

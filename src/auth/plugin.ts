@@ -93,7 +93,7 @@ export function registerAuth(app: FastifyInstance, firebaseAuth: Auth): void {
       const code =
         firebaseCode === undefined ? undefined : tokenFailureCodes.get(firebaseCode);
 
-      request.log.info({ firebaseCode }, 'id token rejected');
+      request.log.info({ code: code ?? 'auth/token-invalid' }, 'id token rejected');
 
       throw new AppError({
         code: code ?? 'auth/token-invalid',

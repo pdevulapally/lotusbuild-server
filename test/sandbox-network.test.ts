@@ -17,7 +17,11 @@ test('sandbox service takes policy from the resolved plan for primary and valida
   const plans = new Map(planDocuments.map((doc) => [doc.key, parsePlan(doc, `plans/${doc.key}`, registry)]));
   const policies: SandboxNetworkPolicy[] = [];
   const running = { externalId: 'fixture', lifetime: async () => ({ startedAt: new Date(0), endAt: new Date(60000) }) } as RunningSandbox;
-  const adapter = { start: async (_provider, context) => { policies.push(context.networkPolicy); return running; } } as SandboxAdapter;
+  const adapter: SandboxAdapter = { connect: async () => running, terminate: async () => true, start: async (_provider, context) => {
+    policies.push(context.networkPolicy);
+    await context.lifecycle?.beforeCreate(); await context.lifecycle?.created(running);
+    return running;
+  } };
   const service = new SandboxService({ get: async () => ({ registry, plans }) } as unknown as ConfigurationStore,
     { markInFlight: async () => {}, recordSandbox: async () => {} } as unknown as MeteringService,
     new Map([['e2b', adapter]]));
@@ -29,7 +33,9 @@ test('sandbox service takes policy from the resolved plan for primary and valida
     }) } };
   await service.acquire(input);
   await service.acquire({ ...input, source: { ...running,
-    forkForValidation: async (_timeout, policy) => { policies.push(policy); return running; } } });
+    forkForValidation: async (_timeout, policy, lifecycle) => {
+      policies.push(policy); await lifecycle?.beforeCreate(); await lifecycle?.created(running); return running;
+    } } });
   assert.deepEqual(policies, [plans.get('business')!.sandboxNetwork, plans.get('business')!.sandboxNetwork]);
   await assert.rejects(service.acquire({ ...input, entitlements: { planKey: 'unknown' } as UserEntitlements }), /not configured/);
   assert.equal(policies.length, 2);

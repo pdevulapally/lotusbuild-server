@@ -870,6 +870,25 @@ test('cancellation stops the primary model call', async () => {
   );
 });
 
+test('cancellation observed after a successful model return rejects the turn but retains authoritative usage', async () => {
+  const controller = new AbortController();
+  const metering = new FakeMetering();
+  await assert.rejects(turn({ signal: controller.signal, metering, script: [() => {
+    controller.abort(); return say('Must not become a completed answer');
+  }] }), /aborted/);
+  assert.deepEqual(metering.consumed, [{ meterKey: 'ai.tokens.input', quantity: 10 }, { meterKey: 'ai.tokens.output', quantity: 20 }]);
+});
+
+test('cancellation after command mutation prevents another model call and normal tool-result publication', async () => {
+  const controller = new AbortController();
+  const sandbox = new FakeSandbox();
+  const published: Published[] = [];
+  sandbox.runCommand = async () => { sandbox.writes.push('partial-change'); controller.abort(); return { exitCode: 0, stdout: 'changed', stderr: '' }; };
+  await assert.rejects(turn({ sandbox, published, signal: controller.signal,
+    script: [() => call('run_command', { command: 'mutate' }), () => { throw new Error('A second model call must not start'); }] }), /aborted/);
+  assert.deepEqual(sandbox.writes, ['partial-change']);
+});
+
 test('cancellation stops a specialist model call', async () => {
   const controller = new AbortController();
 

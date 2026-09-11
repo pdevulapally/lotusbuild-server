@@ -37,20 +37,22 @@ export async function connectRedis(
   // 'error' event on an EventEmitter takes the process down. A reconnect blip
   // must be reported, not fatal: commands fail on their own because the offline
   // queue is disabled, so the caller already learns about it.
-  redis.on('error', onError);
+  // Redis AUTH errors can carry command.args, including the password.
+  redis.on('error', () => onError(new Error('REDIS_URL connection error.')));
 
   try {
     await redis.connect();
-  } catch (cause) {
+  } catch {
     throw new EnvironmentError([
-      `REDIS_URL points at ${config.REDIS_URL.host}, which did not accept a connection — ` +
-        `${cause instanceof Error ? cause.message : String(cause)}`,
+      'REDIS_URL could not establish a connection; check reachability and authentication.',
     ]);
   }
 
-  const pong = await redis.ping();
+  let pong: string;
+  try { pong = await redis.ping(); }
+  catch { throw new EnvironmentError(['REDIS_URL readiness check failed.']); }
   if (pong !== 'PONG') {
-    throw new Error(`Redis at ${config.REDIS_URL.host} answered PING with "${pong}".`);
+    throw new EnvironmentError(['REDIS_URL returned an unexpected PING response.']);
   }
 
   return redis;

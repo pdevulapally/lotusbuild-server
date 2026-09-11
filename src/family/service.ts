@@ -119,6 +119,8 @@ export class FamilyService {
       const old = await tx.get(ref);
       const erasure = await tx.get(this.#db.doc(`accountErasures/${parentUid}`));
       if (erasure.exists || grant.data()?.['enabled'] !== true || project.data()?.['ownerUid'] !== parentUid || project.data()?.['status'] === 'deleting') throw denied();
+      // Retained requests keep their owner, including when legacy metadata is missing.
+      if (old.exists && old.data()?.['parentUid'] !== parentUid) throw denied();
       if (old.data()?.['status'] === 'PENDING' || old.data()?.['status'] === 'APPROVING') {
         throw new AppError({ code: 'family/request-pending', statusCode: 409, message: 'A build request is already waiting for this project.' });
       }
@@ -131,7 +133,9 @@ export class FamilyService {
   async buildRequests(parent: AuthenticatedUser, childUid: string, limit = 100, after?: string) {
     verified(parent);
     await this.#db.runTransaction((tx) => this.#requireLink(tx, childUid, parent.uid));
-    let query = this.#db.collection(`familyLinks/${childUid}/buildRequests`).orderBy(FieldPath.documentId());
+    // A current link does not transfer ownership of retained requests. Scope before paging.
+    let query = this.#db.collection(`familyLinks/${childUid}/buildRequests`)
+      .where('parentUid', '==', parent.uid).orderBy(FieldPath.documentId());
     if (after !== undefined) query = query.startAfter(after);
     const page = await query.limit(limit).get();
     return page.docs.map((doc) => ({ projectId: doc.id, requestId: doc.data()['requestId'], status: doc.data()['status'],

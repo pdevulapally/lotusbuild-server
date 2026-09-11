@@ -725,7 +725,8 @@ export class MeteringService {
       for (const id of ids) {
         const ref = this.#reservationRef(uid, id);
         const snapshot = await tx.get(ref);
-        if (!snapshot.exists || snapshot.data()?.['status'] !== 'OPEN') {
+        if (!snapshot.exists || snapshot.data()?.['status'] !== 'OPEN'
+          || snapshot.data()?.['sandboxStopped'] === true || snapshot.data()?.['sandboxNotCreated'] === true) {
           throw new Error('Cannot dispatch against a missing or closed reservation.');
         }
         records.push(ref);
@@ -734,8 +735,23 @@ export class MeteringService {
     });
   }
 
-  /** Persist termination evidence before closing any accounting hold. */
-  async confirmSandboxStopped(uid: string, ids: readonly string[], stoppedAt?: Date): Promise<void> {
+  /** Only for a failed acquisition that never dispatched a provider create/fork request. */
+  async confirmSandboxNotCreated(uid: string, ids: readonly string[]): Promise<void> {
+    await this.#firestore.runTransaction(async (tx) => {
+      const refs: DocumentReference[] = [];
+      for (const id of ids) {
+        const ref = this.#reservationRef(uid, id);
+        const snapshot = await tx.get(ref);
+        if (!snapshot.exists) throw new Error('A sandbox reservation is missing.');
+        if (snapshot.data()?.['sandboxExternalId'] !== undefined) throw new Error('Sandbox creation already has resource evidence.');
+        if (snapshot.data()?.['status'] === 'OPEN') refs.push(ref);
+      }
+      for (const ref of refs) tx.update(ref, { inFlight: false, sandboxNotCreated: true, updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+
+  /** Persist resource-specific termination evidence even when lifetime metadata is unavailable. */
+  async confirmSandboxStopped(uid: string, ids: readonly string[], externalId: string, stoppedAt?: Date): Promise<void> {
     const { registry } = await this.#configuration.get();
     await this.#firestore.runTransaction(async (tx) => {
       const changes: { ref: DocumentReference; data: Record<string, unknown> }[] = [];
@@ -744,30 +760,54 @@ export class MeteringService {
         const snapshot = await tx.get(ref);
         if (!snapshot.exists) throw new Error('A sandbox reservation is missing.');
         const fields = snapshot.data() ?? {};
+        if (fields['sandboxExternalId'] !== externalId) throw new Error('Termination evidence belongs to another sandbox.');
         const meter = registry.meters.get(stringField(fields, 'meterKey', ref.path));
         if (meter === undefined) throw new Error('Unknown sandbox meter.');
         if (fields['status'] !== 'OPEN') continue;
-        if (meter.kind === 'GAUGE') changes.push({ ref, data: { inFlight: false } });
-        else if (stoppedAt !== undefined) {
+        const evidence: Record<string, unknown> = { sandboxStopped: true };
+        // Preserve the first known stop time; retrying cleanup must not increase usage.
+        const stop = fields['sandboxStoppedAt'] === undefined ? stoppedAt : timestampField(fields, 'sandboxStoppedAt', ref.path);
+        if (stop !== undefined) evidence['sandboxStoppedAt'] = Timestamp.fromDate(stop);
+        if (meter.kind === 'GAUGE') evidence['inFlight'] = false;
+        else if (stop !== undefined && fields['observedQuantity'] === undefined
+          && fields['sandboxStartedAt'] !== undefined && fields['sandboxEndAt'] !== undefined) {
           const start = timestampField(fields, 'sandboxStartedAt', ref.path);
           const end = timestampField(fields, 'sandboxEndAt', ref.path);
-          const actual = Math.max(1, Math.ceil((Math.min(stoppedAt.getTime(), end.getTime()) - start.getTime()) / 1000));
-          changes.push({ ref, data: { observedQuantity: Math.min(actual, integerField(fields, 'estimatedQuantity', ref.path, { min: 1 })) } });
+          const actual = Math.max(1, Math.ceil((Math.min(stop.getTime(), end.getTime()) - start.getTime()) / 1000));
+          evidence['observedQuantity'] = Math.min(actual, integerField(fields, 'estimatedQuantity', ref.path, { min: 1 }));
         }
+        changes.push({ ref, data: evidence });
       }
       for (const { ref, data } of changes) tx.update(ref, { ...data, updatedAt: FieldValue.serverTimestamp() });
     });
   }
 
-  async recordSandbox(uid: string, ids: readonly string[], input: { externalId: string; platform: string; startedAt: Date; endAt: Date }): Promise<void> {
+  async recordSandbox(uid: string, ids: readonly string[], input: { externalId: string; platform: string; startedAt?: Date; endAt?: Date }): Promise<void> {
+    if (!input.externalId || !input.platform) throw new Error('Sandbox identity is missing.');
+    if ((input.startedAt === undefined) !== (input.endAt === undefined)
+      || (input.startedAt !== undefined && input.endAt !== undefined
+        && (!Number.isFinite(input.startedAt.getTime()) || !Number.isFinite(input.endAt.getTime()) || input.endAt <= input.startedAt))) {
+      throw new Error('Sandbox lifetime metadata is invalid.');
+    }
     await this.#firestore.runTransaction(async (tx) => {
       const refs = ids.map((id) => this.#reservationRef(uid, id));
       for (const ref of refs) {
         const snapshot = await tx.get(ref);
-        if (snapshot.data()?.['status'] !== 'OPEN') throw new Error('Sandbox hold is not open.');
+        const fields = snapshot.data() ?? {};
+        if (fields['status'] !== 'OPEN' || fields['sandboxNotCreated'] === true) throw new Error('Sandbox hold is not open for registration.');
+        if ((fields['sandboxExternalId'] !== undefined && fields['sandboxExternalId'] !== input.externalId)
+          || (fields['sandboxPlatform'] !== undefined && fields['sandboxPlatform'] !== input.platform)) {
+          throw new Error('Sandbox reservation identity cannot change.');
+        }
+        for (const [key, value] of [['sandboxStartedAt', input.startedAt], ['sandboxEndAt', input.endAt]] as const) {
+          if (value !== undefined && fields[key] !== undefined && timestampField(fields, key, ref.path).getTime() !== value.getTime()) {
+            throw new Error('Recorded sandbox lifetime cannot change.');
+          }
+        }
       }
       for (const ref of refs) tx.update(ref, { sandboxExternalId: input.externalId, sandboxPlatform: input.platform,
-        sandboxStartedAt: Timestamp.fromDate(input.startedAt), sandboxEndAt: Timestamp.fromDate(input.endAt) });
+        ...(input.startedAt === undefined ? {} : { sandboxStartedAt: Timestamp.fromDate(input.startedAt) }),
+        ...(input.endAt === undefined ? {} : { sandboxEndAt: Timestamp.fromDate(input.endAt) }) });
     });
   }
 
@@ -775,6 +815,32 @@ export class MeteringService {
     const snapshot = await this.#reservationRef(uid, id).get();
     if (!snapshot.exists) throw new Error('Reservation is missing.');
     return snapshot.data() ?? {};
+  }
+
+  /** Execution may end independently of settlement, but never without durable resource-stop evidence. */
+  async assertSandboxesStoppedIn(transaction: Transaction, uid: string, ids: readonly string[],
+    requiredSandboxIds: readonly string[]): Promise<void> {
+    const { registry } = await this.#configuration.get();
+    const sandboxMeters = new Set([registry.sandboxTimeMeterKey,
+      ...[...registry.sandboxProviders.values()].map((provider) => provider.concurrencyMeterKey)]);
+    const stopped = new Set<string>();
+    for (const id of ids) {
+      const ref = this.#reservationRef(uid, id);
+      const snapshot = await transaction.get(ref);
+      if (!snapshot.exists) throw new Error('Resource accounting evidence is missing.');
+      const fields = snapshot.data() ?? {};
+      enumField(fields, 'status', ref.path, reservationStatuses);
+      const meterKey = stringField(fields, 'meterKey', ref.path);
+      if (!registry.meters.has(meterKey)) throw new Error('Resource accounting meter is unknown.');
+      if (!sandboxMeters.has(meterKey) && fields['sandboxExternalId'] === undefined) continue;
+      if (fields['sandboxNotCreated'] === true && fields['sandboxExternalId'] === undefined) continue;
+      if (fields['sandboxStopped'] !== true) throw new Error('Sandbox execution is not confirmed stopped.');
+      stringField(fields, 'sandboxPlatform', ref.path);
+      stopped.add(stringField(fields, 'sandboxExternalId', ref.path));
+    }
+    if (requiredSandboxIds.some((id) => !stopped.has(id))) {
+      throw new Error('Attached sandbox termination evidence is missing.');
+    }
   }
 
   async recordObservedUsage(uid: string, id: string, quantity: number, evidence?: string): Promise<void> {
