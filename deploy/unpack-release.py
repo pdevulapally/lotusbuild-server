@@ -9,6 +9,16 @@ import subprocess
 import sys
 import tarfile
 
+def protocol_field(metadata):
+    version = metadata.get('runnerRecoveryProtocol') if isinstance(metadata, dict) else None
+    if type(version) is not int or not 1 <= version <= 2147483647:
+        raise ValueError('release/recovery-protocol-incompatible')
+    return version
+
+
+def supported_protocol():
+    return protocol_field(json.loads((Path(__file__).resolve().parents[1] / 'package.json').read_text(encoding='utf-8')))
+
 
 def runtime_fingerprint():
     # Built-in Node APIs only. No imports from the candidate or its dependencies.
@@ -33,10 +43,12 @@ def build_metadata(revision):
     if runtime.get('platform') != 'linux':
         raise ValueError('A Linux/glibc builder is required')
     glibc_version(runtime.get('glibc'))
-    return {'revision': revision, **runtime}
+    return {'revision': revision, **runtime,
+            'runnerRecoveryProtocol': supported_protocol()}
 
 
-def unpack(archive, digest, revision, target=None):
+def unpack(archive, digest, revision, target=None, expected_protocol=None):
+    supported = supported_protocol() if expected_protocol is None else protocol_field({'runnerRecoveryProtocol': expected_protocol})
     if not re.fullmatch(r'[0-9a-f]{64}', digest) or not re.fullmatch(r'[0-9a-f]{40,64}', revision):
         raise ValueError('Invalid release checksum or revision')
     # Keep the same file descriptor for checksum, validation and extraction.
@@ -79,6 +91,14 @@ def unpack(archive, digest, revision, target=None):
                 raise ValueError('Invalid release metadata')
             with payload.extractfile(members['release.json']) as metadata_file:
                 metadata = json.load(metadata_file)
+            if members['package.json'].size > 16384:
+                raise ValueError('Invalid package metadata')
+            with payload.extractfile(members['package.json']) as package_file:
+                package = json.load(package_file)
+            if not isinstance(metadata, dict) or not isinstance(package, dict) or any(
+                protocol_field(item) != supported for item in (metadata, package)
+            ):
+                raise ValueError('release/recovery-protocol-incompatible')
             runtime = runtime_fingerprint()
             if not isinstance(metadata, dict) or metadata.get('revision') != revision:
                 raise ValueError('Release revision mismatch')
@@ -112,10 +132,15 @@ def unpack(archive, digest, revision, target=None):
 
 if __name__ == '__main__':
     try:
-        if len(sys.argv) == 3 and sys.argv[1] == '--metadata':
+        if len(sys.argv) == 2 and sys.argv[1] == '--protocol':
+            print(supported_protocol())
+        elif len(sys.argv) == 3 and sys.argv[1] == '--metadata':
             print(json.dumps(build_metadata(sys.argv[2])))
-        elif len(sys.argv) == 5:
-            unpack(*sys.argv[1:4], None if sys.argv[4] == '--check-only' else sys.argv[4])
+        elif len(sys.argv) in (5, 6):
+            if len(sys.argv) == 6 and not re.fullmatch(r'[1-9][0-9]{0,9}', sys.argv[5]):
+                raise ValueError('release/recovery-protocol-incompatible')
+            expected = None if len(sys.argv) == 5 else int(sys.argv[5])
+            unpack(*sys.argv[1:4], None if sys.argv[4] == '--check-only' else sys.argv[4], expected)
         else:
             raise ValueError('Usage: unpack-release.py --metadata COMMIT_SHA | ARCHIVE SHA256 COMMIT_SHA TARGET|--check-only')
     except (ValueError, OSError, tarfile.TarError, subprocess.SubprocessError) as error:

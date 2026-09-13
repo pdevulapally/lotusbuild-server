@@ -20,7 +20,7 @@ import type { SessionEvents } from './sessions/events.ts';
 import type { SessionRepository } from './sessions/repository.ts';
 import { registerSessionRoutes } from './sessions/routes.ts';
 import type { UserRepository } from './users/repository.ts';
-import { registerErrorHandler } from './http/errors.ts';
+import { registerErrorHandler, safeErrorDiagnostic } from './http/errors.ts';
 import { registerRateLimiting } from './http/rate-limit.ts';
 import { redisKeyPrefixes } from './redis/client.ts';
 
@@ -53,7 +53,10 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
   const { firebaseAuth, redis, entitlements, metering, users, projects, sessions, sessionEvents } =
     dependencies;
   const app = Fastify({
-    logger: { level: config.LOG_LEVEL },
+    logger: { level: config.LOG_LEVEL, serializers: {
+      // Fastify's serializer type requires these strings; none comes from the error.
+      err: (error) => ({ type: 'SafeErrorDiagnostic', message: 'Operational failure', stack: '', ...safeErrorDiagnostic(error) }),
+    } },
     // Trust the reverse proxy in front of us for client IP and protocol, which
     // rate limiting and redirect construction both depend on being correct.
     trustProxy: 'loopback',

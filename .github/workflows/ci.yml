@@ -51,15 +51,23 @@ jobs:
       - name: Verify no secret is committed
         run: |
           set -euo pipefail
-          if git ls-files | grep -iE '(^|/)\.env($|\.)|adminsdk|service-account|\.pem$|\.p12$'; then
-            echo "::error::A credential-shaped file is tracked by git."
-            exit 1
-          fi
-          # Excludes this workflow, whose own pattern would otherwise match it.
-          if git grep -nIE 'sk_live_|sk_test_|whsec_|-----BEGIN [A-Z ]*PRIVATE KEY-----' -- . ':!.github/'; then
-            echo "::error::A credential-shaped string is committed."
-            exit 1
-          fi
+          # Neither matched content nor scanner stderr may enter workflow logs.
+          files=$(git ls-files 2>/dev/null) || { echo '::error::Secret scanner file enumeration failed.'; exit 2; }
+          status=0
+          grep -iE '(^|/)\.env($|\.)|adminsdk|service-account|\.pem$|\.p12$' <<< "$files" >/dev/null 2>&1 || status=$?
+          case "$status" in
+            0) echo '::error::A credential-shaped file is tracked by git.'; exit 1 ;;
+            1) ;;
+            *) echo '::error::Secret scanner filename check failed.'; exit 2 ;;
+          esac
+          # Equivalent patterns avoid matching their own definitions; .github is covered.
+          status=0
+          git grep -lIE 'sk[_]live_|sk[_]test_|whsec[_]|-----BEGIN [A-Z ]*PRIVATE KEY-----' -- . >/dev/null 2>&1 || status=$?
+          case "$status" in
+            0) echo '::error::A credential-shaped string is committed.'; exit 1 ;;
+            1) ;;
+            *) echo '::error::Secret scanner content check failed.'; exit 2 ;;
+          esac
           echo "No tracked secrets."
 
       - name: Package the checked release without production credentials

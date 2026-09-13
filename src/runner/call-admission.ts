@@ -28,12 +28,30 @@ export function createCallAdmission(deps: {
     async begin(input) {
       input.signal.throwIfAborted();
       await deps.authorize();
+      input.signal.throwIfAborted();
       const count = await deps.anthropic.messages.countTokens(input.params, { signal: input.signal });
+      input.signal.throwIfAborted();
       if (!Number.isSafeInteger(count.input_tokens) || count.input_tokens <= 0) {
         throw new Error('Anthropic returned no usable input-token estimate.');
       }
       const holds: { id: string; kind: 'input' | 'output' }[] = [];
-      let dispatchMarked = false;
+      const settle = async (usage: AuthoritativeUsage): Promise<void> => {
+        const failures: unknown[] = [];
+        for (const hold of holds) {
+          const actual = usage[hold.kind];
+          if (actual === undefined) {
+            deps.onProblem(new Error('Authoritative usage is unavailable; the hold remains open.'), 'model usage reconciliation required');
+            continue;
+          }
+          try {
+            await deps.metering.recordObservedUsage(deps.uid, hold.id, actual);
+            await deps.metering.settle({ uid: deps.uid, reservationId: hold.id,
+              actualQuantity: actual, recordOverrun: hold.kind === 'input', now: new Date() });
+            await deps.reservations.forget(hold.id);
+          } catch (error) { failures.push(error); }
+        }
+        if (failures.length > 0) throw new AggregateError(failures, 'Recording model usage failed.');
+      };
       try {
         holds.push({ ...await deps.reservations.take({ meterKey: deps.inputMeterKey,
           quantity: count.input_tokens, operationId: `model-input:${deps.sessionId}` }), kind: 'input' });
@@ -45,42 +63,24 @@ export function createCallAdmission(deps: {
         // be observed before generation. No provider work has started yet.
         await deps.authorize();
         input.signal.throwIfAborted();
-        // Set before awaiting: a lost commit acknowledgement is also ambiguous.
-        dispatchMarked = true;
+        // Persist crash uncertainty before generation. This write is not dispatch.
         await deps.metering.markInFlight(deps.uid, [
           ...holds.map((hold) => hold.id),
           ...(input.outputReservationId === undefined ? [] : [input.outputReservationId]),
         ]);
+        input.signal.throwIfAborted();
       } catch (cause) {
-        if (!dispatchMarked) {
-          for (const hold of holds) {
-            try {
-              await deps.metering.release(deps.uid, hold.id);
-              await deps.reservations.forget(hold.id);
-            } catch (cleanup) { deps.onProblem(cleanup instanceof Error ? cleanup : new Error(String(cleanup)), 'releasing an undispatched model hold'); }
-          }
+        // begin never invokes generation, even when the marker committed but its
+        // acknowledgement was lost. Journal known zero before closing so recovery
+        // can finish settlement if its own acknowledgement is lost. A specialist's
+        // shared output hold belongs to its caller and may contain earlier usage.
+        try { await settle({ input: 0, output: 0 }); }
+        catch {
+          deps.onProblem(new Error('Known-undispatched model usage reconciliation failed.'), 'closing an undispatched model call');
         }
         throw cause;
       }
-      return {
-        async settle(usage) {
-          const failures: unknown[] = [];
-          for (const hold of holds) {
-            const actual = usage[hold.kind];
-            if (actual === undefined) {
-              deps.onProblem(new Error('Authoritative usage is unavailable; the hold remains open.'), 'model usage reconciliation required');
-              continue;
-            }
-            try {
-              await deps.metering.recordObservedUsage(deps.uid, hold.id, actual);
-              await deps.metering.settle({ uid: deps.uid, reservationId: hold.id,
-                actualQuantity: actual, recordOverrun: hold.kind === 'input', now: new Date() });
-              await deps.reservations.forget(hold.id);
-            } catch (error) { failures.push(error); }
-          }
-          if (failures.length > 0) throw new AggregateError(failures, 'Recording model usage failed.');
-        },
-      };
+      return { settle };
     },
   };
 }

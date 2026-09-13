@@ -41,14 +41,15 @@ export interface GitIdentity {
 }
 
 export interface SnapshotPublisher {
-  assertPersistenceLease(authority: SessionLease): Promise<void>;
+  assertPersistenceLease(authority: SessionLease, cleanup?: boolean): Promise<void>;
   reserveSnapshotUpload(authority: SessionLease, entitlements: UserEntitlements,
-    input: { id: string; objectName: string; bytes: number; expiresAt: Date }): Promise<void>;
+    input: { id: string; objectName: string; bytes: number; expiresAt: Date }, cleanup?: boolean): Promise<void>;
   publishSnapshot(
     authority: SessionLease,
     entitlements: UserEntitlements,
     snapshot: UploadedSnapshot,
     uploadId: string,
+    cleanup?: boolean,
   ): Promise<{ readonly projectId: string; readonly previous: StoredSnapshot }>;
 }
 
@@ -191,11 +192,12 @@ export class ProjectPersistence {
     readonly entitlements: UserEntitlements;
     readonly authority: SessionLease;
     readonly commitMessage: string;
+    readonly cleanup?: boolean;
   }): Promise<SaveOutcome> {
     // This pre-check stops a runner that is already stale before it commits or
     // archives anything. The guarded publish below is still required because
     // ownership can change while the archive is being uploaded.
-    await this.#publisher.assertPersistenceLease(input.authority);
+    await this.#publisher.assertPersistenceLease(input.authority, input.cleanup);
 
     const stdout = await this.#run(
       input.sandbox,
@@ -223,7 +225,7 @@ export class ProjectPersistence {
     const bytes = Number(size);
     const uploadId = `${input.authority.token}-${randomUUID()}`;
     const upload = await this.#snapshots.createUpload(input.project.id, uploadId, bytes, async (objectName, expiresAt) => {
-      await this.#publisher.reserveSnapshotUpload(input.authority, input.entitlements, { id: uploadId, objectName, bytes, expiresAt });
+      await this.#publisher.reserveSnapshotUpload(input.authority, input.entitlements, { id: uploadId, objectName, bytes, expiresAt }, input.cleanup);
     });
     await input.sandbox.writeFile(urlPath, upload.url);
     await this.#run(
@@ -249,6 +251,7 @@ export class ProjectPersistence {
       input.entitlements,
       uploaded,
       uploadId,
+      input.cleanup,
     );
     // Everything above this line decides whether the save happens; everything
     // below it has already happened. Deleting what the publish superseded is

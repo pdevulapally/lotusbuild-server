@@ -667,6 +667,20 @@ test('a former lease cannot mutate a session reclaimed by the same runner', asyn
   assert.equal(h.session('session-a')?.['status'], 'RUNNING');
 });
 
+test('a stale sandbox cleanup cannot replace or clear the successor resource pointers', async () => {
+  const h = holding(['new-hold'], ['OPEN']);
+  const current = { sessionId: 'session-a', runnerId: 'runner-1', token: 'seed-token' };
+  await h.sessions.attachSandbox('session-a', current, { sandboxId: 'new-vm', reservationIds: ['new-hold'] });
+  const stale = { ...current, token: 'old-token' };
+  await assert.rejects(h.sessions.attachSandbox('session-a', stale, { sandboxId: 'old-vm', reservationIds: ['old-hold'] }));
+  await assert.rejects(h.sessions.detachSandbox('session-a', stale));
+  await assert.rejects(h.sessions.forgetSpecialistReservation('session-a', stale, 'new-hold'));
+  assert.equal(h.session('session-a')?.['sandboxId'], 'new-vm');
+  assert.deepEqual(h.session('session-a')?.['reservationIds'], ['new-hold']);
+  assert.deepEqual(h.session('session-a')?.['specialistReservationIds'], ['new-hold']);
+  assert.equal(h.reservations.get('new-hold'), 'OPEN');
+});
+
 test('an expired lease cannot heartbeat or finalize its own session', async () => {
   const h = holding([], []);
   h.firestore.seed('sessions/session-a', { ...h.session('session-a'), claimableAt: Timestamp.fromMillis(0) });
@@ -674,6 +688,66 @@ test('an expired lease cannot heartbeat or finalize its own session', async () =
   await assert.rejects(h.sessions.heartbeat('session-a', expired));
   await assert.rejects(h.sessions.finish('session-a', expired, { status: 'IDLE' }));
   assert.equal(h.project()?.['activeSessionId'], 'session-a');
+});
+
+test('cleanup permission allows cancellation saves and heartbeat but never a stale lease or account erasure', async () => {
+  const h = holding([], []);
+  const lease = { sessionId: 'session-a', runnerId: 'runner-1', token: 'seed-token' };
+  h.firestore.seed('sessions/session-a', { ...h.session('session-a'), cancelRequested: true });
+  await assert.rejects(h.sessions.assertPersistenceLease(lease), { code: 'session/cancelled' });
+  await h.sessions.assertPersistenceLease(lease, true);
+  await h.sessions.heartbeat('session-a', lease, new Date(), true);
+  await assert.rejects(h.sessions.assertPersistenceLease({ ...lease, token: 'stale' }, true), { code: 'session/lease-lost' });
+  h.firestore.seed('accountErasures/user-1', { status: 'PENDING' });
+  await assert.rejects(h.sessions.assertPersistenceLease(lease, true), { code: 'account/erasure-pending' });
+});
+
+test('shutdown preserves queued work and yielding retains the project guard for successor recovery', async () => {
+  const h = holding([], []);
+  const lease = { sessionId: 'session-a', runnerId: 'runner-1', token: 'seed-token' };
+  await h.sessions.enqueueMessage('user-1', 'session-a', 'Preserve this follow-up');
+  const before = h.charges();
+  await assert.rejects(h.sessions.dequeueNextMessage('session-a', lease, AbortSignal.abort()));
+  await h.sessions.yieldForRecovery('session-a', lease);
+  assert.equal(h.project()?.['activeSessionId'], 'session-a');
+  assert.equal(h.session('session-a')?.['status'], 'RUNNING');
+  assert.equal(h.charges(), before);
+  await assert.rejects(h.sessions.yieldForRecovery('session-a', lease));
+  const successor = await h.sessions.claim('runner-2');
+  assert.equal(successor?.id, 'session-a');
+  const next = await h.sessions.dequeueNextMessage('session-a', { sessionId: 'session-a', runnerId: 'runner-2', token: successor!.leaseToken });
+  assert.equal(next?.prompt, 'Preserve this follow-up');
+});
+
+test('shutdown blocks pending-turn adoption and new claims without consuming or charging the prompt', async () => {
+  const h = holding([], []);
+  const lease = { sessionId: 'session-a', runnerId: 'runner-1', token: 'seed-token' };
+  await h.sessions.enqueueMessage('user-1', 'session-a', 'Deferred prompt');
+  await h.sessions.finish('session-a', lease, { status: 'IDLE' });
+  await assert.rejects(h.sessions.claim('runner-2', new Date(), AbortSignal.abort()));
+  const successor = await h.sessions.claim('runner-2');
+  const current = { sessionId: 'session-a', runnerId: 'runner-2', token: successor!.leaseToken };
+  const before = h.charges();
+  await assert.rejects(h.sessions.startPendingTurn('session-a', current, AbortSignal.abort()));
+  assert.equal(h.charges(), before);
+  assert.equal(h.session('session-a')?.['queuedTurnPending'], true);
+  assert.equal(await h.sessions.startPendingTurn('session-a', current), true);
+});
+
+test('shutdown observed inside queue adoption rolls back the charge and preserves the prompt', async (t) => {
+  const h = holding([], []);
+  const lease = { sessionId: 'session-a', runnerId: 'runner-1', token: 'seed-token' };
+  await h.sessions.enqueueMessage('user-1', 'session-a', 'Keep this prompt');
+  const before = h.charges();
+  const controller = new AbortController();
+  const read = h.projects.readOwnedInTransaction.bind(h.projects);
+  t.mock.method(h.projects, 'readOwnedInTransaction', async (...args: Parameters<typeof read>) => {
+    const project = await read(...args); controller.abort(); return project;
+  });
+  await assert.rejects(h.sessions.dequeueNextMessage('session-a', lease, controller.signal));
+  assert.equal(h.charges(), before);
+  t.mock.restoreAll();
+  assert.equal((await h.sessions.dequeueNextMessage('session-a', lease))?.prompt, 'Keep this prompt');
 });
 
 for (const outcome of [
@@ -759,6 +833,79 @@ async function routeApp(h: ReturnType<typeof harness>, append: SessionEvents['ap
   return app;
 }
 const authHeaders = { authorization: 'Bearer fixture-token' };
+
+for (const status of ['FAILED', 'IDLE', 'QUEUED', 'RUNNING'] as const) {
+  for (const steer of [false, true]) {
+    test(`unrecoverable ${status} prompt route rejects steer=${steer} without writes or events`, async (t) => {
+      const h = harness(); h.seedSession('blocked', 'project-1', status);
+      h.firestore.seed('sessions/blocked', { ...h.session('blocked'), workspaceRecovery: {
+        status: 'UNRECOVERABLE', sandboxId: 'private-sandbox', reason: 'sandbox-absent',
+      } });
+      const before = JSON.stringify([...h.firestore.documents]); let published = 0;
+      const app = await routeApp(h, async (_id, type, data) => { published++; return { id: '1-0', type, data }; });
+      t.after(() => app.close());
+      const response = await app.inject({ method: 'POST', url: '/sessions/blocked/messages', headers: authHeaders, payload: { prompt: 'Continue', steer } });
+      assert.equal(response.statusCode, 409);
+      assert.deepEqual(response.json().error, { code: 'session/workspace-unrecoverable',
+        message: 'The latest unsaved workspace state could not be recovered. This session cannot accept new work.' });
+      assert.equal(published, 0); assert.equal(JSON.stringify([...h.firestore.documents]), before);
+    });
+  }
+}
+
+test('foreign unrecoverable sessions retain generic not-found prompt responses', async (t) => {
+  const h = harness(); h.seedSession('foreign', 'project-1', 'FAILED');
+  h.firestore.seed('sessions/foreign', { ...h.session('foreign'), ownerUid: 'user-2',
+    workspaceRecovery: { status: 'UNRECOVERABLE', sandboxId: 'private-sandbox' } });
+  const app = await routeApp(h); t.after(() => app.close());
+  const before = JSON.stringify([...h.firestore.documents]);
+  const response = await app.inject({ method: 'POST', url: '/sessions/foreign/messages', headers: authHeaders, payload: { prompt: 'Continue' } });
+  assert.equal(response.statusCode, 404); assert.equal(response.json().error.code, 'session/not-found');
+  assert.equal(response.body.includes('unrecoverable'), false);
+  assert.equal(JSON.stringify([...h.firestore.documents]), before);
+});
+
+test('REQUIRED retains ordinary busy semantics and permits staging salvageable queued work', async () => {
+  const h = harness(); h.seedSession('pending', 'project-1', 'RUNNING');
+  h.firestore.seed('projects/project-1', { ...h.project(), activeSessionId: 'pending' });
+  h.firestore.seed('sessions/pending', { ...h.session('pending'), workspaceRecovery: { status: 'REQUIRED', sandboxId: 'vm' } });
+  await assert.rejects(h.sessions.appendPrompt('user-1', 'pending', 'Append'), { code: 'session/busy' });
+  await h.sessions.enqueueMessage('user-1', 'pending', 'Queue after salvage');
+  assert.equal(h.charges(), 0); assert.equal(h.session('pending')?.['workspaceRecovery'] !== undefined, true);
+});
+
+for (const path of ['append', 'queue', 'steer'] as const) {
+  test(`unrecoverable transition during ${path} admission invalidates the transaction`, async (t) => {
+    const h = harness(); h.seedSession('racing', 'project-1', path === 'append' ? 'FAILED' : 'RUNNING');
+    if (path !== 'append') h.firestore.seed('projects/project-1', { ...h.project(), activeSessionId: 'racing' });
+    h.firestore.seed('sessions/racing', { ...h.session('racing'), workspaceRecovery: { status: 'REQUIRED', sandboxId: 'vm' } });
+    const read = h.projects.readOwnedInTransaction.bind(h.projects); let transitioned = false;
+    t.mock.method(h.projects, 'readOwnedInTransaction', async (...args: Parameters<typeof read>) => {
+      const project = await read(...args);
+      if (!transitioned) {
+        transitioned = true;
+        if (path === 'append') {
+          // Commit between admission's session read and its commit. The fake
+          // detects the changed version and retries the original transaction.
+          await h.firestore.runTransaction(async (tx) => {
+            const ref = h.firestore.doc('sessions/racing') as unknown as DocumentReference;
+            await tx.get(ref); tx.update(ref, { workspaceRecovery: { status: 'UNRECOVERABLE', sandboxId: 'vm' } });
+          });
+        } else await h.sessions.markWorkspaceUnrecoverable(authority(h, 'racing'), 'sandbox-absent');
+      }
+      return project;
+    });
+    const admit = path === 'append' ? h.sessions.appendPrompt('user-1', 'racing', 'Continue')
+      : path === 'queue' ? h.sessions.enqueueMessage('user-1', 'racing', 'Continue')
+      : h.sessions.queueSteerMessage('user-1', 'racing', 'Continue');
+    await assert.rejects(admit, { code: 'session/workspace-unrecoverable' });
+    assert.equal(transitioned, true); assert.equal(h.charges(), 0);
+    assert.equal([...h.firestore.documents.keys()].some((key) => key.includes('/messages/') || key.includes('/queued_messages/')), false);
+    assert.equal(h.session('racing')?.['pendingSteer'], undefined);
+    assert.equal(h.session('racing')?.['messageCount'], 1);
+  });
+}
+
 function authority(h: ReturnType<typeof harness>, id: string, runnerId = 'runner-1') {
   return { sessionId: id, runnerId, token: String(h.session(id)?.['leaseToken']) };
 }

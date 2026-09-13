@@ -1,10 +1,11 @@
 import { createCallAdmission } from './call-admission.ts';
+import { readOnlyTools, workspaceTools } from './tools.ts';
 import { assertBuildAllowed } from '../entitlements/build-admission.ts';
 import type Anthropic from '@anthropic-ai/sdk';
 
 import type { EntitlementService, UserEntitlements } from '../entitlements/service.ts';
 import type { ConfigurationStore } from '../entitlements/store.ts';
-import { AppError } from '../http/errors.ts';
+import { AppError, safeErrorDiagnostic } from '../http/errors.ts';
 import type { MeteringService } from '../metering/service.ts';
 import type { ProjectPersistence, RestoreOutcome } from '../projects/persistence.ts';
 import type { Project, ProjectRepository } from '../projects/repository.ts';
@@ -22,6 +23,23 @@ import {
   blockerExplanation,
   runAgentTurn,
 } from './agent.ts';
+
+/** Safe primary/secondary categories; never retain raw provider payloads or stderr. */
+export class RunnerWorkError extends AggregateError {
+  readonly primaryCategory: string;
+  readonly secondaryStage: string;
+  constructor(primary: unknown, secondary: string) {
+    const kind = primary instanceof AppError && ['session/cancelled', 'session/lease-lost'].includes(primary.code)
+      ? primary.code : primary instanceof Error && primary.message === 'Runner shutdown requested.' ? 'runner/shutdown' : 'runner/execution-failed';
+    super([new Error(kind), new Error(secondary)], 'Runner work or recovery remains incomplete.');
+    this.name = 'RunnerWorkError';
+    this.primaryCategory = kind;
+    this.secondaryStage = secondary;
+  }
+}
+function persistenceRevoked(error: unknown): boolean {
+  return error instanceof AppError && ['account/erasure-pending', 'project/deleting', 'project/not-found'].includes(error.code);
+}
 
 /**
  * Gives back specialist token holds a dead runner left open.
@@ -101,18 +119,20 @@ export class SessionRunner {
   }
 
   /** Takes one session if there is one. Returns whether there was. */
-  async runOnce(): Promise<boolean> {
-    const session = await this.#deps.sessions.claim(this.#deps.runnerId);
+  async runOnce(shutdown?: AbortSignal): Promise<boolean> {
+    if (shutdown?.aborted) return false;
+    const session = await this.#deps.sessions.claim(this.#deps.runnerId, new Date(), shutdown);
     if (session === undefined) {
       return false;
     }
 
     this.#deps.log.info({ sessionId: session.id, uid: session.ownerUid }, 'claimed a session');
-    await this.#work(session);
+    try { await this.#work(session, shutdown); }
+    catch (error) { throw error instanceof RunnerWorkError ? error : new RunnerWorkError(error, 'runner/work-failed'); }
     return true;
   }
 
-  async #work(session: ClaimedSession): Promise<void> {
+  async #work(session: ClaimedSession, shutdown?: AbortSignal): Promise<void> {
     const { sessions, sandboxes, events, log, runnerId } = this.#deps;
     const authority: SessionLease = {
       sessionId: session.id,
@@ -129,14 +149,15 @@ export class SessionRunner {
     // decided by Firestore, and this only stops us paying for work we have
     // already lost the right to do.
     const cancellation = new AbortController();
+    const signal = shutdown === undefined ? cancellation.signal : AbortSignal.any([cancellation.signal, shutdown]);
     const stopWork = (reason: Error): void => {
       leaseLost = reason;
       cancellation.abort(reason);
     };
     const heartbeat = setInterval(() => {
-      void sessions.heartbeat(session.id, authority).catch((error: unknown) => {
+      void sessions.heartbeat(session.id, authority, new Date(), cancellation.signal.aborted).catch((error: unknown) => {
         stopWork(error instanceof Error ? error : new Error(String(error)));
-        log.warn({ sessionId: session.id, err: leaseLost }, 'lost the lease on this session');
+        log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(leaseLost) }, 'lost the lease on this session');
       });
     }, this.#deps.heartbeatSeconds * 1000);
 
@@ -159,7 +180,7 @@ export class SessionRunner {
         }
       });
     } catch (err) {
-      log.warn({ sessionId: session.id, err }, 'could not subscribe to session events');
+      log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(err) }, 'could not subscribe to session events');
     }
 
     const publish = async (type: string, data: Record<string, unknown>): Promise<void> => {
@@ -168,7 +189,7 @@ export class SessionRunner {
       } catch (error) {
         // The stream is a view of the work, not the work. Losing an event must
         // not fail a build the user is paying for, but it must be visible.
-        log.error({ sessionId: session.id, type, err: error }, 'session event was not published');
+        log.error({ sessionId: session.id, type, diagnostic: safeErrorDiagnostic(error) }, 'session event was not published');
       }
     };
 
@@ -180,6 +201,9 @@ export class SessionRunner {
     let entitlements: UserEntitlements | undefined;
     let persists = false;
     let saveAttempted = false;
+    let turnCompleted = false;
+    let saveCompleted = false;
+    let workspaceMayBeDirty = false;
     // Proof that this sandbox holds the project's history rather than an empty
     // directory. Saving without it would publish a fresh repository over a
     // snapshot the user still owns — which is exactly what a failed restore
@@ -187,8 +211,66 @@ export class SessionRunner {
     let restored: RestoreOutcome | undefined;
 
     try {
+      signal.throwIfAborted();
       project = await this.#deps.projects.readOwned(session.ownerUid, session.projectId);
-      entitlements = await this.#deps.entitlements.forUser(session.ownerUid, new Date(), true);
+      let recovery = session.workspaceRecovery;
+      if (recovery?.status === 'REQUIRED') {
+        try { await sessions.assertPersistenceLease(authority, true); }
+        catch (error) {
+          if (!persistenceRevoked(error)) throw new RunnerWorkError(error, 'workspace/salvage-authorization-failed');
+          await sessions.markWorkspaceUnrecoverable(authority, 'persistence-revoked');
+          recovery = await sessions.workspaceRecoveryState(authority);
+        }
+      }
+      if (recovery?.status !== 'UNRECOVERABLE') {
+        entitlements = await this.#deps.entitlements.forUser(session.ownerUid, new Date(), true);
+        persists = entitlements.capabilities.boolean('git.persistence');
+      }
+      if (recovery?.status === 'REQUIRED') {
+        try {
+          if (!persists) await sessions.markWorkspaceUnrecoverable(authority, 'persistence-revoked');
+          else if (!session.sandboxId || recovery.sandboxId !== session.sandboxId || !/^[a-zA-Z0-9_-]+$/.test(recovery.sandboxId)) {
+            await sessions.markWorkspaceUnrecoverable(authority, 'invalid-attachment');
+          } else {
+            const preserved = await sandboxes.reconnectForSalvage(project.platform, recovery.sandboxId);
+            if (preserved === undefined) await sessions.markWorkspaceUnrecoverable(authority, 'sandbox-absent');
+            else {
+              if (preserved.stopCommands === undefined) throw new Error('Workspace quiescence is unsupported.');
+              await preserved.stopCommands();
+              await this.#deps.persistence.save({ sandbox: preserved, provider: await sandboxes.providerFor(project.platform),
+                project, entitlements: entitlements!, authority, cleanup: true, commitMessage: `LotusBuild recovery ${session.id}` });
+            }
+          }
+          recovery = await sessions.workspaceRecoveryState(authority);
+          if (recovery?.status === 'REQUIRED') throw new Error('Salvage publication was not confirmed.');
+        } catch (error) { throw new RunnerWorkError(error, 'workspace/salvage-failed'); }
+      }
+      const abandoned = [...new Set([...session.reservationIds, ...session.specialistReservationIds])];
+      if (session.sandboxId !== undefined || abandoned.length > 0) {
+        try {
+          await sandboxes.recover({ uid: session.ownerUid, platform: project.platform,
+            externalSandboxId: session.sandboxId, reservationIds: abandoned, now: new Date(),
+            salvageRequired: recovery !== undefined && !['COMPLETED', 'UNRECOVERABLE'].includes(recovery.status),
+            onProblem: () => log.warn({ sessionId: session.id }, 'resource or usage recovery remains pending'),
+          });
+          for (const id of session.specialistReservationIds) await sessions.forgetSpecialistReservation(session.id, authority, id);
+          await sessions.detachSandbox(session.id, authority);
+        } catch (error) {
+          if (recovery?.status !== 'UNRECOVERABLE') throw new RunnerWorkError(error, 'sandbox/recovery-failed');
+          try { await sessions.finishUnrecoverable(authority); }
+          catch { throw new RunnerWorkError(error, 'workspace/terminalization-failed'); }
+          log.warn({ sessionId: session.id }, 'unrecoverable execution ended; accounting references retained for reconciliation');
+          await publish('session.failed', { error: 'The latest unsaved workspace changes could not be recovered.' });
+          return;
+        }
+      }
+      if (recovery?.status === 'UNRECOVERABLE') {
+        throw new AppError({ code: 'workspace/unrecoverable', statusCode: 409, message: 'Workspace recovery is unrecoverable: ' + recovery.reason });
+      }
+      // Salvage and cleanup are allowed on a cancelled session, new execution is not.
+      if (session.cancelRequested === true) throw new AppError({ code: 'session/cancelled', statusCode: 409, message: 'Cancelled by user' });
+      if (entitlements === undefined) throw new Error('Build entitlements are unavailable.');
+      if (session.workspaceRecovery !== undefined) project = await this.#deps.projects.readOwned(session.ownerUid, session.projectId);
       assertBuildAllowed(entitlements, project.platform, session.model);
       // Narrowed once here: the reservation closures below run later, so a
       // possibly-undefined outer binding would not be narrowed inside them.
@@ -212,20 +294,11 @@ export class SessionRunner {
           const latest = await this.#deps.entitlements.forUser(session.ownerUid, new Date(), true);
           assertBuildAllowed(latest, project!.platform, session.model);
         },
-        onProblem: (error, what) => log.error({ sessionId: session.id, err: error }, what),
+        onProblem: (error) => log.error({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'model admission reconciliation failed'),
       });
 
-      const abandoned = [...new Set([...session.reservationIds, ...session.specialistReservationIds])];
-      if (session.sandboxId !== undefined || abandoned.length > 0) {
-        await sandboxes.recover({ uid: session.ownerUid, platform: project.platform,
-          externalSandboxId: session.sandboxId, reservationIds: abandoned, now: new Date(),
-          onProblem: (error, what) => log.warn({ sessionId: session.id, err: error }, what),
-        });
-        for (const id of session.specialistReservationIds) await sessions.forgetSpecialistReservation(session.id, authority, id);
-        await sessions.detachSandbox(session.id, authority);
-      }
-
-      if (session.queuedTurnPending === true && !await sessions.startPendingTurn(session.id, authority)) {
+      signal.throwIfAborted();
+      if (session.queuedTurnPending === true && !await sessions.startPendingTurn(session.id, authority, signal)) {
         const status = await sessions.finish(session.id, authority, { status: 'IDLE' });
         await publish(status === 'QUEUED' ? 'session.queued' : 'session.idle', {});
         return;
@@ -233,6 +306,7 @@ export class SessionRunner {
 
       await publish('session.running', { runnerId, model: session.model, effort: session.effort });
 
+      signal.throwIfAborted();
       acquired = await sandboxes.acquire({
         publicPreviewEnabled: project.publicPreviewEnabled === true,
         uid: session.ownerUid,
@@ -241,6 +315,7 @@ export class SessionRunner {
         sessionId: session.id,
         now: new Date(),
         reservations: tokenReservations,
+        signal,
       });
       // Recorded before the agent touches it: the window that matters is the one
       // where this runner dies with a machine running and holds outstanding.
@@ -248,6 +323,7 @@ export class SessionRunner {
         sandboxId: acquired.running.externalId,
         reservationIds: acquired.reservations.map((reservation) => reservation.id),
       });
+      signal.throwIfAborted();
       await publish('sandbox.started', {
         provider: acquired.provider.provider,
         template: acquired.provider.template,
@@ -270,20 +346,27 @@ export class SessionRunner {
         session.id,
         this.#deps.messageHistoryLimit,
       );
+      const toolCall = async (name: string, input: Record<string, unknown>) => {
+        if (persists && workspaceTools.has(name) && !readOnlyTools.has(name)) {
+          await sessions.requireWorkspaceSalvage(authority, acquired!.running.externalId);
+          workspaceMayBeDirty = true;
+        }
+        await publish('agent.tool_call', { name, input });
+      };
 
       const withValidationSandbox: NonNullable<import('./tools.ts').ToolContext['withValidationSandbox']> = async (run) => {
         await sessions.assertPersistenceLease(authority);
-        cancellation.signal.throwIfAborted();
+        signal.throwIfAborted();
         if (acquired === undefined) throw new Error('The primary sandbox is unavailable.');
         const copy = await sandboxes.acquire({ uid: session.ownerUid, sessionId: session.id,
           platform: project!.platform, entitlements: await this.#deps.entitlements.forUser(session.ownerUid, new Date(), true),
-          now: new Date(), reservations: tokenReservations, source: acquired.running });
+          now: new Date(), reservations: tokenReservations, source: acquired.running, signal });
         let outcome;
         let failure: unknown;
         try { outcome = await run(copy.running); } catch (cause) { failure = cause; }
         try {
           await sandboxes.release({ uid: session.ownerUid, acquired: copy, now: new Date(),
-            onStopFailure: (error) => log.error({ err: error, sessionId: session.id }, 'validation disposal failed') });
+            onStopFailure: (error) => log.error({ diagnostic: safeErrorDiagnostic(error), sessionId: session.id }, 'validation disposal failed') });
           for (const hold of copy.reservations) await tokenReservations.forget(hold.id);
         } catch (cleanup) {
           if (failure !== undefined) throw new AggregateError([failure, cleanup], 'Validation and sandbox disposal failed.');
@@ -319,7 +402,7 @@ export class SessionRunner {
             void publish('agent.text', { delta });
           },
           step: (step) => publish('agent.step', step),
-          toolCall: (name, toolInput) => publish('agent.tool_call', { name, input: toolInput }),
+          toolCall,
           toolResult: (name, result) =>
             publish('agent.tool_result', {
               name,
@@ -342,20 +425,25 @@ export class SessionRunner {
               summary: detail.summary,
             }),
         },
-        signal: cancellation.signal,
+        signal,
         reservations: tokenReservations,
-        onProblem: (error, what) => {
-          log.error({ sessionId: session.id, err: error }, what);
+        onProblem: (error) => {
+          log.error({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'agent operation cleanup failed');
         },
       });
 
+      signal.throwIfAborted();
       await this.#deliver(session, run, publish);
+      turnCompleted = true;
 
       // Hot turn chaining: check the queue before releasing the sandbox.
       // If the user enqueued a follow-up while this turn was running, dequeue
       // it and run the next turn in the same live sandbox without cold-booting.
-      let nextQueued = await sessions.dequeueNextMessage(session.id, authority);
+      signal.throwIfAborted();
+      let nextQueued = await sessions.dequeueNextMessage(session.id, authority, signal);
       while (nextQueued !== undefined) {
+        turnCompleted = false;
+        signal.throwIfAborted();
         await publish('session.queued', { queuedMessageId: nextQueued.id });
         log.info(
           { sessionId: session.id, queuedMessageId: nextQueued.id },
@@ -392,7 +480,7 @@ export class SessionRunner {
               void publish('agent.text', { delta });
             },
             step: (step) => publish('agent.step', step),
-            toolCall: (name, toolInput) => publish('agent.tool_call', { name, input: toolInput }),
+            toolCall,
             toolResult: (name, result) =>
               publish('agent.tool_result', {
                 name,
@@ -413,16 +501,19 @@ export class SessionRunner {
                 summary: detail.summary,
               }),
           },
-          signal: cancellation.signal,
+          signal,
           reservations: tokenReservations,
-        onProblem: (error, what) => {
-            log.error({ sessionId: session.id, err: error }, what);
+        onProblem: (error) => {
+            log.error({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'agent operation cleanup failed');
           },
         });
 
+        signal.throwIfAborted();
         await this.#deliver(session, chainRun, publish);
+        turnCompleted = true;
 
-        nextQueued = await sessions.dequeueNextMessage(session.id, authority);
+        signal.throwIfAborted();
+        nextQueued = await sessions.dequeueNextMessage(session.id, authority, signal);
       }
 
       saveAttempted = true;
@@ -436,6 +527,7 @@ export class SessionRunner {
         restored,
         publish,
       );
+      saveCompleted = true;
       await this.#letGo(session, acquired);
       acquired = undefined;
 
@@ -443,10 +535,14 @@ export class SessionRunner {
       await publish(status === 'QUEUED' ? 'session.queued' : 'session.idle', { steps: run.steps, stopReason: run.stopReason });
       log.info({ sessionId: session.id, steps: run.steps }, 'finished a session');
     } catch (error) {
+      if (error instanceof RunnerWorkError) throw error;
       const reason = this.#reason(error);
-      log.error({ sessionId: session.id, err: error }, 'session failed');
+      const shuttingDown = shutdown?.aborted === true && !cancellation.signal.aborted;
+      if (shuttingDown) log.info({ sessionId: session.id }, 'runner shutdown: draining active session');
+      else log.error({ sessionId: session.id }, 'session failed');
 
       if (acquired !== undefined) {
+        if (workspaceMayBeDirty && saveAttempted && !saveCompleted) throw new RunnerWorkError(error, 'workspace/save-failed');
         // Saved before the machine is discarded, even now: a build that failed
         // at step nine still wrote eight steps of a project the user is paying
         // to keep.
@@ -462,15 +558,30 @@ export class SessionRunner {
               persists,
               restored,
               publish,
+              true,
             );
+            saveCompleted = true;
           } catch (saveError) {
             log.error(
-              { sessionId: session.id, err: saveError },
+              { sessionId: session.id },
               'could not preserve partial project work',
             );
+            if (workspaceMayBeDirty) throw new RunnerWorkError(error, 'workspace/save-failed');
+            // No primary mutation was admitted: cleanup may dispose of this VM.
+            try { await this.#letGo(session, acquired); }
+            catch { throw new RunnerWorkError(error, 'workspace/save-and-cleanup-failed'); }
+            acquired = undefined;
+            throw new RunnerWorkError(error, 'workspace/save-failed-without-mutations');
           }
         }
-        await this.#letGo(session, acquired);
+        try { await this.#letGo(session, acquired); }
+        catch { throw new RunnerWorkError(error, 'sandbox/cleanup-failed'); }
+      }
+      if (shuttingDown) {
+        if (turnCompleted) await sessions.finish(session.id, authority, { status: 'IDLE' });
+        else await sessions.yieldForRecovery(session.id, authority);
+        log.info({ sessionId: session.id }, 'session left recoverable after runner shutdown');
+        return;
       }
       await publish('session.failed', { error: reason });
 
@@ -479,7 +590,8 @@ export class SessionRunner {
       } catch (cause) {
         // Only reachable when the lease is already gone, in which case another
         // runner owns the session and gets to decide its status.
-        log.warn({ sessionId: session.id, err: cause }, 'could not mark the session failed');
+        log.warn({ sessionId: session.id }, 'could not mark the session failed');
+        throw new RunnerWorkError(error, 'session/finalization-failed');
       }
     } finally {
       clearInterval(heartbeat);
@@ -531,8 +643,8 @@ export class SessionRunner {
    *
    * A success-path failure propagates so a build is not reported idle without
    * durable persistence. The caller catches a partial-save failure only while
-   * already handling another failure, preserving the original reason while
-   * still releasing the sandbox and finalising the session.
+   * already handling another failure. A dirty workspace stays attached until
+   * a successor salvages it or records an explicit unrecoverable outcome.
    *
    * `restored` is required rather than assumed: the failure path runs after any
    * failure, including one that stopped the restore, and a sandbox whose history
@@ -547,7 +659,9 @@ export class SessionRunner {
     persists: boolean,
     restored: RestoreOutcome | undefined,
     publish: (type: string, data: Record<string, unknown>) => Promise<void>,
+    cleanup = false,
   ): Promise<void> {
+    await acquired.running.stopCommands?.();
     if (!persists || project === undefined || entitlements === undefined) {
       return;
     }
@@ -565,6 +679,7 @@ export class SessionRunner {
         project,
         entitlements,
         authority,
+        cleanup,
         // Traceable back to the turn that produced it without putting the
         // user's prompt — which is theirs, and arbitrary text — in a commit.
         commitMessage: `LotusBuild session ${session.id}`,
@@ -577,21 +692,19 @@ export class SessionRunner {
       if (saved.cleanupFailure !== undefined) {
         // Logged, not published: the save the user asked for succeeded, and an
         // orphaned object in our bucket is ours to collect, not theirs to read
-        // about. The object name is the address an operator needs to find it,
-        // and this log never leaves the server.
-        const { superseded, cause } = saved.cleanupFailure;
+        // about. Correlate through the project ID, never the object path or payload.
+        const { cause } = saved.cleanupFailure;
         this.#deps.log.error(
           {
             sessionId: session.id,
             projectId: project.id,
-            snapshot: superseded,
-            err: cause,
+            diagnostic: safeErrorDiagnostic(cause),
           },
           'project saved, but its superseded snapshot could not be deleted',
         );
       }
     } catch (error) {
-      this.#deps.log.error({ sessionId: session.id, err: error }, 'could not save the project');
+      this.#deps.log.error({ sessionId: session.id }, 'could not save the project');
       await publish('project.save_failed', {
         error: error instanceof AppError ? error.message : 'The project could not be saved.',
       });
@@ -607,20 +720,20 @@ export class SessionRunner {
       acquired,
       now: new Date(),
       onStopFailure: (error) => {
-        log.warn({ sessionId: session.id, err: error }, 'could not stop the sandbox');
+        log.warn({ sessionId: session.id }, 'could not stop the sandbox');
       },
     });
     try {
       await sessions.detachSandbox(session.id, authority);
     } catch (error) {
-      log.warn({ sessionId: session.id, err: error }, 'could not clear the sandbox record');
+      log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'could not clear the sandbox record');
     }
   }
 
   /**
    * What to tell the user. An `AppError` was written to be read by them — "the
    * Free plan allows 10 builds" — so it is passed through. Anything else is our
-   * bug or a provider's, and its text is for the log only.
+   * bug or a provider's; only safe diagnostics reach operational logs.
    */
   #reason(error: unknown): string {
     if (error instanceof AppError) {
@@ -643,24 +756,53 @@ export async function runUntilStopped(
     readonly shouldContinue: () => boolean;
     readonly log: RunnerLogger;
     readonly maintenance?: () => Promise<void>;
+    readonly signal?: AbortSignal;
   },
 ): Promise<void> {
-  while (options.shouldContinue()) {
+  while (options.shouldContinue() && !options.signal?.aborted) {
     let didWork = false;
     if (options.maintenance !== undefined) {
       try { await options.maintenance(); }
-      catch (error) { options.log.error({ err: error }, 'snapshot cleanup remains pending'); }
+      catch (error) { options.log.error({ diagnostic: safeErrorDiagnostic(error) }, 'snapshot cleanup remains pending'); }
     }
+    if (!options.shouldContinue() || options.signal?.aborted) break;
     try {
-      didWork = await runner.runOnce();
+      didWork = await runner.runOnce(options.signal);
     } catch (error) {
-      // runOnce contains its own failures, so reaching here means claiming
-      // itself failed — Firestore is unreachable. Waiting is the only sensible
-      // response; crashing would just have the supervisor do the same, slower.
-      options.log.error({ err: error }, 'could not claim a session');
+      if (error instanceof AppError && error.code === 'session/recovery-protocol-incompatible') {
+        options.log.error({ diagnostic: safeErrorDiagnostic(error) }, 'runner recovery protocol is incompatible; claims stopped');
+        throw error;
+      }
+      if (error instanceof RunnerWorkError) {
+        options.log.error({ diagnostic: safeErrorDiagnostic(error) }, 'runner work or recovery failed');
+        if (options.signal?.aborted || !options.shouldContinue()) throw error;
+      } else options.log.error({}, 'could not claim a session');
     }
     if (!didWork && options.shouldContinue()) {
-      await new Promise((resolve) => setTimeout(resolve, options.idlePollSeconds * 1000));
+      await new Promise<void>((resolve) => {
+        const done = () => { clearTimeout(timer); options.signal?.removeEventListener('abort', done); resolve(); };
+        const timer = setTimeout(done, options.idlePollSeconds * 1000);
+        options.signal?.addEventListener('abort', done, { once: true });
+        if (options.signal?.aborted) done();
+      });
     }
   }
+}
+
+/** The deadline includes active work, resource cleanup and connection closure. */
+export async function withDrainDeadline(signal: AbortSignal, timeoutMs: number, work: () => Promise<void>, log: RunnerLogger): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let start = () => {};
+  const deadline = new Promise<never>((_resolve, reject) => {
+    start = () => {
+      timer = setTimeout(() => {
+        log.error({}, 'runner drain deadline exceeded; durable resource and usage recovery required');
+        reject(new Error('Runner drain deadline exceeded.'));
+      }, timeoutMs);
+    };
+    signal.addEventListener('abort', start, { once: true });
+    if (signal.aborted) start();
+  });
+  try { await Promise.race([work(), deadline]); }
+  finally { clearTimeout(timer); signal.removeEventListener('abort', start); }
 }

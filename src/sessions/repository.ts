@@ -1,3 +1,4 @@
+import { runnerRecoveryProtocol } from './recovery-protocol.ts';
 import {
   type DocumentReference,
   FieldPath,
@@ -58,6 +59,30 @@ export type MessageRole = (typeof messageRoles)[number];
  */
 export const promptMaxLength = 8000;
 
+export interface WorkspaceRecovery {
+  readonly protocol?: number;
+  readonly status: 'REQUIRED' | 'COMPLETED' | 'UNRECOVERABLE';
+  readonly sandboxId: string;
+  readonly reason?: string;
+}
+
+function workspaceRecovery(fields: Fields, where: string): WorkspaceRecovery | undefined {
+  const value = fields['workspaceRecovery'];
+  if (value === undefined) return undefined; // Legacy/ordinary resource recovery.
+  try {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('Invalid recovery state.');
+    const record = value as Fields;
+    if (Object.keys(record).some((key) => !['protocol', 'status', 'sandboxId', 'reason'].includes(key))
+      || (record['protocol'] !== undefined && record['protocol'] !== runnerRecoveryProtocol())) throw new Error('Unsupported recovery protocol.');
+    return { status: enumField(record, 'status', where, ['REQUIRED', 'COMPLETED', 'UNRECOVERABLE']),
+      sandboxId: stringField(record, 'sandboxId', where),
+      ...(record['protocol'] === undefined ? {} : { protocol: runnerRecoveryProtocol() }),
+      ...(record['reason'] === undefined ? {} : { reason: stringField(record, 'reason', where) }) };
+  } catch {
+    throw new AppError({ code: 'session/recovery-protocol-incompatible', statusCode: 503, message: 'Workspace recovery metadata is invalid or unsupported. Execution is blocked.' });
+  }
+}
+
 export interface BuildSession {
   readonly id: string;
   readonly projectId: string;
@@ -71,6 +96,7 @@ export interface BuildSession {
   readonly heartbeatAt: Date | undefined;
   readonly error: string | undefined;
   readonly cancelRequested?: boolean | undefined;
+  readonly workspaceRecovery?: WorkspaceRecovery | undefined;
   /** A late follow-up has not yet been appended or charged as a new turn. */
   readonly queuedTurnPending?: boolean | undefined;
   /** Latest accepted steering instruction, consumed under the runner lease. */
@@ -78,7 +104,8 @@ export interface BuildSession {
   /**
    * Meter holds the claiming runner took out. Recorded on the session so that
    * whoever inherits an expired lease can give them back: a hold nobody returns
-   * is a concurrency slot the user never gets to use again.
+   * is a concurrency slot the user never gets to use again. An unrecoverable
+   * terminal session may retain these references for independent accounting.
    */
   readonly reservationIds: readonly string[];
   /**
@@ -150,6 +177,7 @@ function parseSession(id: string, fields: Fields, where: string): BuildSession {
     heartbeatAt: optionalTimestampField(fields, 'heartbeatAt', where),
     error: optionalStringField(fields, 'error'),
     cancelRequested: fields['cancelRequested'] === true ? true : undefined,
+    workspaceRecovery: workspaceRecovery(fields, where),
     queuedTurnPending: fields['queuedTurnPending'] === undefined ? undefined : booleanField(fields, 'queuedTurnPending', where),
     pendingSteer: fields['pendingSteer'] === undefined ? undefined : stringField(fields, 'pendingSteer', where),
     reservationIds: stringArrayField(fields, 'reservationIds', where),
@@ -442,6 +470,7 @@ export class SessionRepository {
           message: 'No such session.',
         });
       }
+      this.#assertPromptRecoveryEligible(current);
       if (current.status === 'QUEUED' || current.status === 'RUNNING') {
         throw new AppError({
           code: 'session/busy',
@@ -506,6 +535,7 @@ export class SessionRepository {
         throw new AppError({ code: 'session/not-found', statusCode: 404, message: 'No such session.' });
       }
       const session = parseSession(snapshot.id, snapshot.data() ?? {}, parent.path);
+      this.#assertPromptRecoveryEligible(session);
       if (!isActiveSessionStatus(session.status) || session.cancelRequested === true) {
         throw new AppError({ code: 'session/not-active', statusCode: 409, message: 'This session is no longer accepting queued messages.' });
       }
@@ -571,7 +601,8 @@ export class SessionRepository {
    * Dequeues the next message in the queue under the runner's lease,
    * charges the build quota, and appends it to the messages collection.
    */
-  async dequeueNextMessage(sessionId: string, authority: SessionLease): Promise<QueuedMessage | undefined> {
+  async dequeueNextMessage(sessionId: string, authority: SessionLease, signal?: AbortSignal): Promise<QueuedMessage | undefined> {
+    signal?.throwIfAborted();
     const ref = this.#ref(sessionId);
     const now = new Date();
     return this.#firestore.runTransaction(async (transaction) => {
@@ -596,6 +627,7 @@ export class SessionRepository {
       });
 
       const seq = session.messageCount;
+      signal?.throwIfAborted();
       transaction.create(ref.collection(messagesCollectionName).doc(messageId(seq)), {
         role: 'user',
         content: nextData.prompt,
@@ -608,6 +640,16 @@ export class SessionRepository {
       });
       return nextData;
     });
+  }
+
+  #assertPromptRecoveryEligible(session: BuildSession): void {
+    if (session.workspaceRecovery?.status === 'UNRECOVERABLE') {
+      throw new AppError({
+        code: 'session/workspace-unrecoverable',
+        statusCode: 409,
+        message: 'The latest unsaved workspace state could not be recovered. This session cannot accept new work.',
+      });
+    }
   }
 
   #validatePrompt(prompt: string): void {
@@ -627,6 +669,7 @@ export class SessionRepository {
         throw new AppError({ code: 'session/not-found', statusCode: 404, message: 'No such session.' });
       }
       const session = parseSession(snapshot.id, snapshot.data() ?? {}, ref.path);
+      this.#assertPromptRecoveryEligible(session);
       if (session.status !== 'RUNNING' || session.cancelRequested === true) {
         throw new AppError({ code: 'session/not-running', statusCode: 409, message: 'This session is no longer accepting steering instructions.' });
       }
@@ -660,7 +703,8 @@ export class SessionRepository {
   }
 
   /** Start work accepted during finalization, after claiming and recovering old resources. */
-  async startPendingTurn(sessionId: string, authority: SessionLease): Promise<boolean> {
+  async startPendingTurn(sessionId: string, authority: SessionLease, signal?: AbortSignal): Promise<boolean> {
+    signal?.throwIfAborted();
     const ref = this.#ref(sessionId);
     return this.#firestore.runTransaction(async (transaction) => {
       const session = await this.#requireLease(transaction, ref, authority);
@@ -679,6 +723,7 @@ export class SessionRepository {
           meterKey: registry.buildMeterKey, quantity: 1, now: new Date() });
         transaction.delete(next.ref);
       }
+      signal?.throwIfAborted();
       transaction.create(ref.collection(messagesCollectionName).doc(messageId(session.messageCount)), {
         role: 'user', content: prompt, createdAt: FieldValue.serverTimestamp(),
       });
@@ -807,7 +852,8 @@ export class SessionRepository {
    * One clock domain, and skew between machines is absorbed by the lease being
    * far longer than any skew NTP allows.
    */
-  async claim(runnerId: string, now: Date = new Date()): Promise<ClaimedSession | undefined> {
+  async claim(runnerId: string, now: Date = new Date(), signal?: AbortSignal): Promise<ClaimedSession | undefined> {
+    signal?.throwIfAborted();
     const candidates = await this.#firestore
       .collection(sessionsCollectionPath)
       .where('claimableAt', '<=', Timestamp.fromDate(now))
@@ -844,13 +890,20 @@ export class SessionRepository {
           details: { sessionId: session.id, projectId: session.projectId, status: session.status },
         });
       }
-      const project = await this.#projects.readOwnedInTransaction(
-        transaction,
-        session.ownerUid,
-        session.projectId,
-        session.status === 'RUNNING',
-      );
+      let project: Project;
+      try {
+        project = await this.#projects.readOwnedInTransaction(transaction, session.ownerUid, session.projectId, session.status === 'RUNNING');
+      } catch (error) {
+        if (session.workspaceRecovery?.status !== 'REQUIRED' || !(error instanceof AppError)
+          || !['project/not-found', 'project/deleting'].includes(error.code)) throw error;
+        // No publication lease is granted when destructive user intent revoked
+        // project access. The existing erasure/deletion workflow owns disposal.
+        transaction.update(ref, { workspaceRecovery: { ...session.workspaceRecovery, status: 'UNRECOVERABLE', reason: 'persistence-revoked' },
+          error: 'Workspace recovery is unrecoverable: persistence-revoked', updatedAt: FieldValue.serverTimestamp() });
+        return undefined;
+      }
       this.#assertProjectGuard(project, session);
+      signal?.throwIfAborted();
       transaction.update(ref, {
         status: 'RUNNING',
         claimedBy: runnerId,
@@ -872,18 +925,18 @@ export class SessionRepository {
     });
   }
 
-  async assertPersistenceLease(authority: SessionLease): Promise<void> {
+  async assertPersistenceLease(authority: SessionLease, cleanup = false): Promise<void> {
     const ref = this.#ref(authority.sessionId);
     await this.#firestore.runTransaction(async (transaction) => {
-      await this.#requirePersistenceLease(transaction, ref, authority);
+      await this.#requirePersistenceLease(transaction, ref, authority, cleanup);
     });
   }
 
   async reserveSnapshotUpload(authority: SessionLease, entitlements: UserEntitlements,
-    input: { id: string; objectName: string; bytes: number; expiresAt: Date }): Promise<void> {
+    input: { id: string; objectName: string; bytes: number; expiresAt: Date }, cleanup = false): Promise<void> {
     const { registry } = await this.#configuration.get();
     await this.#firestore.runTransaction(async (transaction) => {
-      const { session, project } = await this.#requirePersistenceLease(transaction, this.#ref(authority.sessionId), authority);
+      const { session, project } = await this.#requirePersistenceLease(transaction, this.#ref(authority.sessionId), authority, cleanup);
       if (input.objectName !== `projects/${project.id}/snapshots/${input.id}.tar.gz` || input.expiresAt.getTime() <= Date.now()) {
         throw new Error('Invalid snapshot upload admission.');
       }
@@ -902,6 +955,7 @@ export class SessionRepository {
     entitlements: UserEntitlements,
     snapshot: UploadedSnapshot,
     uploadId: string,
+    cleanup = false,
   ): Promise<{ readonly projectId: string; readonly previous: StoredSnapshot }> {
     const { registry } = await this.#configuration.get();
     const ref = this.#ref(authority.sessionId);
@@ -911,6 +965,7 @@ export class SessionRepository {
         transaction,
         ref,
         authority,
+        cleanup,
       );
       const uploadRef = this.#firestore.doc(`snapshotUploads/${uploadId}`);
       const upload = await transaction.get(uploadRef);
@@ -940,6 +995,12 @@ export class SessionRepository {
         snapshotUpdatedAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });
+      // Publication and salvage completion are one commit: a lost acknowledgement
+      // cannot leave a published workspace looking like an unsaved orphan.
+      if (session.workspaceRecovery?.status === 'REQUIRED') {
+        if (session.workspaceRecovery.sandboxId !== session.sandboxId) throw new Error('Workspace recovery identity mismatch.');
+        transaction.update(ref, { workspaceRecovery: { ...session.workspaceRecovery, status: 'COMPLETED' } });
+      }
       return { projectId: project.id, previous: project.snapshot };
     });
   }
@@ -949,14 +1010,14 @@ export class SessionRepository {
    * whose session was taken while it was busy must stop, or two runners write
    * the same transcript.
    */
-  async heartbeat(sessionId: string, authority: SessionLease, now: Date = new Date()): Promise<void> {
+  async heartbeat(sessionId: string, authority: SessionLease, now: Date = new Date(), cleanup = false): Promise<void> {
     await this.#withLease(sessionId, authority, (transaction, ref) => {
       transaction.update(ref, {
         heartbeatAt: Timestamp.fromDate(now),
         claimableAt: this.#leaseExpiry(now),
         updatedAt: FieldValue.serverTimestamp(),
       });
-    });
+    }, cleanup);
   }
 
   /**
@@ -971,10 +1032,12 @@ export class SessionRepository {
     authority: SessionLease,
     held: { readonly sandboxId: string; readonly reservationIds: readonly string[] },
   ): Promise<void> {
-    await this.#withLease(sessionId, authority, (transaction, ref) => {
+    await this.#withLease(sessionId, authority, (transaction, ref, session) => {
+      if (session.workspaceRecovery?.status === 'REQUIRED') throw new Error('Unsaved workspace must be recovered before replacement.');
       transaction.update(ref, {
         sandboxId: held.sandboxId,
         reservationIds: [...held.reservationIds],
+        workspaceRecovery: FieldValue.delete(),
         updatedAt: FieldValue.serverTimestamp(),
       });
     });
@@ -1079,13 +1142,72 @@ export class SessionRepository {
     );
   }
 
+  /** Operational shutdown preserves the current turn, queue, guard and any recovery evidence. */
+  async yieldForRecovery(sessionId: string, authority: SessionLease): Promise<void> {
+    await this.#withLease(sessionId, authority, (transaction, ref) => {
+      transaction.update(ref, {
+        claimableAt: Timestamp.now(), claimedBy: FieldValue.delete(), leaseToken: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    }, true);
+  }
+
+  /** Write-ahead evidence, before a primary workspace mutation can be dispatched. */
+  async requireWorkspaceSalvage(authority: SessionLease, sandboxId: string): Promise<void> {
+    await this.#withLease(authority.sessionId, authority, (tx, ref, session) => {
+      if (session.sandboxId !== sandboxId) throw new Error('Workspace recovery identity mismatch.');
+      tx.update(ref, { workspaceRecovery: { protocol: runnerRecoveryProtocol(), status: 'REQUIRED', sandboxId }, updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+
+  async workspaceRecoveryState(authority: SessionLease): Promise<WorkspaceRecovery | undefined> {
+    return this.#firestore.runTransaction(async (tx) =>
+      (await this.#requireRunnerLease(tx, this.#ref(authority.sessionId), authority, true)).workspaceRecovery);
+  }
+
+  /** Resource bookkeeping only. Does not grant access to snapshot publication. */
+  async markWorkspaceUnrecoverable(authority: SessionLease,
+    reason: 'sandbox-absent' | 'invalid-attachment' | 'persistence-revoked'): Promise<void> {
+    await this.#firestore.runTransaction(async (tx) => {
+      const ref = this.#ref(authority.sessionId);
+      const session = await this.#requireRunnerLease(tx, ref, authority, true);
+      if (session.workspaceRecovery?.status !== 'REQUIRED') throw new Error('No pending workspace salvage.');
+      tx.update(ref, { workspaceRecovery: { ...session.workspaceRecovery, status: 'UNRECOVERABLE', reason },
+        error: 'Workspace recovery is unrecoverable: ' + reason, updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+
   /** Forgets the sandbox and holds once they have actually been given back. */
   async detachSandbox(sessionId: string, authority: SessionLease): Promise<void> {
-    await this.#withLease(sessionId, authority, (transaction, ref) => {
+    await this.#withLease(sessionId, authority, (transaction, ref, session) => {
+      if (session.workspaceRecovery?.status === 'REQUIRED') throw new Error('Unsaved workspace must be recovered before detachment.');
       transaction.update(ref, {
         sandboxId: FieldValue.delete(),
         reservationIds: FieldValue.delete(),
         updatedAt: FieldValue.serverTimestamp(),
+      });
+    }, true);
+  }
+
+  /** End lost-workspace execution without discarding or settling unresolved accounting. */
+  async finishUnrecoverable(authority: SessionLease): Promise<void> {
+    const ref = this.#ref(authority.sessionId);
+    await this.#firestore.runTransaction(async (transaction) => {
+      const { session } = await this.#requireLeaseState(transaction, ref, authority, true);
+      if (session.workspaceRecovery?.status !== 'UNRECOVERABLE') throw new Error('Workspace loss is not confirmed.');
+      await this.#metering.assertSandboxesStoppedIn(transaction, session.ownerUid,
+        [...new Set([...session.reservationIds, ...session.specialistReservationIds])],
+        [...new Set([session.workspaceRecovery.sandboxId, ...(session.sandboxId === undefined ? [] : [session.sandboxId])])]);
+      // The reservation documents and both ID lists remain discoverable. Their
+      // OPEN/SETTLED/RELEASED status, not this session's status, governs accounting.
+      transaction.update(ref, {
+        status: 'FAILED', error: 'The latest unsaved workspace changes could not be recovered.',
+        sandboxId: FieldValue.delete(), claimedBy: FieldValue.delete(), leaseToken: FieldValue.delete(),
+        claimableAt: FieldValue.delete(), queuedTurnPending: FieldValue.delete(), pendingSteer: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      transaction.update(this.#projects.refFor(session.projectId), {
+        activeSessionId: null, updatedAt: FieldValue.serverTimestamp(),
       });
     });
   }
@@ -1103,6 +1225,7 @@ export class SessionRepository {
     const ref = this.#ref(sessionId);
     return this.#firestore.runTransaction(async (transaction) => {
       const { session } = await this.#requireLeaseState(transaction, ref, authority, true);
+      if (session.workspaceRecovery?.status === 'REQUIRED') throw new Error('Unsaved workspace prevents finalization.');
       if (session.cancelRequested === true && outcome.status === 'IDLE') {
         throw new AppError({
           code: 'session/cancelled',
@@ -1122,7 +1245,8 @@ export class SessionRepository {
       // Terminal means `claimableAt` is deleted, and a session without it is
       // never claimed again by anyone — so this is the last moment any hold it
       // still owns can be given back. Closing them here, in the same commit,
-      // makes "terminal while holding capacity" a state that cannot exist. A
+      // makes ordinary terminal completion require settled holds. The separate
+      // finishUnrecoverable path retains accounting only after resource-stop proof. A
       // contradictory ledger throws, the whole finalisation is refused, and the
       // session stays claimable for another runner to try again.
       if (session.specialistReservationIds.length > 0) {
@@ -1173,6 +1297,16 @@ export class SessionRepository {
     authority: SessionLease,
     allowCancelled = false,
   ): Promise<{ readonly session: BuildSession; readonly project: Project }> {
+    const session = await this.#requireRunnerLease(transaction, ref, authority, allowCancelled);
+    const project = await this.#projects.readOwnedInTransaction(
+      transaction, session.ownerUid, session.projectId, allowCancelled,
+    );
+    this.#assertProjectGuard(project, session);
+    return { session, project };
+  }
+
+  async #requireRunnerLease(transaction: Transaction, ref: DocumentReference, authority: SessionLease,
+    allowCancelled = false): Promise<BuildSession> {
     const snapshot = await transaction.get(ref);
     if (!snapshot.exists) {
       throw new AppError({
@@ -1201,22 +1335,18 @@ export class SessionRepository {
         details: { status: session.status, claimedBy: session.claimedBy },
       });
     }
-    const project = await this.#projects.readOwnedInTransaction(
-      transaction,
-      session.ownerUid,
-      session.projectId,
-      allowCancelled,
-    );
-    this.#assertProjectGuard(project, session);
-    return { session, project };
+    return session;
   }
 
   async #requirePersistenceLease(
     transaction: Transaction,
     ref: DocumentReference,
     authority: SessionLease,
+    cleanup = false,
   ): Promise<{ readonly session: BuildSession; readonly project: Project }> {
-    const state = await this.#requireLeaseState(transaction, ref, authority);
+    const state = await this.#requireLeaseState(transaction, ref, authority, cleanup);
+    // Cancellation permits saving already-written work, not bypassing project access.
+    if (cleanup) await this.#projects.readOwnedInTransaction(transaction, state.session.ownerUid, state.session.projectId);
     const { session } = state;
     if (session.leaseToken !== authority.token) {
       throw new AppError({

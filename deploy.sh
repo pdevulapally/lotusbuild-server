@@ -14,11 +14,12 @@ actual=$(sha256sum "$artifact" | cut -d ' ' -f 1)
 [[ "$actual" == "$digest" ]] || { echo 'Release checksum mismatch.' >&2; exit 1; }
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [[ "$(git -C "$script_dir" rev-parse --verify HEAD)" == "$revision" ]] || { echo 'Deploy checkout revision mismatch.' >&2; exit 1; }
+protocol=$(python3 "$script_dir/deploy/unpack-release.py" --protocol)
 candidate="/home/preet/apps/.lotusbuild-candidate-${revision}-$$"
 ssh "$HOST" "umask 077; mkdir '$candidate'"
 ssh "$HOST" "umask 077; cat > '$candidate/release.tar.gz'" < "$artifact"
 # Execute the validator from this trusted checkout, never from the artifact.
-ssh "$HOST" python3 - "$candidate/release.tar.gz" "$digest" "$revision" "$candidate" < "$script_dir/deploy/unpack-release.py"
+ssh "$HOST" python3 - "$candidate/release.tar.gz" "$digest" "$revision" "$candidate" "$protocol" < "$script_dir/deploy/unpack-release.py"
 ssh "$HOST" bash -s -- "$candidate" <<'REMOTE'
 set -euo pipefail
 candidate=$1
@@ -40,21 +41,38 @@ cd "$candidate"
 node --env-file=.env dist/preflight.js
 python3 deploy/exchange-directories.py --check "$active" "$candidate"
 switched=0
+stop_services() {
+  sudo -n systemctl stop lotusbuild-api lotusbuild-runner
+  for unit in lotusbuild-api lotusbuild-runner; do
+    [[ "$(systemctl show --property=ActiveState --value "$unit")" == inactive ]] || return 1
+    [[ "$(systemctl show --property=MainPID --value "$unit")" == 0 ]] || return 1
+  done
+}
 rollback() {
   code=$?
   trap - EXIT
   if [[ "$code" != 0 && "$switched" == 1 ]]; then
-    python3 "$active/deploy/exchange-directories.py" "$active" "$candidate"
-    sudo -n systemctl restart lotusbuild-api lotusbuild-runner
+    if ! python3 "$active/deploy/exchange-directories.py" --check --rollback "$active" "$candidate"; then
+      echo 'rollback/recovery-protocol-incompatible: rollback refused; compatible release retained at the active path.' >&2
+      exit "$code"
+    fi
+    # Stop all writers before validating and exchanging back. No legacy worker
+    # may overlap a newly started writer, even during automatic failure recovery.
+    stop_services
+    (cd "$candidate" && node --env-file=.env dist/preflight.js)
+    python3 "$active/deploy/exchange-directories.py" --rollback "$active" "$candidate"
+    cd "$active"
+    sudo -n systemctl start lotusbuild-api lotusbuild-runner
     echo 'Candidate failed; previous directory restored. Verify both units and health.' >&2
   fi
   exit "$code"
 }
 trap rollback EXIT
+stop_services
 python3 deploy/exchange-directories.py "$active" "$candidate"
 switched=1
 cd "$active"
-sudo -n systemctl restart lotusbuild-api lotusbuild-runner
+sudo -n systemctl start lotusbuild-api lotusbuild-runner
 healthy=0
 for attempt in {1..10}; do
   if systemctl is-active --quiet lotusbuild-api && systemctl is-active --quiet lotusbuild-runner && curl -fsS --max-time 5 -o /dev/null https://api.lotusbuild.co.uk/health; then healthy=1; break; fi

@@ -3,7 +3,7 @@ import type Stripe from 'stripe';
 
 import { authenticatedUser } from '../auth/plugin.ts';
 import type { ConfigurationStore } from '../entitlements/store.ts';
-import { AppError } from '../http/errors.ts';
+import { AppError, safeErrorDiagnostic } from '../http/errors.ts';
 import { cached } from '../support/cache.ts';
 import type { UserRepository } from '../users/repository.ts';
 import type { BillingRepository } from './repository.ts';
@@ -189,7 +189,7 @@ export function registerBillingRoutes(
       }
 
       const onError = (error: Error): void => {
-        request.log.error({ err: error, uid: user.uid }, 'stripe rejected a billing call');
+        request.log.error({ diagnostic: safeErrorDiagnostic(error), uid: user.uid }, 'stripe rejected a billing call');
       };
       const customer = await customerFor(user.uid, onError);
       if (await throughStripe('check existing subscriptions', () => subscriptionFor(customer), onError)) {
@@ -256,7 +256,7 @@ export function registerBillingRoutes(
             return_url: urls.portalReturn.toString(),
           }),
         (error) => {
-          request.log.error({ err: error, uid: user.uid }, 'stripe rejected a billing call');
+          request.log.error({ diagnostic: safeErrorDiagnostic(error), uid: user.uid }, 'stripe rejected a billing call');
         },
       );
       return { url: session.url };
@@ -308,10 +308,9 @@ export function registerBillingRoutes(
             signature,
             deps.webhookSecret,
           );
-        } catch (cause) {
-          // Logged, never echoed: the reason a signature failed is a detail an
-          // attacker would use to work out how close they got.
-          request.log.warn({ err: cause }, 'rejected an unverifiable Stripe event');
+        } catch {
+          // SDK verification errors carry the submitted signature and payload.
+          request.log.warn({ code: 'billing/bad-signature' }, 'rejected an unverifiable Stripe event');
           throw new AppError({
             code: 'billing/bad-signature',
             statusCode: 400,

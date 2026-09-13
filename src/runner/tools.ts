@@ -6,6 +6,7 @@ import type { SandboxProvider } from '../entitlements/schema.ts';
 import type { CommandOutcome, RunningSandbox } from '../sandboxes/provider.ts';
 
 export interface ToolContext {
+  readonly signal?: AbortSignal;
   readonly publicPreviewEnabled?: boolean;
   readonly withValidationSandbox?: (run: (sandbox: RunningSandbox) => Promise<CommandOutcome>) => Promise<CommandOutcome>;
   readonly sandbox: RunningSandbox;
@@ -25,19 +26,19 @@ export interface ToolContext {
 
 async function projectRead(context: ToolContext, path: string): Promise<string> {
   if (context.sandbox.projectFileOperation === undefined) return context.sandbox.readFile(path);
-  const result = await context.sandbox.projectFileOperation(context.provider.workdir, { op: 'read', path }, context.commandTimeoutMs);
+  const result = await context.sandbox.projectFileOperation(context.provider.workdir, { op: 'read', path }, context.commandTimeoutMs, context.signal);
   if (result.exitCode !== 0) throw new Error('Confined file read failed: ' + result.stderr);
   return (JSON.parse(result.stdout) as { text: string }).text;
 }
 async function projectWrite(context: ToolContext, path: string, content: string): Promise<void> {
   if (context.sandbox.projectFileOperation === undefined) return context.sandbox.writeFile(path, content);
   const result = await context.sandbox.projectFileOperation(context.provider.workdir,
-    { op: 'write', path, data: Buffer.from(content).toString('base64') }, context.commandTimeoutMs);
+    { op: 'write', path, data: Buffer.from(content).toString('base64') }, context.commandTimeoutMs, context.signal);
   if (result.exitCode !== 0) throw new Error('Confined file write failed: ' + result.stderr);
 }
 async function projectWindow(context: ToolContext, path: string, offset: number, limit: number): Promise<{ text: string; start: number; total: number }> {
   const result = await context.sandbox.projectFileOperation!(context.provider.workdir,
-    { op: 'range', path, offset, limit: Math.min(limit, Math.max(1, Math.floor(context.toolOutputMaxChars / 6))) }, context.commandTimeoutMs);
+    { op: 'range', path, offset, limit: Math.min(limit, Math.max(1, Math.floor(context.toolOutputMaxChars / 6))) }, context.commandTimeoutMs, context.signal);
   if (result.exitCode !== 0) throw new Error('Confined ranged read failed: ' + result.stderr);
   return JSON.parse(result.stdout) as { text: string; start: number; total: number };
 }
@@ -543,6 +544,7 @@ const definitions: readonly ToolDefinition[] = [
     async run(input, context) {
       return describe(
         await context.sandbox.runCommand(requireString(input, 'command'), {
+          signal: context.signal,
           cwd: context.provider.workdir,
           timeoutMs: context.commandTimeoutMs,
         }),
@@ -806,8 +808,9 @@ const definitions: readonly ToolDefinition[] = [
       const limit = optionalPositiveInteger(input, 'limit') ?? defaultEntryPageSize;
 
       const outcome = context.sandbox.projectFileOperation !== undefined
-        ? await context.sandbox.projectFileOperation(context.provider.workdir, { op: 'list', path: scopePath, glob: rawGlob ?? '' }, context.commandTimeoutMs)
+        ? await context.sandbox.projectFileOperation(context.provider.workdir, { op: 'list', path: scopePath, glob: rawGlob ?? '' }, context.commandTimeoutMs, context.signal)
         : await context.sandbox.runCommand(listFilesScript, {
+          signal: context.signal,
         cwd: context.provider.workdir,
         timeoutMs: context.commandTimeoutMs,
         envs: { LOTUSBUILD_SCOPE_PATH: scopePath, LOTUSBUILD_PATHSPEC: rawGlob ?? '' },
@@ -928,8 +931,9 @@ const definitions: readonly ToolDefinition[] = [
       const limit = optionalPositiveInteger(input, 'limit') ?? defaultEntryPageSize;
 
       const outcome = context.sandbox.projectFileOperation !== undefined
-        ? await context.sandbox.projectFileOperation(context.provider.workdir, { op: 'search', path: scopePath, glob: rawGlob ?? '', query }, context.commandTimeoutMs)
+        ? await context.sandbox.projectFileOperation(context.provider.workdir, { op: 'search', path: scopePath, glob: rawGlob ?? '', query }, context.commandTimeoutMs, context.signal)
         : await context.sandbox.runCommand(searchFilesScript, {
+          signal: context.signal,
         cwd: context.provider.workdir,
         timeoutMs: context.commandTimeoutMs,
         envs: {
@@ -1010,6 +1014,7 @@ const definitions: readonly ToolDefinition[] = [
         text: 'Public previews are disabled for this project. Only the project owner can enable them outside this build. Do not expose another public port or tunnel.' };
 
       await context.sandbox.runCommand(command, {
+        signal: context.signal,
         cwd: context.provider.workdir,
         timeoutMs: context.commandTimeoutMs,
         background: true,
@@ -1023,7 +1028,7 @@ const definitions: readonly ToolDefinition[] = [
         `for attempt in $(seq 1 ${deadline}); do ` +
           `if curl -sf -o /dev/null "http://127.0.0.1:${port}/"; then exit 0; fi; sleep 1; done; ` +
           'exit 1',
-        { cwd: context.provider.workdir, timeoutMs: (deadline + 5) * 1000 },
+        { cwd: context.provider.workdir, timeoutMs: (deadline + 5) * 1000, signal: context.signal },
       );
       if (probe.exitCode !== 0) {
         return {
@@ -1035,6 +1040,7 @@ const definitions: readonly ToolDefinition[] = [
       }
 
       const url = context.sandbox.previewUrl(port);
+      context.signal?.throwIfAborted();
       await context.onPreview({ url, port });
       return { text: `The preview is live at ${url}`, isError: false };
     },
@@ -1092,13 +1098,17 @@ export async function runTool(
   context: ToolContext,
   tools: ToolSet,
 ): Promise<ToolResult> {
+  context.signal?.throwIfAborted();
   const definition = tools.get(name);
   if (definition === undefined) {
     return { text: `Tool "${name}" is not available to this agent.`, isError: true };
   }
   try {
-    return await definition.run(input, context);
+    const result = await definition.run(input, context);
+    context.signal?.throwIfAborted();
+    return result;
   } catch (error) {
+    context.signal?.throwIfAborted();
     return { text: error instanceof Error ? error.message : String(error), isError: true };
   }
 }
@@ -1352,6 +1362,7 @@ export function makeRunValidation(guard: {
         guard.assertStillOurs();
         guard.signal.throwIfAborted();
         return sandbox.runCommand(command, {
+          signal: guard.signal,
           cwd: context.provider.workdir, timeoutMs: context.commandTimeoutMs, envs: {},
         });
       });

@@ -1,3 +1,4 @@
+import { safeErrorDiagnostic } from './http/errors.ts';
 import { BillingRepository } from './billing/repository.ts';
 import { createStripe } from './billing/stripe.ts';
 import { EnvironmentError, loadConfig } from './config/index.ts';
@@ -34,8 +35,7 @@ async function main(): Promise<void> {
   const redis = await connectRedis(
     config,
     (error) => {
-      process.stderr.write(`redis: ${error.message}
-`);
+      process.stderr.write(JSON.stringify({ diagnostic: safeErrorDiagnostic(error), provider: 'redis' }) + '\n');
     },
     'lotusbuild-api',
   );
@@ -75,11 +75,11 @@ async function main(): Promise<void> {
   // A connection in subscribe mode cannot run ordinary commands, so the event
   // stream needs its own. One for the whole process, not one per client.
   const subscriber = redis.duplicate({ connectionName: 'lotusbuild-api-events' });
-  subscriber.on('error', (error: Error) => {
-    process.stderr.write(`redis subscriber: ${error.message}
-`);
+  subscriber.on('error', () => {
+    process.stderr.write('REDIS_URL subscriber connection error.\n');
   });
-  await subscriber.connect();
+  try { await subscriber.connect(); }
+  catch { throw new EnvironmentError(['REDIS_URL subscriber connection failed.']); }
 
   const app = buildServer(config, {
     privacyRequests: new PrivacyRequests(firebase.firestore),
@@ -111,7 +111,7 @@ async function main(): Promise<void> {
       retentionSeconds: config.SESSION_EVENT_RETENTION_SECONDS,
       maxPerSession: config.SESSION_EVENT_MAX_PER_SESSION,
       onListenerError: (error, sessionId) => {
-        logError({ err: error, sessionId }, 'session event delivery failed');
+        logError({ diagnostic: safeErrorDiagnostic(error), sessionId }, 'session event delivery failed');
       },
     }),
   });
@@ -139,10 +139,6 @@ async function main(): Promise<void> {
 main().catch((error: unknown) => {
   // Configuration problems are operator errors, not crashes: report them
   // legibly rather than as a stack trace nobody reads.
-  if (error instanceof EnvironmentError) {
-    process.stderr.write(`${error.message}\n`);
-  } else {
-    process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
-  }
+  process.stderr.write(JSON.stringify({ diagnostic: safeErrorDiagnostic(error), operation: 'process-failure' }) + '\n');
   process.exit(1);
 });

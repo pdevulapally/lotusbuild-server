@@ -7,6 +7,12 @@ export interface CommandOutcome {
   readonly stderr: string;
 }
 
+/** Acquisition accounting must run before dispatch and before post-create preparation. */
+export interface SandboxLifecycle {
+  beforeCreate(): Promise<void>;
+  created(sandbox: RunningSandbox): Promise<void>;
+}
+
 /**
  * A sandbox that is up, as the agent's tools need it.
  *
@@ -15,12 +21,13 @@ export interface CommandOutcome {
  * to imitate.
  */
 export interface RunningSandbox {
-  projectFileOperation?(root: string, request: Readonly<Record<string, unknown>>, timeoutMs: number): Promise<CommandOutcome>;
+  projectFileOperation?(root: string, request: Readonly<Record<string, unknown>>, timeoutMs: number, signal?: AbortSignal): Promise<CommandOutcome>;
   /** The provider's own id, recorded so an orphan can be found and killed. */
   readonly externalId: string;
   runCommand(
     command: string,
     options: {
+      readonly signal?: AbortSignal | undefined;
       readonly cwd: string;
       readonly timeoutMs: number;
       readonly background?: boolean;
@@ -40,20 +47,24 @@ export interface RunningSandbox {
   /** Public URL a port inside the sandbox is reachable on. */
   previewUrl(port: number): string;
   stop(): Promise<void>;
+  /** Stops tracked command activity before a cleanup snapshot. Throws if uncertain. */
+  stopCommands?(): Promise<void>;
   lifetime?(): Promise<{ startedAt: Date; endAt: Date }>;
   /** Provider VM copy. Never implemented as a second directory in the same VM. */
-  forkForValidation?(timeoutMs: number, networkPolicy: SandboxNetworkPolicy): Promise<RunningSandbox>;
+  forkForValidation?(timeoutMs: number, networkPolicy: SandboxNetworkPolicy, lifecycle?: SandboxLifecycle): Promise<RunningSandbox>;
 }
 
 export interface SandboxAdapter {
+  /** True: killed; false: confirmed absent. Unknown outcomes must throw; never resume. */
   terminate?(externalId: string): Promise<boolean>;
   start(
     provider: SandboxProvider,
     context: { readonly metadata: Readonly<Record<string, string>>; readonly publicPreviewEnabled?: boolean;
-      readonly networkPolicy: SandboxNetworkPolicy },
+      readonly networkPolicy: SandboxNetworkPolicy; readonly lifecycle?: SandboxLifecycle },
   ): Promise<RunningSandbox>;
   /** Reconnects to an existing sandbox, so a successor can shut an orphan down. */
-  connect(externalId: string): Promise<RunningSandbox>;
+  /** Undefined means provider-confirmed absence; other failures must throw. */
+  connect(externalId: string): Promise<RunningSandbox | undefined>;
 }
 
 /**
