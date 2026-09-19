@@ -22,19 +22,26 @@
     "@fastify/cors": "^11.3.0",
     "@fastify/helmet": "^13.1.1",
     "@fastify/rate-limit": "^11.2.0",
+    "@fastify/websocket": "^11.3.1",
     "e2b": "^2.45.0",
     "fastify": "^5.2.1",
     "firebase-admin": "^14.3.0",
     "ioredis": "^6.0.0",
     "pino": "^10.3.1",
-    "stripe": "^22.5.0"
+    "stripe": "^22.5.0",
+    "ws": "^8.21.3"
   },
   "overrides": {
-    "gaxios@6": { "uuid": "11.1.1" },
-    "teeny-request@9": { "uuid": "11.1.1" }
+    "gaxios@6": {
+      "uuid": "11.1.1"
+    },
+    "teeny-request@9": {
+      "uuid": "11.1.1"
+    }
   },
   "devDependencies": {
     "@types/node": "^22.13.1",
+    "@types/ws": "^8.18.1",
     "typescript": "^5.7.3"
   }
 }
