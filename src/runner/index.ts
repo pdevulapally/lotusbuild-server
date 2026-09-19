@@ -5,6 +5,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import pino from 'pino';
 
 import { EnvironmentError, loadRunnerConfig } from '../config/index.ts';
+import { DesktopHandoffStore } from '../desktop/handoff.ts';
 import { EntitlementService } from '../entitlements/service.ts';
 import { ConfigurationStore } from '../entitlements/store.ts';
 import { SubscriptionCache } from '../entitlements/subscription-cache.ts';
@@ -132,6 +133,7 @@ async function main(): Promise<void> {
       commandTimeoutMs: config.AGENT_COMMAND_TIMEOUT_SECONDS * 1000,
       previewReadyTimeoutSeconds: config.PREVIEW_READY_TIMEOUT_SECONDS,
     },
+    desktop: new DesktopHandoffStore(redis),
     heartbeatSeconds: config.RUNNER_HEARTBEAT_SECONDS,
     // A turn reads the whole conversation so far. Bounded by the same ceiling
     // that bounds a message listing, so one enormous session cannot be loaded

@@ -30,9 +30,35 @@ export async function writeDesktopHandoff(
   await redis.set(keyFor(sessionId), JSON.stringify({ host: handoff.host, token: handoff.token }), 'EX', ttlSeconds);
 }
 
-/** Runner side: the desktop is gone. Deleting is what tells every open relay socket to end. */
-export async function deleteDesktopHandoff(redis: Redis, sessionId: string): Promise<void> {
-  await redis.del(keyFor(sessionId));
+/**
+ * Runner side: the desktop is gone. Deleting is what tells every open relay
+ * socket to end. Returns whether there was a handoff to delete.
+ */
+export async function deleteDesktopHandoff(redis: Redis, sessionId: string): Promise<boolean> {
+  return (await redis.del(keyFor(sessionId))) === 1;
+}
+
+/** What the runner needs from the handoff, so it can be replaced in tests and never touches Redis directly. */
+export interface DesktopHandoffPort {
+  publish(sessionId: string, handoff: DesktopHandoff, ttlSeconds: number): Promise<void>;
+  /** True if a handoff existed. Safe to call when there is none. */
+  clear(sessionId: string): Promise<boolean>;
+}
+
+export class DesktopHandoffStore implements DesktopHandoffPort {
+  readonly #redis: Redis;
+
+  constructor(redis: Redis) {
+    this.#redis = redis;
+  }
+
+  publish(sessionId: string, handoff: DesktopHandoff, ttlSeconds: number): Promise<void> {
+    return writeDesktopHandoff(this.#redis, sessionId, handoff, ttlSeconds);
+  }
+
+  clear(sessionId: string): Promise<boolean> {
+    return deleteDesktopHandoff(this.#redis, sessionId);
+  }
 }
 
 /** Presence only, so a liveness poll never has to read the credential. */

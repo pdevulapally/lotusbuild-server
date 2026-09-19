@@ -1031,7 +1031,9 @@ export async function runAgentTurn(input: {
 }): Promise<AgentRun> {
   const toolContext: ToolContext = {
     signal: input.signal,
-    publicPreviewEnabled: input.project.publicPreviewEnabled === true,
+    // Kept in step with the sandbox: a desktop sandbox is never public, so the
+    // agent must not be told it can hand out a public URL.
+    publicPreviewEnabled: input.project.publicPreviewEnabled === true && input.provider.desktop === undefined,
     ...(input.withValidationSandbox === undefined ? {} : { withValidationSandbox: input.withValidationSandbox }),
     sandbox: input.sandbox,
     provider: input.provider,

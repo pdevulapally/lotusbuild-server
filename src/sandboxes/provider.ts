@@ -1,4 +1,4 @@
-import type { SandboxNetworkPolicy, SandboxProvider } from '../entitlements/schema.ts';
+import type { DesktopSettings, SandboxNetworkPolicy, SandboxProvider } from '../entitlements/schema.ts';
 import { AppError } from '../http/errors.ts';
 
 export interface CommandOutcome {
@@ -11,6 +11,15 @@ export interface CommandOutcome {
 export interface SandboxLifecycle {
   beforeCreate(): Promise<void>;
   created(sandbox: RunningSandbox): Promise<void>;
+}
+
+/**
+ * Where a running desktop can be reached and the credential for it: everything
+ * the relay needs and nothing the browser is ever given.
+ */
+export interface DesktopEndpoint {
+  readonly host: string;
+  readonly token: string;
 }
 
 /**
@@ -46,6 +55,12 @@ export interface RunningSandbox {
   readFileRange?(path: string, offset: number, limit: number, timeoutMs: number): Promise<{ text: string; start: number; total: number }>;
   /** Public URL a port inside the sandbox is reachable on. */
   previewUrl(port: number): string;
+  /**
+   * Starts a screen, a desktop session and a view-only stream inside this
+   * sandbox, and says where it can be reached privately. Absent on a provider
+   * that has no desktop to offer. Throws if the desktop did not come up.
+   */
+  startDesktop?(settings: DesktopSettings, signal?: AbortSignal): Promise<DesktopEndpoint>;
   stop(): Promise<void>;
   /** Stops tracked command activity before a cleanup snapshot. Throws if uncertain. */
   stopCommands?(): Promise<void>;

@@ -121,7 +121,9 @@ export class SandboxService {
         // Enough to find the machine from the provider's own console when
         // something is stuck, without putting anything private on it.
         metadata: { sessionId: input.sessionId, platform: provider.platform },
-        publicPreviewEnabled: input.publicPreviewEnabled === true,
+        // A desktop is watched through the relay, so a public URL is neither needed
+        // nor allowed: the stream port has no password of its own.
+        publicPreviewEnabled: input.publicPreviewEnabled === true && provider.desktop === undefined,
         networkPolicy: plan.sandboxNetwork,
         lifecycle,
       }) : await input.source.forkForValidation!(provider.timeoutSeconds * 1000, plan.sandboxNetwork, lifecycle);
