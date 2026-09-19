@@ -20,6 +20,8 @@ declare module 'fastify' {
   }
   interface FastifyInstance {
     requireAuth: preHandlerHookHandler;
+    /** Runs after `requireAuth`: refuses a caller whose token says their email is unverified. */
+    requireVerifiedEmail: preHandlerHookHandler;
   }
 }
 
@@ -117,6 +119,21 @@ export function registerAuth(app: FastifyInstance, firebaseAuth: Auth): void {
     reply.header('Cache-Control', 'no-store');
   };
 
+  // The claim is read from the ID token, so it stays false until the client
+  // fetches a fresh token after the user verifies. The client is expected to
+  // force a refresh on this error and retry once; nothing here re-reads the
+  // user record, which keeps the check free of a second Firebase call.
+  const requireVerifiedEmail: preHandlerHookHandler = async (request: FastifyRequest): Promise<void> => {
+    if (!authenticatedUser(request).emailVerified) {
+      throw new AppError({
+        code: 'auth/email-not-verified',
+        statusCode: 403,
+        message: 'Verify your email address to use this feature.',
+      });
+    }
+  };
+
   app.decorate('requireAuth', requireAuth);
+  app.decorate('requireVerifiedEmail', requireVerifiedEmail);
   app.decorateRequest('auth', undefined);
 }

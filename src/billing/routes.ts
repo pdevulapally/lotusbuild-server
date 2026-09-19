@@ -157,7 +157,7 @@ export function registerBillingRoutes(
   app.post<{ Body: { planKey: string } }>(
     '/billing/checkout',
     {
-      preHandler: [app.requireAuth, app.enforceRateLimit('write')],
+      preHandler: [app.requireAuth, app.requireVerifiedEmail, app.enforceRateLimit('write')],
       schema: {
         body: {
           type: 'object',

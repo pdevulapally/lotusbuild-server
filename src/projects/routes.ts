@@ -57,7 +57,7 @@ export function registerProjectRoutes(app: FastifyInstance, projects: ProjectRep
   app.post<{ Body: CreateProjectBody }>(
     '/projects',
     {
-      preHandler: [app.requireAuth, app.enforceRateLimit('write')],
+      preHandler: [app.requireAuth, app.requireVerifiedEmail, app.enforceRateLimit('write')],
       schema: {
         body: {
           type: 'object',

@@ -16,10 +16,14 @@ import { SnapshotStore } from './storage/snapshots.ts';
 import { buildServer } from './server.ts';
 import { PrivacyRequests } from './privacy/requests.ts';
 import { FamilyService } from './family/service.ts';
+import { releaseRevision } from './release.ts';
 
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  // Read once at boot: it cannot change under a running process, and an unusable
+  // release file should stop the start rather than surface on the first probe.
+  const revision = releaseRevision();
   // The event fan-out is constructed before the server that owns the logger, so
   // it starts on stderr and is handed the real one as soon as it exists. An
   // error reported in that gap must still be seen.
@@ -85,6 +89,7 @@ async function main(): Promise<void> {
     privacyRequests: new PrivacyRequests(firebase.firestore),
     family: new FamilyService(firebase.firestore, config.FAMILY_INVITATION_TTL_SECONDS),
     firebaseAuth: firebase.auth,
+    ...(revision === undefined ? {} : { revision }),
     redis,
     entitlements,
     metering,
