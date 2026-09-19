@@ -94,6 +94,14 @@ const apiSpec = {
   STRIPE_PORTAL_RETURN_URL: asUrl('where the Stripe billing portal returns a customer', {
     protocols: ['https:', 'http:'],
   }),
+  DESKTOP_MAX_CONNECTIONS: asInteger('relayed desktop streams this process will hold at once', { min: 1, max: 1000 }),
+  DESKTOP_MAX_CONNECTIONS_PER_USER: asInteger('relayed desktop streams one account may hold at once per API process', { min: 1, max: 20 }),
+  DESKTOP_MAX_VIEWERS_PER_SESSION: asInteger('relayed desktop streams one session may have at once', { min: 1, max: 10 }),
+  DESKTOP_STREAM_MAX_SECONDS: asInteger('hard lifetime of one relayed desktop socket before the client must fetch a new ticket', { min: 30, max: 3600 }),
+  DESKTOP_PING_SECONDS: asInteger('how often a relayed desktop socket is pinged; a peer that never answers is dropped', { min: 5, max: 120 }),
+  DESKTOP_BUFFER_MAX_BYTES: asInteger('maximum bytes queued for a slow desktop viewer before it is dropped', { min: 65536, max: 16777216 }),
+  DESKTOP_CLIENT_MAX_BYTES_PER_SECOND: asInteger('most a view-only desktop viewer may send per second before it is dropped', { min: 1024, max: 1048576 }),
+  E2B_DOMAIN: asString('E2B domain a desktop host must belong to before the relay connects to it'),
   CORS_ALLOWED_ORIGINS: asList(
     'browser origins permitted to call this API',
     asUrl('allowed origin', { protocols: ['https:', 'http:'] }),

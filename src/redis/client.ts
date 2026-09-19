@@ -74,4 +74,8 @@ export const redisKeyPrefixes = {
   sessionEvents: 'ev:',
   /** Stripe event ids already handled, so a redelivery is not applied twice. */
   stripeEvent: 'evt:',
+  /** Single-use, hashed tickets that let a browser open the desktop WebSocket. */
+  desktopTicket: 'dkt:',
+  /** Where a running desktop is, handed from the runner to the API's relay. Holds a bearer token. */
+  desktopHandoff: 'dkh:',
 } as const;

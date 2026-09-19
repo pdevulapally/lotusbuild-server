@@ -43,6 +43,13 @@ function validEnv(): Record<string, string> {
     SSE_MAX_CONNECTIONS_PER_USER: '4',
     SSE_BUFFER_MAX_BYTES: '65536',
     HTTP_MAX_REQUESTS_PER_MINUTE: '300',
+    DESKTOP_MAX_CONNECTIONS: '20',
+    DESKTOP_MAX_CONNECTIONS_PER_USER: '2',
+    DESKTOP_MAX_VIEWERS_PER_SESSION: '2',
+    DESKTOP_STREAM_MAX_SECONDS: '600',
+    DESKTOP_PING_SECONDS: '20',
+    DESKTOP_BUFFER_MAX_BYTES: '1048576',
+    DESKTOP_CLIENT_MAX_BYTES_PER_SECOND: '16384',
     // Deliberately not shaped like a real Stripe secret key or webhook
     // signing secret — CI's own secret scanner greps for those exact
     // prefixes, correctly, since it cannot tell a fixture from the real

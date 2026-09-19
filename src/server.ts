@@ -3,7 +3,7 @@ import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import type { Redis } from 'ioredis';
 import type { Auth } from 'firebase-admin/auth';
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 
 import { authenticatedUser, registerAuth } from './auth/plugin.ts';
 import type { BillingRepository } from './billing/repository.ts';
@@ -23,6 +23,8 @@ import type { UserRepository } from './users/repository.ts';
 import { registerErrorHandler, safeErrorDiagnostic } from './http/errors.ts';
 import { registerRateLimiting } from './http/rate-limit.ts';
 import { redisKeyPrefixes } from './redis/client.ts';
+import { DesktopRelay, registerDesktopRoutes } from './desktop/relay.ts';
+import { DesktopTickets, redactDesktopTicket } from './desktop/tickets.ts';
 
 /**
  * Everything the routes need, passed in rather than constructed here, so that
@@ -55,6 +57,15 @@ export interface Dependencies {
   readonly revision?: string;
 }
 
+/** Same fields Fastify logs by default, minus the desktop ticket a URL may carry. */
+export const requestLogSerializer = (request: FastifyRequest) => ({
+  method: request.method,
+  url: redactDesktopTicket(request.url),
+  host: request.host,
+  remoteAddress: request.ip,
+  ...(request.socket?.remotePort === undefined ? {} : { remotePort: request.socket.remotePort }),
+});
+
 /** Headers a browser may read off a cross-origin response; everything else is hidden from its JavaScript. */
 export const exposedResponseHeaders = ['Retry-After', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'];
 
@@ -65,6 +76,9 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     logger: { level: config.LOG_LEVEL, serializers: {
       // Fastify's serializer type requires these strings; none comes from the error.
       err: (error) => ({ type: 'SafeErrorDiagnostic', message: 'Operational failure', stack: '', ...safeErrorDiagnostic(error) }),
+      // The desktop WebSocket ticket rides in the query string, and the default
+      // serializer logs the whole URL.
+      req: requestLogSerializer,
     } },
     // Trust the reverse proxy in front of us for client IP and protocol, which
     // rate limiting and redirect construction both depend on being correct.
@@ -193,6 +207,25 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
       },
     );
 
+    await registerDesktopRoutes(api, {
+      redis,
+      sessions,
+      tickets: new DesktopTickets(redis),
+      relay: new DesktopRelay(
+        { redis, sessions, tickets: new DesktopTickets(redis) },
+        {
+          maxConnections: config.DESKTOP_MAX_CONNECTIONS,
+          maxConnectionsPerUser: config.DESKTOP_MAX_CONNECTIONS_PER_USER,
+          maxViewersPerSession: config.DESKTOP_MAX_VIEWERS_PER_SESSION,
+          streamMaxSeconds: config.DESKTOP_STREAM_MAX_SECONDS,
+          pingSeconds: config.DESKTOP_PING_SECONDS,
+          bufferMaxBytes: config.DESKTOP_BUFFER_MAX_BYTES,
+          clientMaxBytesPerSecond: config.DESKTOP_CLIENT_MAX_BYTES_PER_SECOND,
+          allowedOrigins: new Set(config.CORS_ALLOWED_ORIGINS.map((url) => url.origin)),
+          upstreamDomain: config.E2B_DOMAIN,
+        },
+      ),
+    });
     registerProjectRoutes(api, projects);
     registerPrivacyRoutes(api, dependencies.privacyRequests);
     registerFamilyRoutes(api, dependencies.family, projects, sessions);
