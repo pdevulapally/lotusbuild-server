@@ -28,8 +28,16 @@ const documentId = '^[A-Za-z0-9_-]{1,128}$';
 interface CreateProjectBody {
   readonly name: string;
   readonly description?: string;
-  readonly platform: Platform;
 }
+
+/**
+ * Every new project is a "web" project, because a caller no longer chooses a
+ * build type: the product has one workspace, not separate web and mobile ones.
+ * The value is still stored and still selects the sandbox provider row and the
+ * plan gates keyed by platform, which is why it is not simply removed. A client
+ * that still sends `platform` has it dropped by schema validation, not obeyed.
+ */
+const newProjectPlatform: Platform = 'web';
 
 function toResponse(project: Project) {
   return {
@@ -61,7 +69,7 @@ export function registerProjectRoutes(app: FastifyInstance, projects: ProjectRep
       schema: {
         body: {
           type: 'object',
-          required: ['name', 'platform'],
+          required: ['name'],
           additionalProperties: false,
           properties: {
             name: {
@@ -75,7 +83,6 @@ export function registerProjectRoutes(app: FastifyInstance, projects: ProjectRep
               maxLength: projectDescriptionMaxLength,
               pattern: printableLine,
             },
-            platform: { type: 'string', enum: ['web', 'mobile'] },
           },
         },
       },
@@ -85,7 +92,7 @@ export function registerProjectRoutes(app: FastifyInstance, projects: ProjectRep
       const project = await projects.create(user.uid, {
         name: request.body.name.trim(),
         description: request.body.description?.trim(),
-        platform: request.body.platform,
+        platform: newProjectPlatform,
       });
       return reply.code(201).send(toResponse(project));
     },
