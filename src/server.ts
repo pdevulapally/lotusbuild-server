@@ -47,7 +47,16 @@ export interface Dependencies {
   readonly configuration: ConfigurationStore;
   readonly stripe: Stripe;
   readonly billing: BillingRepository;
+  /**
+   * The git revision this build was packaged from, reported on `/health` so a
+   * deploy can be checked against what is actually running. Absent in a
+   * development checkout, where nothing packaged the tree.
+   */
+  readonly revision?: string;
 }
+
+/** Headers a browser may read off a cross-origin response; everything else is hidden from its JavaScript. */
+export const exposedResponseHeaders = ['Retry-After', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'];
 
 export function buildServer(config: Config, dependencies: Dependencies): FastifyInstance {
   const { firebaseAuth, redis, entitlements, metering, users, projects, sessions, sessionEvents } =
@@ -100,101 +109,115 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     credentials: false,
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
     allowedHeaders: ['Authorization', 'Content-Type', 'Last-Event-ID'],
+    // Without this a cross-origin caller cannot read the retry hint off a 429,
+    // because Retry-After is not one of the headers browsers reveal by default.
+    exposedHeaders: exposedResponseHeaders,
   });
 
-  // Resolves configuration rather than only proving the process is listening.
-  // The registry document went missing once and every route answered 500 while
-  // this endpoint stayed green — so deploy.sh passed its own smoke test and CI
-  // called the release healthy. The store is TTL-cached, so this is a memory
-  // read on all but the first call after expiry.
-  app.get('/health', async () => {
-    await dependencies.configuration.get();
-    return { status: 'ok' };
-  });
+  // Every route is declared inside this plugin, and that is load-bearing.
+  // @fastify/rate-limit attaches itself to a route from an onRoute hook, and
+  // onRoute fires when app.get() is *called*, not when the route is finally
+  // added. A plugin registered with `void app.register(...)` has not loaded by
+  // the time the next line of this function runs, so routes declared straight
+  // on the root were declared before the hook existed and were never limited
+  // per address. A child plugin is only run after the plugins registered
+  // before it have loaded, which is what makes the limit apply.
+  void app.register(async (api) => {
+    // Resolves configuration rather than only proving the process is listening.
+    // The registry document went missing once and every route answered 500 while
+    // this endpoint stayed green — so deploy.sh passed its own smoke test and CI
+    // called the release healthy. The store is TTL-cached, so this is a memory
+    // read on all but the first call after expiry.
+    api.get('/health', async () => {
+      await dependencies.configuration.get();
+      return dependencies.revision === undefined
+        ? { status: 'ok' }
+        : { status: 'ok', revision: dependencies.revision };
+    });
 
-  app.get('/me', { preHandler: [app.requireAuth, app.enforceRateLimit('read')] }, async (request) => {
-    const user = authenticatedUser(request);
-    // Session start is where the account record is created, so every later route
-    // can rely on it existing rather than each one creating it defensively.
-    const stored = await users.ensure(user);
-    const resolved = await entitlements.forUser(user.uid);
-
-    // Every field is named explicitly rather than spread from an internal
-    // object, so nothing added to those types later leaks into the response.
-    return {
-      uid: stored.uid,
-      email: stored.email,
-      emailVerified: user.emailVerified,
-      displayName: stored.displayName,
-      photoUrl: stored.photoUrl,
-      projectCount: stored.projectCount,
-      plan: { key: resolved.planKey, name: resolved.planName },
-      subscriptionStatus: resolved.subscriptionStatus,
-      capabilities: resolved.capabilities.entries(),
-      limits: [...resolved.meterLimits.values()].map((limit) => ({
-        meterKey: limit.meterKey,
-        includedAllowance: limit.includedAllowance,
-        hardLimit: limit.hardLimit,
-        overageEnabled: limit.overageEnabled,
-      })),
-    };
-  });
-
-  app.get(
-    '/me/usage',
-    { preHandler: [app.requireAuth, app.enforceRateLimit('read')] },
-    async (request) => {
+    api.get('/me', { preHandler: [api.requireAuth, api.enforceRateLimit('read')] }, async (request) => {
       const user = authenticatedUser(request);
+      // Session start is where the account record is created, so every later route
+      // can rely on it existing rather than each one creating it defensively.
       const stored = await users.ensure(user);
       const resolved = await entitlements.forUser(user.uid);
-      const usage = await metering.readUsageBreakdown(user.uid, resolved);
 
+      // Every field is named explicitly rather than spread from an internal
+      // object, so nothing added to those types later leaks into the response.
       return {
         uid: stored.uid,
+        email: stored.email,
+        emailVerified: user.emailVerified,
+        displayName: stored.displayName,
+        photoUrl: stored.photoUrl,
+        projectCount: stored.projectCount,
         plan: { key: resolved.planKey, name: resolved.planName },
-        meters: usage.map((entry) => ({
-          meterKey: entry.meterKey,
-          unit: entry.unit,
-          label: entry.label,
-          kind: entry.kind,
-          resetPeriod: entry.resetPeriod,
-          consumed: entry.consumed,
-          reserved: entry.reserved,
-          totalUsed: entry.consumed + entry.reserved,
-          includedAllowance: entry.includedAllowance,
-          hardLimit: entry.hardLimit,
-          overageEnabled: entry.overageEnabled,
-          periodStart: entry.periodStart.toISOString(),
+        subscriptionStatus: resolved.subscriptionStatus,
+        capabilities: resolved.capabilities.entries(),
+        limits: [...resolved.meterLimits.values()].map((limit) => ({
+          meterKey: limit.meterKey,
+          includedAllowance: limit.includedAllowance,
+          hardLimit: limit.hardLimit,
+          overageEnabled: limit.overageEnabled,
         })),
       };
-    },
-  );
+    });
 
+    api.get(
+      '/me/usage',
+      { preHandler: [api.requireAuth, api.enforceRateLimit('read')] },
+      async (request) => {
+        const user = authenticatedUser(request);
+        const stored = await users.ensure(user);
+        const resolved = await entitlements.forUser(user.uid);
+        const usage = await metering.readUsageBreakdown(user.uid, resolved);
 
-  registerProjectRoutes(app, projects);
-  registerPrivacyRoutes(app, dependencies.privacyRequests);
-  registerFamilyRoutes(app, dependencies.family, projects, sessions);
-  registerSessionRoutes(app, sessions, sessionEvents, {
-    heartbeatSeconds: config.SSE_HEARTBEAT_SECONDS,
-    maxConnections: config.SSE_MAX_CONNECTIONS,
-    maxConnectionsPerUser: config.SSE_MAX_CONNECTIONS_PER_USER,
-    maxBufferedBytes: config.SSE_BUFFER_MAX_BYTES,
-    reauthenticate: async (token) => { await firebaseAuth.verifyIdToken(token, true); },
-  });
-  registerBillingRoutes(app, {
-    stripe: dependencies.stripe,
-    billing: dependencies.billing,
-    users,
-    configuration: dependencies.configuration,
-    webhookSecret: config.STRIPE_WEBHOOK_SECRET,
-    // The same staleness budget the configuration itself runs on: a price
-    // change and a plan change should reach the pricing page together.
-    catalogueTtlMs: config.CONFIG_CACHE_TTL_SECONDS * 1000,
-    urls: {
-      checkoutSuccess: config.STRIPE_CHECKOUT_SUCCESS_URL,
-      checkoutCancel: config.STRIPE_CHECKOUT_CANCEL_URL,
-      portalReturn: config.STRIPE_PORTAL_RETURN_URL,
-    },
+        return {
+          uid: stored.uid,
+          plan: { key: resolved.planKey, name: resolved.planName },
+          meters: usage.map((entry) => ({
+            meterKey: entry.meterKey,
+            unit: entry.unit,
+            label: entry.label,
+            kind: entry.kind,
+            resetPeriod: entry.resetPeriod,
+            consumed: entry.consumed,
+            reserved: entry.reserved,
+            totalUsed: entry.consumed + entry.reserved,
+            includedAllowance: entry.includedAllowance,
+            hardLimit: entry.hardLimit,
+            overageEnabled: entry.overageEnabled,
+            periodStart: entry.periodStart.toISOString(),
+          })),
+        };
+      },
+    );
+
+    registerProjectRoutes(api, projects);
+    registerPrivacyRoutes(api, dependencies.privacyRequests);
+    registerFamilyRoutes(api, dependencies.family, projects, sessions);
+    registerSessionRoutes(api, sessions, sessionEvents, {
+      heartbeatSeconds: config.SSE_HEARTBEAT_SECONDS,
+      maxConnections: config.SSE_MAX_CONNECTIONS,
+      maxConnectionsPerUser: config.SSE_MAX_CONNECTIONS_PER_USER,
+      maxBufferedBytes: config.SSE_BUFFER_MAX_BYTES,
+      reauthenticate: async (token) => { await firebaseAuth.verifyIdToken(token, true); },
+    });
+    registerBillingRoutes(api, {
+      stripe: dependencies.stripe,
+      billing: dependencies.billing,
+      users,
+      configuration: dependencies.configuration,
+      webhookSecret: config.STRIPE_WEBHOOK_SECRET,
+      // The same staleness budget the configuration itself runs on: a price
+      // change and a plan change should reach the pricing page together.
+      catalogueTtlMs: config.CONFIG_CACHE_TTL_SECONDS * 1000,
+      urls: {
+        checkoutSuccess: config.STRIPE_CHECKOUT_SUCCESS_URL,
+        checkoutCancel: config.STRIPE_CHECKOUT_CANCEL_URL,
+        portalReturn: config.STRIPE_PORTAL_RETURN_URL,
+      },
+    });
   });
 
   return app;

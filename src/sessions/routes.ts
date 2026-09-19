@@ -89,6 +89,35 @@ function frame(event: SessionEvent): string {
   return `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`;
 }
 
+/**
+ * Why the server ended a stream, so a client can tell an expired token from a
+ * dropped network without guessing.
+ *
+ * - `token-expired`: the ID token this stream was opened with has reached its
+ *   expiry. A refreshed token cannot extend an open stream; reconnect with one.
+ * - `authorization-failed`: re-checking the token or the session failed (revoked
+ *   or disabled account, session gone, or the check itself could not complete).
+ * - `slow-consumer`: the client was not reading fast enough. Resume from the
+ *   last event id.
+ * - `stream-error`: the server failed while starting or replaying the stream.
+ */
+export type StreamClosingReason =
+  | 'token-expired'
+  | 'authorization-failed'
+  | 'slow-consumer'
+  | 'stream-error';
+
+/**
+ * The last frame of a stream the server ended. It carries no `id:` line, so it
+ * can never become the `Last-Event-ID` a client resumes from.
+ */
+export function closingFrame(reason: StreamClosingReason): string {
+  return `event: stream.closing\ndata: ${JSON.stringify({ reason })}\n\n`;
+}
+
+/** How long a client that stopped reading gets to receive the closing frame before the socket is destroyed. */
+const closingGraceMs = 1000;
+
 export function registerSessionRoutes(
   app: FastifyInstance,
   sessions: SessionRepository,
@@ -115,7 +144,7 @@ export function registerSessionRoutes(
   app.post<{ Params: { projectId: string }; Body: { prompt: string; model: string } }>(
     '/projects/:projectId/sessions',
     {
-      preHandler: [app.requireAuth, app.enforceRateLimit('build')],
+      preHandler: [app.requireAuth, app.requireVerifiedEmail, app.enforceRateLimit('build')],
       schema: {
         params: {
           type: 'object',
@@ -234,7 +263,7 @@ export function registerSessionRoutes(
   app.post<{ Params: { sessionId: string }; Body: { prompt: string; steer?: boolean } }>(
     '/sessions/:sessionId/messages',
     {
-      preHandler: [app.requireAuth, app.enforceRateLimit('build')],
+      preHandler: [app.requireAuth, app.requireVerifiedEmail, app.enforceRateLimit('build')],
       schema: {
         params: {
           type: 'object',
@@ -471,14 +500,18 @@ export function registerSessionRoutes(
       const authorizationWindow = options.heartbeatSeconds * 2000;
       const tokenExpiry = user.expiresAt === undefined ? Number.POSITIVE_INFINITY : user.expiresAt * 1000;
       let authorizedUntil = Math.min(Date.now() + authorizationWindow, tokenExpiry);
+      // The window ends at the token's own expiry or, if the periodic re-check
+      // has stalled, two heartbeats after it last succeeded; only the first is
+      // an expired token.
+      const lapsedReason = (): StreamClosingReason =>
+        Date.now() >= tokenExpiry ? 'token-expired' : 'authorization-failed';
       const write = (chunk: string): void => {
         if (finished) return;
-        if (!socket.writable || Date.now() >= authorizedUntil) { finish(); return; }
-        if (socket.writable) {
-          // Close slow readers at backpressure instead of accumulating bytes.
-          // The client can resume from its last received event ID.
-          if (Buffer.byteLength(chunk) > options.maxBufferedBytes || !socket.write(chunk)) finish();
-        }
+        if (!socket.writable) { finish(); return; }
+        if (Date.now() >= authorizedUntil) { finish(lapsedReason()); return; }
+        // Close slow readers at backpressure instead of accumulating bytes.
+        // The client can resume from its last received event ID.
+        if (Buffer.byteLength(chunk) > options.maxBufferedBytes || !socket.write(chunk)) finish('slow-consumer');
       };
 
       // Events published while history is being read are held rather than sent,
@@ -491,7 +524,7 @@ export function registerSessionRoutes(
       let authenticating = false;
       const heartbeat = setInterval(() => {
         if (finished) return;
-        if (Date.now() >= authorizedUntil) { finish(); return; }
+        if (Date.now() >= authorizedUntil) { finish(lapsedReason()); return; }
         if (authenticating) return;
         authenticating = true;
         void (async () => {
@@ -501,14 +534,24 @@ export function registerSessionRoutes(
             authorizedUntil = Math.min(Date.now() + authorizationWindow, tokenExpiry);
             write(': keep-alive\n\n');
           } catch {
-            finish();
+            finish('authorization-failed');
           } finally { authenticating = false; }
         })();
       }, options.heartbeatSeconds * 1000);
       // Never a reason to hold the process open at shutdown.
       heartbeat.unref();
 
-      const finish = (): void => {
+      // A stream the client hung up on has nobody to tell, so only the server's
+      // own reasons pass one. The frame is the response's last write; the socket
+      // is still destroyed after a short grace so a client that stopped reading
+      // cannot hold it open for the sake of a frame.
+      const closeSocket = (reason: StreamClosingReason | undefined): void => {
+        if (reason === undefined || !socket.writable) { socket.destroy(); return; }
+        socket.end(closingFrame(reason));
+        setTimeout(() => socket.destroy(), closingGraceMs).unref();
+      };
+
+      const finish = (reason?: StreamClosingReason): void => {
         if (finished) {
           return;
         }
@@ -520,13 +563,13 @@ export function registerSessionRoutes(
         clearInterval(heartbeat);
         pending.length = 0;
         try { release?.(); } catch { request.log.warn({ sessionId: session.id }, 'event listener cleanup failed'); }
-        finally { socket.destroy(); }
+        finally { closeSocket(reason); }
       };
 
-      request.raw.on('close', finish);
-      request.raw.on('error', finish);
-      socket.on('close', finish);
-      socket.on('error', finish);
+      request.raw.on('close', () => finish());
+      request.raw.on('error', () => finish());
+      socket.on('close', () => finish());
+      socket.on('error', () => finish());
       if (socket.destroyed || request.raw.aborted) { finish(); return; }
 
       try {
@@ -534,7 +577,7 @@ export function registerSessionRoutes(
           if (finished) return;
           if (replaying) {
             pendingBytes += Buffer.byteLength(frame(event));
-            if (pendingBytes > options.maxBufferedBytes) { finish(); return; }
+            if (pendingBytes > options.maxBufferedBytes) { finish('slow-consumer'); return; }
             pending.push(event);
             return;
           }
@@ -567,7 +610,7 @@ export function registerSessionRoutes(
         // All that is left is to log it and hang up, which the client sees as a
         // dropped stream and retries.
         request.log.error({ diagnostic: safeErrorDiagnostic(error), sessionId: session.id }, 'event stream failed to start');
-        finish();
+        finish('stream-error');
       }
     },
   );

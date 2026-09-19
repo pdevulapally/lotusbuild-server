@@ -42,7 +42,7 @@ const diagnosticCodes = new Set([
   'session/ai-not-permitted', 'session/model-not-permitted', 'session/platform-not-permitted',
   'account/erasure-pending', 'account/reconciliation-required', 'project/deleting', 'project/not-found',
   'project/persistence-failed', 'sandbox/platform-unconfigured', 'billing/provider-unavailable',
-  'billing/bad-signature', 'auth/token-invalid', 'auth/token-expired', 'auth/token-revoked',
+  'billing/bad-signature', 'auth/token-invalid', 'auth/token-expired', 'auth/token-revoked', 'auth/email-not-verified',
   'runner/shutdown', 'runner/execution-failed',
 ]);
 const diagnosticStages = new Set([

@@ -4,16 +4,16 @@ import Fastify from 'fastify';
 import type { Auth } from 'firebase-admin/auth';
 import { registerAuth } from '../src/auth/plugin.ts';
 import { AppError, registerErrorHandler } from '../src/http/errors.ts';
-import { registerSessionRoutes } from '../src/sessions/routes.ts';
+import { closingFrame, registerSessionRoutes } from '../src/sessions/routes.ts';
 import type { SessionRepository } from '../src/sessions/repository.ts';
 import type { SessionEvent, SessionEvents } from '../src/sessions/events.ts';
 
-async function fixture() {
+async function fixture(expiresInSeconds = 3600) {
   const app = Fastify({ logger: false });
   let revoked = false;
   let listener: ((event: SessionEvent) => void) | undefined;
   let subscriptions = 0;
-  const verify = async () => { if (revoked) throw new Error('revoked'); return { uid: 'alice', auth_time: Date.now() / 1000, exp: Date.now() / 1000 + 3600 }; };
+  const verify = async () => { if (revoked) throw new Error('revoked'); return { uid: 'alice', auth_time: Date.now() / 1000, exp: Date.now() / 1000 + expiresInSeconds }; };
   registerAuth(app, { verifyIdToken: verify } as unknown as Auth);
   registerErrorHandler(app);
   app.decorate('enforceRateLimit', () => async () => {});
@@ -62,4 +62,40 @@ test('SSE closes after token revocation and drops oversized live events', async 
       await until(() => h.count() === 0);
     } finally { abort.abort(); await h.app.close(); }
   }
+});
+
+test('SSE tells the client why the server ended the stream, in a final frame with no id', async () => {
+  type Harness = Awaited<ReturnType<typeof fixture>>;
+  const cases: { reason: 'authorization-failed' | 'slow-consumer' | 'token-expired'; expiresIn: number; trigger: (h: Harness) => void }[] = [
+    { reason: 'authorization-failed', expiresIn: 3600, trigger: (h) => h.revoke() },
+    { reason: 'slow-consumer', expiresIn: 3600, trigger: (h) => h.emit({ id: '1-0', type: 'test', data: { content: 'x'.repeat(2000) } }) },
+    { reason: 'token-expired', expiresIn: 0.1, trigger: () => {} },
+  ];
+  for (const { reason, expiresIn, trigger } of cases) {
+    const h = await fixture(expiresIn);
+    try {
+      const response = await fetch(`${h.address}/sessions/owned/events`, { headers });
+      assert.equal(response.status, 200);
+      await until(() => h.count() === 1);
+      trigger(h);
+      // Resolves only if the server ended the response; a bare socket drop would reject.
+      const text = await response.text();
+      assert.ok(text.endsWith(closingFrame(reason)), `${reason}: ${JSON.stringify(text)}`);
+      assert.equal(closingFrame(reason), `event: stream.closing\ndata: {"reason":"${reason}"}\n\n`);
+      assert.equal(closingFrame(reason).includes('id:'), false);
+      await until(() => h.count() === 0);
+    } finally { await h.app.close(); }
+  }
+});
+
+test('SSE sends no closing frame when the client is the one that hung up', async () => {
+  const h = await fixture();
+  const abort = new AbortController();
+  try {
+    const response = await fetch(`${h.address}/sessions/owned/events`, { headers, signal: abort.signal });
+    await until(() => h.count() === 1);
+    abort.abort();
+    await assert.rejects(response.text());
+    await until(() => h.count() === 0);
+  } finally { abort.abort(); await h.app.close(); }
 });

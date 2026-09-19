@@ -824,7 +824,7 @@ test('retrying finalisation after a transient release failure is safe', async ()
 
 async function routeApp(h: ReturnType<typeof harness>, append: SessionEvents['append'] = async (_id, type, data) => ({ id: '1-0', type, data })) {
   const app = Fastify({ logger: false });
-  registerAuth(app, { verifyIdToken: async () => ({ uid: 'user-1', auth_time: Date.now() / 1000, exp: Date.now() / 1000 + 3600 }) } as unknown as Auth);
+  registerAuth(app, { verifyIdToken: async () => ({ uid: 'user-1', auth_time: Date.now() / 1000, email_verified: true, exp: Date.now() / 1000 + 3600 }) } as unknown as Auth);
   registerErrorHandler(app);
   app.decorate('enforceRateLimit', () => async () => {});
   registerProjectRoutes(app, h.projects);

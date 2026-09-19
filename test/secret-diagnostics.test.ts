@@ -238,6 +238,7 @@ test('actual Stripe signature rejection logs safe metadata without the SDK signa
   const app = Fastify({ logger: { stream: { write: (line: string) => { logs += line; } } } });
   t.after(() => app.close());
   app.decorate('requireAuth', async () => {});
+  app.decorate('requireVerifiedEmail', async () => {});
   app.decorate('enforceRateLimit', () => async () => {});
   registerErrorHandler(app);
   registerBillingRoutes(app, {
