@@ -1,9 +1,15 @@
 import { projectFilesScript } from './project-files.ts';
 import { ALL_TRAFFIC, CommandExitError, Sandbox, SandboxNotFoundError, type CommandHandle } from 'e2b';
 
-import { parseSandboxNetwork, type SandboxNetworkPolicy, type SandboxProvider } from '../entitlements/schema.ts';
-import type { CommandOutcome, RunningSandbox, SandboxAdapter, SandboxLifecycle } from './provider.ts';
+import { parseSandboxNetwork, type DesktopSettings, type SandboxNetworkPolicy, type SandboxProvider } from '../entitlements/schema.ts';
+import type { CommandOutcome, DesktopEndpoint, RunningSandbox, SandboxAdapter, SandboxLifecycle } from './provider.ts';
 import { outputLimiter, readBoundedText, readTextWindow } from './bounded-output.ts';
+
+/** The X display the desktop lives on, inside the sandbox. */
+const desktopDisplay = ':0';
+
+/** The noVNC proxy's port, and the only one the relay ever connects to. */
+const desktopStreamPort = 6080;
 
 function networkRules(policy: SandboxNetworkPolicy) {
   const checked = parseSandboxNetwork(policy, 'sandbox network');
@@ -63,6 +69,7 @@ export class E2BAdapter implements SandboxAdapter {
   ): Promise<RunningSandbox> {
     const rules = networkRules(context.networkPolicy);
     await context.lifecycle?.beforeCreate();
+    const desktop = provider.desktop !== undefined;
     const sandbox = await Sandbox.create(provider.template, {
       ...this.#connection(),
       // The provider's timeout is also what was reserved against the user's
@@ -70,7 +77,13 @@ export class E2BAdapter implements SandboxAdapter {
       timeoutMs: provider.timeoutSeconds * 1000,
       metadata: { ...context.metadata },
       secure: true,
-      network: { ...rules, allowPublicTraffic: context.publicPreviewEnabled === true },
+      // A desktop's stream has no password of its own: the only thing keeping it
+      // private is that the sandbox is. So a desktop sandbox is never opened to
+      // public traffic, whatever the project asked for.
+      network: { ...rules, allowPublicTraffic: !desktop && context.publicPreviewEnabled === true },
+      // Anything the agent launches on its own, a browser above all, needs to
+      // know which screen to draw on.
+      ...(desktop ? { envs: { DISPLAY: desktopDisplay } } : {}),
     });
     const running = new E2BSandbox(sandbox, this.#maxOutputBytes);
 
@@ -289,6 +302,63 @@ class E2BSandbox implements RunningSandbox {
 
   previewUrl(port: number): string {
     return `https://${this.#sandbox.getHost(port)}`;
+  }
+
+  /**
+   * Brings up a virtual screen, a desktop session, and a view-only VNC stream
+   * that noVNC serves on a private port.
+   *
+   * View-only is decided here, at the VNC server, because it is the only place a
+   * viewer cannot get around: the agent's own clicks and typing go through
+   * `xdotool`, not through VNC, so they are unaffected. There is no VNC password
+   * because the port is only reachable with the sandbox's traffic token, which
+   * the browser never sees.
+   */
+  async startDesktop(settings: DesktopSettings, signal?: AbortSignal): Promise<DesktopEndpoint> {
+    const { width, height } = settings;
+    // These are interpolated into a shell command below. The registry is trusted,
+    // but a value that is not a plain size must never reach a shell.
+    if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
+      throw new Error('The desktop size is not a valid integer size.');
+    }
+    const token = this.#sandbox.trafficAccessToken;
+    if (token === undefined || token === '') {
+      throw new Error('The sandbox has no traffic access token, so its desktop cannot be reached privately.');
+    }
+    const sandbox = this.#sandbox;
+    const inBackground = async (command: string, envs?: Record<string, string>): Promise<void> => {
+      const handle = await sandbox.commands.run(command, { background: true, timeoutMs: 0, ...(envs === undefined ? {} : { envs }) });
+      await handle.disconnect();
+    };
+    // Polls a shell check until it succeeds. A non-zero exit means "not yet";
+    // anything else, such as a dead sandbox, is a real failure.
+    const waitUntil = async (check: string, attempts: number, what: string): Promise<void> => {
+      for (let attempt = 0; attempt < attempts; attempt++) {
+        signal?.throwIfAborted();
+        try {
+          await sandbox.commands.run(check, { timeoutMs: 10_000 });
+          return;
+        } catch (error) {
+          if (!(error instanceof CommandExitError)) throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      throw new Error(`${what} did not become ready.`);
+    };
+
+    signal?.throwIfAborted();
+    await inBackground(`Xvfb ${desktopDisplay} -ac -screen 0 ${width}x${height}x24 -retro -dpi 96 -nolisten tcp -nolisten unix`);
+    await waitUntil(`xdpyinfo -display ${desktopDisplay}`, 40, 'The virtual screen');
+    await inBackground('startxfce4', { DISPLAY: desktopDisplay });
+    await waitUntil('pgrep -x xfce4-session >/dev/null && pgrep -x xfwm4 >/dev/null && pgrep -x xfdesktop >/dev/null', 120, 'The desktop session');
+    signal?.throwIfAborted();
+    await sandbox.commands.run(
+      `x11vnc -bg -display ${desktopDisplay} -forever -wait 50 -shared -viewonly -rfbport 5900 2>/tmp/x11vnc.log`,
+      { timeoutMs: 30_000 },
+    );
+    await inBackground(`cd /opt/noVNC/utils && ./novnc_proxy --vnc localhost:5900 --listen ${desktopStreamPort} --web /opt/noVNC > /tmp/novnc.log 2>&1`);
+    await waitUntil(`ss -ltn | grep -q ":${desktopStreamPort}"`, 40, 'The desktop stream');
+    return { host: sandbox.getHost(desktopStreamPort), token };
   }
 
   async lifetime() {

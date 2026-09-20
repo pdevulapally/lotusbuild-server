@@ -67,6 +67,19 @@ export interface SandboxProvider {
    * be empty, which means no validation is offered for this platform.
    */
   readonly validationProfiles: ReadonlyMap<string, string>;
+  /**
+   * Present means builds on this provider show the user a live desktop; absent,
+   * which is how every registry written before desktops existed reads, means
+   * they do not. It is the switch for the whole feature: nothing changes for a
+   * platform until its row names a size here.
+   */
+  readonly desktop?: DesktopSettings;
+}
+
+/** The screen a build's desktop is created with. */
+export interface DesktopSettings {
+  readonly width: number;
+  readonly height: number;
 }
 
 export interface EntitlementSource {
@@ -213,6 +226,26 @@ export function parseSandboxNetwork(value: unknown, where: string): SandboxNetwo
  * refused rather than quietly dropped, so a broken profile cannot become a
  * silently missing capability.
  */
+/**
+ * Absent is the default and means no desktop. Present but malformed is refused:
+ * a size that cannot be read must not quietly turn a feature on or off.
+ */
+function parseDesktop(entry: Fields, at: string): { readonly desktop?: DesktopSettings } {
+  if (!Object.prototype.hasOwnProperty.call(entry, 'desktop')) return {};
+  const value = entry['desktop'];
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new DocumentShapeError(`${at}: field "desktop" must be an object with a width and a height.`);
+  }
+  const where = `${at}.desktop`;
+  const fields = value as Fields;
+  return {
+    desktop: {
+      width: integerField(fields, 'width', where, { min: 640, max: 3840 }),
+      height: integerField(fields, 'height', where, { min: 480, max: 2160 }),
+    },
+  };
+}
+
 function parseValidationProfiles(entry: Fields, at: string): ReadonlyMap<string, string> {
   const value = entry['validationProfiles'];
   if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -314,6 +347,7 @@ export function parseRegistry(fields: Fields, where: string): Registry {
         idleGraceSeconds: integerField(entry, 'idleGraceSeconds', at, { min: 0 }),
         agentInstructions: stringField(entry, 'agentInstructions', at),
         validationProfiles: parseValidationProfiles(entry, at),
+        ...parseDesktop(entry, at),
       };
     },
   );

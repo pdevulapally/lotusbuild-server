@@ -5,6 +5,7 @@ import type Anthropic from '@anthropic-ai/sdk';
 
 import type { EntitlementService, UserEntitlements } from '../entitlements/service.ts';
 import type { ConfigurationStore } from '../entitlements/store.ts';
+import type { DesktopHandoffPort } from '../desktop/handoff.ts';
 import { AppError, safeErrorDiagnostic } from '../http/errors.ts';
 import type { MeteringService } from '../metering/service.ts';
 import type { ProjectPersistence, RestoreOutcome } from '../projects/persistence.ts';
@@ -103,7 +104,16 @@ export interface RunnerDependencies {
   readonly heartbeatSeconds: number;
   readonly messageHistoryLimit: number;
   readonly log: RunnerLogger;
+  /**
+   * Where a running desktop is announced to the API's relay. Needed only for a
+   * provider whose registry row configures a desktop; a build on one without it
+   * fails to show its desktop, loudly, rather than silently skipping it.
+   */
+  readonly desktop?: DesktopHandoffPort;
 }
+
+/** Why a desktop stopped being available. Mirrors what the frontend is told. */
+type DesktopEndReason = 'session-ended' | 'sandbox-stopped' | 'error';
 
 /**
  * The runner's whole contract with the rest of the system: take a session, do
@@ -113,9 +123,65 @@ export interface RunnerDependencies {
  */
 export class SessionRunner {
   readonly #deps: RunnerDependencies;
+  /** Sessions whose desktop this process announced and has not yet ended. */
+  readonly #desktops = new Set<string>();
 
   constructor(deps: RunnerDependencies) {
     this.#deps = deps;
+  }
+
+  /**
+   * Shows the user this build's desktop, when its provider has one.
+   *
+   * Best effort by design: a build that cannot show its desktop still builds,
+   * and the user is told the desktop is unavailable. Cancellation and shutdown
+   * are the exception and are always rethrown, so a stopping session stops.
+   */
+  async #startDesktop(
+    session: ClaimedSession,
+    acquired: AcquiredSandbox,
+    publish: (type: string, data: Record<string, unknown>) => Promise<void>,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const settings = acquired.provider.desktop;
+    if (settings === undefined) return;
+    try {
+      const handoff = this.#deps.desktop;
+      if (handoff === undefined) throw new Error('The runner has no desktop handoff configured.');
+      if (acquired.running.startDesktop === undefined) throw new Error('This sandbox provider cannot show a desktop.');
+      const endpoint = await acquired.running.startDesktop(settings, signal);
+      // Written only once the stream is reachable, and expiring with the sandbox,
+      // so a deletion that never happens cannot leave a stale entry behind.
+      await handoff.publish(session.id, endpoint, acquired.provider.timeoutSeconds + 60);
+      this.#desktops.add(session.id);
+      await publish('desktop.ready', { width: settings.width, height: settings.height });
+    } catch (error) {
+      signal.throwIfAborted();
+      this.#deps.log.error(
+        { sessionId: session.id, diagnostic: safeErrorDiagnostic(error) },
+        'could not start the desktop; continuing without it',
+      );
+      await publish('desktop.ended', { reason: 'error' satisfies DesktopEndReason });
+    }
+  }
+
+  /**
+   * The desktop is going away: withdraw it from the relay and tell the user.
+   * Never throws. Failing to withdraw is bounded by the handoff's own expiry,
+   * and must not turn releasing a sandbox into a failure.
+   */
+  async #endDesktop(sessionId: string, reason: DesktopEndReason, alsoUnannounced = false): Promise<void> {
+    const handoff = this.#deps.desktop;
+    // A build with no desktop never touches Redis. Only a successor to a dead
+    // runner has to look for an entry it did not write itself.
+    if (handoff === undefined || (!alsoUnannounced && !this.#desktops.has(sessionId))) return;
+    try {
+      const existed = await handoff.clear(sessionId);
+      const announced = this.#desktops.delete(sessionId);
+      if (existed || announced) await this.#deps.events.append(sessionId, 'desktop.ended', { reason });
+    } catch (error) {
+      this.#deps.log.warn({ sessionId, diagnostic: safeErrorDiagnostic(error) }, 'could not withdraw the desktop');
+    }
   }
 
   /** Takes one session if there is one. Returns whether there was. */
@@ -247,6 +313,8 @@ export class SessionRunner {
       }
       const abandoned = [...new Set([...session.reservationIds, ...session.specialistReservationIds])];
       if (session.sandboxId !== undefined || abandoned.length > 0) {
+        // A runner that died with a desktop up cannot have withdrawn it.
+        await this.#endDesktop(session.id, 'sandbox-stopped', true);
         try {
           await sandboxes.recover({ uid: session.ownerUid, platform: project.platform,
             externalSandboxId: session.sandboxId, reservationIds: abandoned, now: new Date(),
@@ -329,6 +397,7 @@ export class SessionRunner {
         template: acquired.provider.template,
         platform: acquired.provider.platform,
       });
+      await this.#startDesktop(session, acquired, publish, signal);
 
       // Only a plan that pays for it gets its work back. For everyone else the
       // sandbox is genuinely disposable, which is the difference being sold.
@@ -542,6 +611,10 @@ export class SessionRunner {
       else log.error({ sessionId: session.id }, 'session failed');
 
       if (acquired !== undefined) {
+        // Withdrawn first: some of the paths below keep the machine for salvage and
+        // throw before it is released, and a failed session should not keep
+        // offering a live view of it.
+        await this.#endDesktop(session.id, 'session-ended');
         if (workspaceMayBeDirty && saveAttempted && !saveCompleted) throw new RunnerWorkError(error, 'workspace/save-failed');
         // Saved before the machine is discarded, even now: a build that failed
         // at step nine still wrote eight steps of a project the user is paying
@@ -715,6 +788,8 @@ export class SessionRunner {
   async #letGo(session: ClaimedSession, acquired: AcquiredSandbox): Promise<void> {
     const { sessions, sandboxes, log, runnerId } = this.#deps;
     const authority = { sessionId: session.id, runnerId, token: session.leaseToken };
+    // The machine is about to stop, so the desktop on it is over.
+    await this.#endDesktop(session.id, 'session-ended');
     await sandboxes.release({
       uid: session.ownerUid,
       acquired,
