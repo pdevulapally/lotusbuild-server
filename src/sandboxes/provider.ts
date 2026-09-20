@@ -52,6 +52,8 @@ export interface RunningSandbox {
   ): Promise<CommandOutcome>;
   writeFile(path: string, content: string): Promise<void>;
   readFile(path: string): Promise<string>;
+  /** A file's bytes, for one that is not text. Refuses a file over `maxBytes` rather than truncating it. */
+  readBytes?(path: string, maxBytes: number): Promise<Buffer>;
   readFileRange?(path: string, offset: number, limit: number, timeoutMs: number): Promise<{ text: string; start: number; total: number }>;
   /** Public URL a port inside the sandbox is reachable on. */
   previewUrl(port: number): string;

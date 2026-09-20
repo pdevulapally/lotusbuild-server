@@ -131,7 +131,7 @@ async function modelFixture() {
       specialistMaxSteps: 2, commandTimeoutMs: 1000, previewReadyTimeoutSeconds: 1 },
     events: { text: () => {}, step: async () => {}, toolCall: async () => {}, toolResult: async () => {},
       preview: async () => {}, specialistStarted: async () => {}, specialistCompleted: async () => {} },
-    signal: controller.signal, assertStillOurs: () => {}, drainSteer: () => undefined, reservations, onProblem });
+    signal: controller.signal, assertStillOurs: () => {}, drainSteer: () => undefined, desktopReady: false, reservations, onProblem });
   const records = () => [...data].filter(([path]) => path.startsWith('users/u/reservations/')).map(([path, fields]) => ({ id: path.split('/').at(-1)!, fields }));
   const usage = (key: string) => data.get(`users/u/usage/${key}`)!;
   return { db, data, metering, registry, entitlements, sessions, authority, sdk, controller, problems, reservations,
