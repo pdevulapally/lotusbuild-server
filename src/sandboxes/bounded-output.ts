@@ -8,6 +8,26 @@ export function outputLimiter(maxBytes: number): (chunk: string) => void {
   };
 }
 
+/** The bytes of a stream, refusing rather than truncating when it is larger than `maxBytes`. */
+export async function readBoundedBytes(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<Buffer> {
+  const reader = stream.getReader();
+  let bytes = 0;
+  const parts: Uint8Array[] = [];
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+      if (bytes > maxBytes) throw new Error(`The file is larger than ${maxBytes} bytes.`);
+      parts.push(chunk.value);
+    }
+    return Buffer.concat(parts);
+  } finally {
+    await reader.cancel();
+    reader.releaseLock();
+  }
+}
+
 export async function readBoundedText(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<string> {
   const reader = stream.getReader();
   let bytes = 0;

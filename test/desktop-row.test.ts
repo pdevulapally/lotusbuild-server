@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parseRegistry } from '../src/entitlements/schema.ts';
-import { registryDocument } from '../src/seed/config.ts';
+import { planDocuments, registryDocument } from '../src/seed/config.ts';
 import { desktopAgentInstructions, desktopSettings, withDesktop } from '../src/seed/desktop-row.ts';
 
 const seeded = registryDocument as unknown as Record<string, unknown>;
@@ -13,6 +13,8 @@ test('enabling changes only the web row, and the result is valid configuration w
   assert.deepEqual(changes.map((change) => change.field).sort(), ['agentInstructions', 'desktop', 'memoryMb', 'template']);
   assert.equal(web(fields)['template'], 'lotusbuild-desktop-dev');
   assert.deepEqual(web(fields)['desktop'], desktopSettings);
+  // The list is the row's own copy, so nothing that edits it can reach the constant.
+  assert.notEqual((web(fields)['desktop'] as { computerModels: unknown })['computerModels'], desktopSettings.computerModels);
   assert.equal(web(fields)['agentInstructions'], desktopAgentInstructions);
   // Everything else in the document is exactly as it was, including the other provider row.
   for (const [key, value] of Object.entries(seeded)) if (key !== 'sandboxProviders') assert.deepEqual(fields[key], value);
@@ -24,6 +26,12 @@ test('enabling changes only the web row, and the result is valid configuration w
   }
   const parsed = parseRegistry(fields, 'registry').sandboxProviders.get('web')!;
   assert.deepEqual(parsed.desktop, desktopSettings);
+  // Every model that may operate the screen is one a plan can actually pick: a typo here would switch it off silently.
+  const plans = planDocuments as unknown as { entitlements: { capabilityKey: string; value: { value: string[] } }[] }[];
+  const planModels = new Set(plans.flatMap((plan) => plan.entitlements)
+    .filter((entitlement) => entitlement.capabilityKey === 'ai.model.allowlist')
+    .flatMap((entitlement) => entitlement.value.value));
+  for (const model of desktopSettings.computerModels) assert.ok(planModels.has(model), model);
 });
 
 test('disabling is the exact inverse of enabling', () => {
@@ -47,12 +55,16 @@ test('a registry without exactly one web provider is refused', () => {
   assert.throws(() => withDesktop({ ...seeded, sandboxProviders: 'nope' }, 'enable'), /no sandboxProviders/);
 });
 
-test('the desktop instructions do not send the agent to start_preview and admit it cannot see the screen', () => {
+test('the desktop instructions do not send the agent to start_preview, and leave what it can see to the runner', () => {
   assert.equal(/use start_preview|run start_preview/i.test(desktopAgentInstructions), false);
   assert.ok(desktopAgentInstructions.includes('start_preview and public URLs are not available'));
-  assert.ok(desktopAgentInstructions.includes('you have no screenshot tool'));
+  // Whether the agent can see the screen depends on the session, so it is not a claim configuration may make.
+  assert.equal(/screenshot|cannot see|watching/i.test(desktopAgentInstructions), false);
   assert.ok(desktopAgentInstructions.includes('--host 0.0.0.0'));
   // Without these Chrome stops on a welcome dialog and never opens the page.
   assert.ok(desktopAgentInstructions.includes('--no-first-run --no-default-browser-check'));
+  // `cd dir && server &` hangs the call until it times out, found live, so the agent is told not to.
+  assert.ok(desktopAgentInstructions.includes('Do not write "cd dir && server &"'));
+  assert.ok(desktopAgentInstructions.includes('--start-maximized'));
   assert.ok(desktopAgentInstructions.includes('DISPLAY is already set to :0'));
 });

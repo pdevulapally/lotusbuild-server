@@ -136,15 +136,18 @@ export class SessionRunner {
    * Best effort by design: a build that cannot show its desktop still builds,
    * and the user is told the desktop is unavailable. Cancellation and shutdown
    * are the exception and are always rethrown, so a stopping session stops.
+   *
+   * Returns whether the desktop is up and shown, which is what tells the agent
+   * whether it has a screen: an agent must not be told about one that is not there.
    */
   async #startDesktop(
     session: ClaimedSession,
     acquired: AcquiredSandbox,
     publish: (type: string, data: Record<string, unknown>) => Promise<void>,
     signal: AbortSignal,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const settings = acquired.provider.desktop;
-    if (settings === undefined) return;
+    if (settings === undefined) return false;
     try {
       const handoff = this.#deps.desktop;
       if (handoff === undefined) throw new Error('The runner has no desktop handoff configured.');
@@ -155,6 +158,7 @@ export class SessionRunner {
       await handoff.publish(session.id, endpoint, acquired.provider.timeoutSeconds + 60);
       this.#desktops.add(session.id);
       await publish('desktop.ready', { width: settings.width, height: settings.height });
+      return true;
     } catch (error) {
       signal.throwIfAborted();
       this.#deps.log.error(
@@ -162,6 +166,7 @@ export class SessionRunner {
         'could not start the desktop; continuing without it',
       );
       await publish('desktop.ended', { reason: 'error' satisfies DesktopEndReason });
+      return false;
     }
   }
 
@@ -397,7 +402,7 @@ export class SessionRunner {
         template: acquired.provider.template,
         platform: acquired.provider.platform,
       });
-      await this.#startDesktop(session, acquired, publish, signal);
+      const desktopReady = await this.#startDesktop(session, acquired, publish, signal);
 
       // Only a plan that pays for it gets its work back. For everyone else the
       // sandbox is genuinely disposable, which is the difference being sold.
@@ -464,6 +469,7 @@ export class SessionRunner {
           }
         },
         drainSteer: () => sessions.drainSteerMessage(session.id, authority),
+        desktopReady,
         events: {
           // Text arrives as it is generated. Not awaited: the model does not
           // wait for Redis, and back-pressure here would stall generation.
@@ -544,6 +550,7 @@ export class SessionRunner {
             }
           },
           drainSteer: () => sessions.drainSteerMessage(session.id, authority),
+          desktopReady,
           events: {
             text: (delta) => {
               void publish('agent.text', { delta });

@@ -80,7 +80,24 @@ export interface SandboxProvider {
 export interface DesktopSettings {
   readonly width: number;
   readonly height: number;
+  /**
+   * The models that may operate the screen, through the computer tool. Absent
+   * means none: the agent still builds and the user still watches, but it cannot
+   * see the screen. Configuration because which models support the tool, and
+   * which are worth its cost, change without a deploy.
+   */
+  readonly computerModels?: readonly string[];
 }
+
+/**
+ * What the API accepts in a screenshot: 2576 px on the long edge and 4784 visual
+ * tokens of 28 px squares. It does not downscale, so a desktop larger than this
+ * cannot be operated through the computer tool and is refused when configured
+ * rather than failing on the first screenshot.
+ */
+export const screenshotLongEdgeLimit = 2576;
+export const screenshotVisualTokenLimit = 4784;
+export const screenshotSquare = 28;
 
 export interface EntitlementSource {
   readonly key: string;
@@ -238,12 +255,24 @@ function parseDesktop(entry: Fields, at: string): { readonly desktop?: DesktopSe
   }
   const where = `${at}.desktop`;
   const fields = value as Fields;
-  return {
-    desktop: {
-      width: integerField(fields, 'width', where, { min: 640, max: 3840 }),
-      height: integerField(fields, 'height', where, { min: 480, max: 2160 }),
-    },
-  };
+  const width = integerField(fields, 'width', where, { min: 640, max: 3840 });
+  const height = integerField(fields, 'height', where, { min: 480, max: 2160 });
+  if (!Object.prototype.hasOwnProperty.call(fields, 'computerModels')) return { desktop: { width, height } };
+
+  const models = fields['computerModels'];
+  if (!Array.isArray(models) || models.length === 0
+    || models.some((model) => typeof model !== 'string' || model.trim() === '' || model !== model.trim())
+    || new Set(models).size !== models.length) {
+    throw new DocumentShapeError(`${where}: "computerModels" must be a non-empty list of unique model names.`);
+  }
+  const visualTokens = Math.ceil(width / screenshotSquare) * Math.ceil(height / screenshotSquare);
+  if (Math.max(width, height) > screenshotLongEdgeLimit || visualTokens > screenshotVisualTokenLimit) {
+    throw new DocumentShapeError(
+      `${where}: a ${width}x${height} screen is larger than a screenshot can be (${screenshotLongEdgeLimit} px on the ` +
+      `long edge, ${screenshotVisualTokenLimit} visual tokens), so its models cannot be given the computer tool.`,
+    );
+  }
+  return { desktop: { width, height, computerModels: [...models] as string[] } };
 }
 
 function parseValidationProfiles(entry: Fields, at: string): ReadonlyMap<string, string> {

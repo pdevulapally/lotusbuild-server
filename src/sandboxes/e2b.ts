@@ -3,7 +3,7 @@ import { ALL_TRAFFIC, CommandExitError, Sandbox, SandboxNotFoundError, type Comm
 
 import { parseSandboxNetwork, type DesktopSettings, type SandboxNetworkPolicy, type SandboxProvider } from '../entitlements/schema.ts';
 import type { CommandOutcome, DesktopEndpoint, RunningSandbox, SandboxAdapter, SandboxLifecycle } from './provider.ts';
-import { outputLimiter, readBoundedText, readTextWindow } from './bounded-output.ts';
+import { outputLimiter, readBoundedBytes, readBoundedText, readTextWindow } from './bounded-output.ts';
 
 /** The X display the desktop lives on, inside the sandbox. */
 const desktopDisplay = ':0';
@@ -298,6 +298,10 @@ class E2BSandbox implements RunningSandbox {
 
   async readFile(path: string): Promise<string> {
     return readBoundedText(await this.#sandbox.files.read(path, { format: 'stream' }), this.#maxOutputBytes);
+  }
+
+  async readBytes(path: string, maxBytes: number): Promise<Buffer> {
+    return readBoundedBytes(await this.#sandbox.files.read(path, { format: 'stream' }), maxBytes);
   }
 
   previewUrl(port: number): string {
