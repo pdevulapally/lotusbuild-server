@@ -55,6 +55,12 @@ const diagnosticStages = new Set([
 export interface SafeErrorDiagnostic {
   readonly category: string;
   readonly statusCode?: number;
+  /**
+   * A gRPC status (1 to 16), which is how Firestore says what went wrong: 9 is a
+   * missing index, 5 a missing document, 7 a permission failure. A number in that
+   * range cannot carry anything but the status, unlike the message beside it.
+   */
+  readonly grpcCode?: number;
   readonly exitCode?: number;
   readonly primaryCategory?: string;
   readonly secondaryStage?: string;
@@ -115,6 +121,7 @@ export function safeErrorDiagnostic(error: unknown): SafeErrorDiagnostic {
       ...(invalidKeys.size > 0 ? { configurationKeys: [...invalidKeys] } : {}),
       ...(typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599 ? { statusCode: status } : {}),
       ...(typeof exit === 'number' && Number.isInteger(exit) && exit >= -128 && exit <= 255 ? { exitCode: exit } : {}),
+      ...(typeof code === 'number' && Number.isInteger(code) && code >= 1 && code <= 16 ? { grpcCode: code } : {}),
       ...(name === 'RunnerWorkError' && typeof primary === 'string' && primary.length <= 64 && diagnosticCodes.has(primary) ? { primaryCategory: primary } : {}),
       ...(name === 'RunnerWorkError' && typeof secondary === 'string' && secondary.length <= 64 && diagnosticStages.has(secondary) ? { secondaryStage: secondary } : {}),
       ...(count > 0 ? { nestedCount: count, nestedCategories: nested.flatMap((item) => [item.category, ...(item.nestedCategories ?? [])]).slice(0, 16) } : {}),
