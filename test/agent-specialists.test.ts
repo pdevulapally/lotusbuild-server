@@ -2848,3 +2848,26 @@ test('the agent awaits durable steering before dispatching its next model call',
   }] });
   assert.equal(h.run.reply, 'Records preserved.');
 });
+
+test('the primary agent is told to stay grounded, verify its work and report honestly, before the safety rules', async () => {
+  let system = '';
+  await turn({ script: [
+    (invocation) => { system = invocation.system; return say('Done'); },
+  ] });
+  const at = (needle: string) => { const index = system.indexOf(needle); assert.ok(index >= 0, `missing: ${needle}`); return index; };
+  // Platform knowledge from the provider row comes first, then how to work, and the safety rules stay last.
+  assert.ok(at('build the thing') < at('Understand before you change'));
+  assert.ok(at('Understand before you change') < at('Platform security and privacy rules apply'));
+  for (const rule of [
+    'Do not invent anything.',
+    'Never claim that something works, passes or is fixed unless you ran it and saw the result.',
+    'say "not verified" and why',
+    'never weaken, skip or',
+    'check the installed package',
+    'Prefer edit_file on an existing file over rewriting it',
+    'Do not ask questions you can answer by looking at the project yourself.',
+    'state your plan in a few lines',
+  ]) at(rule);
+  // The agent is not told what it is building: that comes from the request and the provider instructions.
+  assert.equal(system.includes('You are building a'), false);
+});
