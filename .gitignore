@@ -1,6 +1,10 @@
 node_modules/
 dist/
 *.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
 
 # Credentials. Never committed, in any form.
 .env

@@ -48,6 +48,9 @@ jobs:
       - name: Test release validation
         run: python3 -m unittest discover -s test -p 'deploy_release_test.py'
 
+      - name: FastAPI contract tests
+        run: pip install --no-cache-dir "./api[dev]" && python3 -m pytest -q api/tests
+
       - name: Verify no secret is committed
         run: |
           set -euo pipefail
