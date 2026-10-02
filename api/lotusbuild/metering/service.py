@@ -295,6 +295,41 @@ class MeteringService:
             raise RuntimeError("Stored byte ledger disagrees.")
         self._write_usage(transaction, ref, meter, state.consumed - bytes_count, state.reserved, period_start)
 
+    async def assert_sandboxes_stopped_in(
+        self,
+        transaction: Any,
+        uid: str,
+        reservation_ids: list[str],
+        required_sandbox_ids: list[str],
+    ) -> None:
+        """Execution may end independently of settlement, but never without durable stop evidence."""
+        registry = (await self._configuration.get()).registry
+        sandbox_meters = {
+            registry.sandbox_time_meter_key,
+            *(provider.concurrency_meter_key for provider in registry.sandbox_providers.values()),
+        }
+        stopped: set[str] = set()
+        for reservation_id in reservation_ids:
+            ref = self._reservation_ref(uid, reservation_id)
+            snapshot = await ref.get(transaction=transaction)
+            if not snapshot.exists:
+                raise RuntimeError("Resource accounting evidence is missing.")
+            fields = document_data(snapshot)
+            enum_field(fields, "status", ref.path, RESERVATION_STATUSES)
+            meter_key = string_field(fields, "meterKey", ref.path)
+            if meter_key not in registry.meters:
+                raise RuntimeError("Resource accounting meter is unknown.")
+            if meter_key not in sandbox_meters and fields.get("sandboxExternalId") is None:
+                continue
+            if fields.get("sandboxNotCreated") is True and fields.get("sandboxExternalId") is None:
+                continue
+            if fields.get("sandboxStopped") is not True:
+                raise RuntimeError("Sandbox execution is not confirmed stopped.")
+            string_field(fields, "sandboxPlatform", ref.path)
+            stopped.add(string_field(fields, "sandboxExternalId", ref.path))
+        if any(sandbox_id not in stopped for sandbox_id in required_sandbox_ids):
+            raise RuntimeError("Attached sandbox termination evidence is missing.")
+
     async def reserve(self, **kwargs: Any) -> Reservation:
         return await run_transaction(self._firestore, lambda transaction: self.reserve_in(transaction, **kwargs))
 

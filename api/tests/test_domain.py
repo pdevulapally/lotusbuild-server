@@ -142,3 +142,51 @@ async def _plans():
     from types import SimpleNamespace
 
     return SimpleNamespace(plans={"pro": SimpleNamespace(key="pro")})
+
+
+async def test_unrecoverable_finish_requires_stopped_sandboxes():
+    from types import SimpleNamespace
+
+    from lotusbuild.metering.service import MeteringService
+
+    reservations = {
+        "users/uid/reservations/time": {
+            "status": "SETTLED",
+            "meterKey": "sandbox.seconds",
+            "sandboxStopped": True,
+            "sandboxPlatform": "e2b",
+            "sandboxExternalId": "sb-1",
+        },
+        "users/uid/reservations/tokens": {
+            "status": "RELEASED",
+            "meterKey": "tokens",
+        },
+    }
+
+    class Reference:
+        def __init__(self, path: str) -> None:
+            self.path = path
+
+        async def get(self, transaction: object = None) -> SimpleNamespace:
+            fields = reservations.get(self.path)
+            return SimpleNamespace(exists=fields is not None, to_dict=lambda: fields)
+
+    class Store:
+        def document(self, path: str) -> Reference:
+            return Reference(path)
+
+    registry = SimpleNamespace(
+        sandbox_time_meter_key="sandbox.seconds",
+        sandbox_providers={"e2b": SimpleNamespace(concurrency_meter_key="sandbox.concurrent")},
+        meters={"sandbox.seconds": object(), "tokens": object()},
+    )
+
+    class Configuration:
+        async def get(self) -> SimpleNamespace:
+            return SimpleNamespace(registry=registry)
+
+    metering = MeteringService(Store(), Configuration())
+    await metering.assert_sandboxes_stopped_in(object(), "uid", ["time", "tokens"], ["sb-1"])
+    reservations["users/uid/reservations/time"]["sandboxStopped"] = False
+    with pytest.raises(RuntimeError, match="not confirmed stopped"):
+        await metering.assert_sandboxes_stopped_in(object(), "uid", ["time"], ["sb-1"])
