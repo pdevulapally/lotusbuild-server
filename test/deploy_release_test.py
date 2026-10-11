@@ -270,7 +270,7 @@ systemctl() {
             result, events, active = self.flow(failure=failure)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(active, 'a')
-            self.assertEqual(events, ['preflight b', 'stop a'])
+            self.assertEqual(events, ['preflight b', 'stop a', 'start a'])
 
     def test_future_active_contract_cannot_be_downgraded(self):
         result, events, active = self.flow(active_protocol=PROTOCOL + 1)
