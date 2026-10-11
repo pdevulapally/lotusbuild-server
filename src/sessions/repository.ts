@@ -27,6 +27,7 @@ import {
   projectSessionGuardUnmigratedError,
 } from '../projects/repository.ts';
 import type { StoredSnapshot, UploadedSnapshot } from '../storage/snapshots.ts';
+import { type AttachmentRepository, type MessageAttachment, parseMessageAttachments } from '../attachments/repository.ts';
 import {
   type Fields,
   booleanField,
@@ -147,6 +148,7 @@ export interface SessionMessage {
   readonly role: MessageRole;
   readonly content: string;
   readonly createdAt: Date;
+  readonly attachments?: readonly MessageAttachment[] | undefined;
 }
 
 export interface QueuedMessage {
@@ -154,6 +156,7 @@ export interface QueuedMessage {
   readonly sessionId: string;
   readonly prompt: string;
   readonly createdAt: Date;
+  readonly attachments?: readonly MessageAttachment[] | undefined;
 }
 
 /**
@@ -202,7 +205,17 @@ function parseMessage(id: string, fields: Fields, where: string): SessionMessage
     role: enumField(fields, 'role', where, messageRoles),
     content: stringField(fields, 'content', where),
     createdAt: timestampField(fields, 'createdAt', where),
+    ...attachmentsField(fields, where),
   };
+}
+
+function attachmentsField(fields: Fields, where: string): { attachments?: readonly MessageAttachment[] } {
+  const attachments = parseMessageAttachments(fields, where);
+  return attachments === undefined ? {} : { attachments };
+}
+
+function attachmentsWrite(attachments: readonly MessageAttachment[] | undefined): Record<string, unknown> {
+  return attachments === undefined || attachments.length === 0 ? {} : { attachments: attachments.map((entry) => ({ ...entry })) };
 }
 
 function parseQueuedMessage(id: string, sessionId: string, fields: Fields, where: string): QueuedMessage {
@@ -211,6 +224,7 @@ function parseQueuedMessage(id: string, sessionId: string, fields: Fields, where
     sessionId,
     prompt: stringField(fields, 'prompt', where),
     createdAt: timestampField(fields, 'createdAt', where),
+    ...attachmentsField(fields, where),
   };
 }
 
@@ -220,6 +234,8 @@ export interface NewSession {
   readonly model: string;
   readonly effort?: AiEffort;
   readonly mode?: SessionMode;
+  /** Ids of READY attachments owned by the caller within the same project. */
+  readonly attachments?: readonly string[];
 }
 
 /** What a runner reports when it stops working on a session. */
@@ -233,6 +249,7 @@ export class SessionRepository {
   readonly #entitlements: EntitlementService;
   readonly #configuration: ConfigurationStore;
   readonly #metering: MeteringService;
+  readonly #attachments: AttachmentRepository | undefined;
   readonly #leaseSeconds: number;
 
   constructor(
@@ -242,6 +259,7 @@ export class SessionRepository {
     configuration: ConfigurationStore,
     metering: MeteringService,
     leaseSeconds: number,
+    attachments?: AttachmentRepository,
   ) {
     if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds <= 0) {
       throw new Error(`The session lease must be a positive number of seconds, got ${leaseSeconds}.`);
@@ -251,6 +269,7 @@ export class SessionRepository {
     this.#entitlements = entitlements;
     this.#configuration = configuration;
     this.#metering = metering;
+    this.#attachments = attachments;
     this.#leaseSeconds = leaseSeconds;
   }
 
@@ -301,6 +320,15 @@ export class SessionRepository {
    * creation: a plan can be downgraded, and a mobile project created on pro must
    * not keep building after the subscription lapses.
    */
+  async #claimAttachments(transaction: Transaction, uid: string, projectId: string,
+    ids: readonly string[] | undefined): Promise<readonly MessageAttachment[] | undefined> {
+    if (ids === undefined || ids.length === 0) return undefined;
+    if (this.#attachments === undefined) {
+      throw new AppError({ code: 'attachment/unavailable', statusCode: 503, message: 'Attachments are not available on this server.' });
+    }
+    return this.#attachments.claimIn(transaction, uid, projectId, ids);
+  }
+
   async create(uid: string, projectId: string, input: NewSession, idempotencyId?: string): Promise<BuildSession> {
     this.#validatePrompt(input.prompt);
     if (idempotencyId !== undefined && !/^[A-Za-z0-9_-]{1,128}$/.test(idempotencyId)) throw new Error('Invalid internal session id.');
@@ -329,6 +357,7 @@ export class SessionRepository {
       }
       const currentProject = await this.#projects.readOwnedInTransaction(transaction, uid, project.id);
       this.#assertProjectCanActivate(currentProject);
+      const attachments = await this.#claimAttachments(transaction, uid, project.id, input.attachments);
 
       await this.#metering.consumeIn(transaction, {
         uid,
@@ -354,6 +383,7 @@ export class SessionRepository {
       transaction.create(firstMessage, {
         role: 'user',
         content: input.prompt,
+        ...attachmentsWrite(attachments),
         createdAt: FieldValue.serverTimestamp(),
       });
       transaction.update(this.#projects.refFor(project.id), {
@@ -457,7 +487,7 @@ export class SessionRepository {
    * silently dropped or race the agent's own message into the transcript, and
    * neither is something the user can see happening.
    */
-  async appendPrompt(uid: string, sessionId: string, prompt: string): Promise<BuildSession> {
+  async appendPrompt(uid: string, sessionId: string, prompt: string, attachmentIds?: readonly string[]): Promise<BuildSession> {
     this.#validatePrompt(prompt);
     const session = await this.readOwned(uid, sessionId);
     const entitlements = await this.#entitlements.forUser(uid);
@@ -499,6 +529,7 @@ export class SessionRepository {
       );
       this.#assertProjectCanActivate(project, current.id);
       assertBuildAllowed(entitlements, project.platform, current.model);
+      const attachments = await this.#claimAttachments(transaction, uid, current.projectId, attachmentIds);
 
       // A follow-up turn is another build, and is charged as one.
       await this.#metering.consumeIn(transaction, {
@@ -513,6 +544,7 @@ export class SessionRepository {
       transaction.create(ref.collection(messagesCollectionName).doc(messageId(seq)), {
         role: 'user',
         content: prompt,
+        ...attachmentsWrite(attachments),
         createdAt: FieldValue.serverTimestamp(),
       });
       transaction.update(ref, {
@@ -535,12 +567,13 @@ export class SessionRepository {
   /**
    * Staging a prompt in the session queue while a turn is active.
    */
-  async enqueueMessage(uid: string, sessionId: string, prompt: string): Promise<QueuedMessage> {
+  async enqueueMessage(uid: string, sessionId: string, prompt: string, attachmentIds?: readonly string[]): Promise<QueuedMessage> {
     this.#validatePrompt(prompt);
     const entitlements = await this.#entitlements.forUser(uid);
     const limit = await this.#queueLimit(entitlements);
     const parent = this.#ref(sessionId);
     const ref = parent.collection(queuedMessagesCollectionName).doc();
+    let attachments: readonly MessageAttachment[] | undefined;
     await this.#firestore.runTransaction(async (transaction) => {
       const snapshot = await transaction.get(parent);
       if (!snapshot.exists || snapshot.data()?.['ownerUid'] !== uid) {
@@ -558,11 +591,12 @@ export class SessionRepository {
       if (queued.size >= limit) {
         throw new AppError({ code: 'session/queue-full', statusCode: 429, message: 'The session message queue is full.' });
       }
-      transaction.create(ref, { prompt, createdAt: FieldValue.serverTimestamp() });
+      attachments = await this.#claimAttachments(transaction, uid, session.projectId, attachmentIds);
+      transaction.create(ref, { prompt, ...attachmentsWrite(attachments), createdAt: FieldValue.serverTimestamp() });
       // Enqueue and deletion/dequeue share this parent conflict boundary.
       transaction.update(parent, { updatedAt: FieldValue.serverTimestamp() });
     });
-    return { id: ref.id, sessionId, prompt, createdAt: new Date() };
+    return { id: ref.id, sessionId, prompt, createdAt: new Date(), ...(attachments === undefined ? {} : { attachments }) };
   }
 
   // There is no reason to stage more builds than the plan permits in a whole
@@ -643,6 +677,7 @@ export class SessionRepository {
       transaction.create(ref.collection(messagesCollectionName).doc(messageId(seq)), {
         role: 'user',
         content: nextData.prompt,
+        ...attachmentsWrite(nextData.attachments),
         createdAt: FieldValue.serverTimestamp(),
       });
       transaction.delete(nextDoc.ref);

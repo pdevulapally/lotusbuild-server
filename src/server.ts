@@ -6,6 +6,8 @@ import type { Auth } from 'firebase-admin/auth';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 
 import { authenticatedUser, registerAuth } from './auth/plugin.ts';
+import type { AttachmentRepository } from './attachments/repository.ts';
+import { attachmentLimits, registerAttachmentRoutes } from './attachments/routes.ts';
 import type { BillingRepository } from './billing/repository.ts';
 import { registerBillingRoutes } from './billing/routes.ts';
 import type { Config } from './config/index.ts';
@@ -45,6 +47,7 @@ export interface Dependencies {
   readonly users: UserRepository;
   readonly projects: ProjectRepository;
   readonly sessions: SessionRepository;
+  readonly attachments: AttachmentRepository;
   readonly sessionEvents: SessionEvents;
   readonly configuration: ConfigurationStore;
   readonly stripe: Stripe;
@@ -173,6 +176,7 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
         plan: { key: resolved.planKey, name: resolved.planName },
         subscriptionStatus: resolved.subscriptionStatus,
         capabilities: resolved.capabilities.entries(),
+        attachments: attachmentLimits,
         limits: [...resolved.meterLimits.values()].map((limit) => ({
           meterKey: limit.meterKey,
           includedAllowance: limit.includedAllowance,
@@ -232,6 +236,7 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
       ),
     });
     registerProjectRoutes(api, projects);
+    registerAttachmentRoutes(api, dependencies.attachments);
     registerPrivacyRoutes(api, dependencies.privacyRequests);
     registerFamilyRoutes(api, dependencies.family, projects, sessions);
     registerSessionRoutes(api, sessions, sessionEvents, {

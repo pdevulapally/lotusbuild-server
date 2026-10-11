@@ -19,6 +19,8 @@ import type { MeteringService } from '../metering/service.ts';
 import type { Project } from '../projects/repository.ts';
 import type { RunningSandbox } from '../sandboxes/provider.ts';
 import type { BuildSession, SessionMessage } from '../sessions/repository.ts';
+import type { MessageAttachment } from '../attachments/repository.ts';
+import { attachmentImageTypes } from '../storage/attachments.ts';
 import {
   type Computer,
   type ComputerResult,
@@ -357,10 +359,48 @@ export function systemPrompt(
   ].join('\n');
 }
 
+/** Reads one attachment's bytes, exactly as inspected when it was accepted. */
+export type AttachmentReader = (attachment: MessageAttachment) => Promise<Buffer>;
+
+/** Text attachments are bounded before they enter the context window. */
+const attachmentTextMaxChars = 200_000;
+
+/**
+ * A user message with files becomes content blocks: the prompt first, then
+ * each file as the kind the model can read. Nothing is summarised or invented
+ * — a file that cannot be read fails the turn rather than quietly vanishing.
+ */
+export async function userContentWithAttachments(content: string, attachments: readonly MessageAttachment[],
+  read: AttachmentReader): Promise<string | ContentBlockParam[]> {
+  if (attachments.length === 0) return content;
+  const blocks: ContentBlockParam[] = [{ type: 'text', text: content }];
+  for (const attachment of attachments) {
+    const bytes = await read(attachment);
+    const label = `Attached file "${attachment.name}" (${attachment.contentType}, ${attachment.bytes} bytes)`;
+    if ((attachmentImageTypes as readonly string[]).includes(attachment.contentType)) {
+      blocks.push({ type: 'text', text: label });
+      blocks.push({ type: 'image', source: { type: 'base64', media_type: attachment.contentType as (typeof attachmentImageTypes)[number],
+        data: bytes.toString('base64') } });
+    } else if (attachment.contentType === 'application/pdf') {
+      blocks.push({ type: 'text', text: label });
+      blocks.push({ type: 'document', title: attachment.name, source: { type: 'base64', media_type: 'application/pdf', data: bytes.toString('base64') } });
+    } else {
+      const text = bytes.toString('utf8');
+      const truncated = text.length > attachmentTextMaxChars;
+      blocks.push({ type: 'text', text: `${label}${truncated ? `, first ${attachmentTextMaxChars} characters shown` : ''}:\n\n${text.slice(0, attachmentTextMaxChars)}` });
+    }
+  }
+  return blocks;
+}
+
 /** Firestore's transcript, as the model's conversation. */
-function conversationFrom(messages: readonly SessionMessage[], project: Project): MessageParam[] {
-  return [{ role: 'user', content: projectContext(project) },
-    ...messages.map((message) => ({ role: message.role, content: message.content }))];
+async function conversationFrom(messages: readonly SessionMessage[], project: Project, read: AttachmentReader): Promise<MessageParam[]> {
+  const turns: MessageParam[] = [{ role: 'user', content: projectContext(project) }];
+  for (const message of messages) {
+    turns.push({ role: message.role, content: message.role === 'user' && message.attachments !== undefined
+      ? await userContentWithAttachments(message.content, message.attachments, read) : message.content });
+  }
+  return turns;
 }
 
 function requireText(input: Record<string, unknown>, name: string, where: string): string {
@@ -1179,6 +1219,7 @@ export async function runAgentTurn(input: {
   readonly provider: SandboxProvider;
   readonly sandbox: RunningSandbox;
   readonly messages: readonly SessionMessage[];
+  readonly readAttachment: AttachmentReader;
   readonly entitlements: UserEntitlements;
   readonly registry: Registry;
   readonly metering: MeteringService;
@@ -1392,7 +1433,7 @@ export async function runAgentTurn(input: {
     model: input.session.model,
     effort: input.session.effort,
     system: systemPrompt(input.provider, screenAccess, input.session.mode),
-    conversation: conversationFrom(input.messages, input.project),
+    conversation: await conversationFrom(input.messages, input.project, input.readAttachment),
     tools,
     computer,
     toolContext,

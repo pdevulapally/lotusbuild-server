@@ -12,6 +12,8 @@ import { ProjectRepository } from './projects/repository.ts';
 import { SessionEvents } from './sessions/events.ts';
 import { SessionRepository } from './sessions/repository.ts';
 import { UserRepository } from './users/repository.ts';
+import { AttachmentRepository } from './attachments/repository.ts';
+import { AttachmentStore } from './storage/attachments.ts';
 import { SnapshotStore } from './storage/snapshots.ts';
 import { buildServer } from './server.ts';
 import { PrivacyRequests } from './privacy/requests.ts';
@@ -74,6 +76,15 @@ async function main(): Promise<void> {
     snapshots,
     async (id) => { await redis.del(`${redisKeyPrefixes.sessionEvents}${id}`); },
   );
+  const attachments = new AttachmentRepository(
+    firebase.firestore,
+    projects,
+    entitlements,
+    metering,
+    configuration,
+    new AttachmentStore(firebase.app, config.FIREBASE_STORAGE_BUCKET),
+    config.SNAPSHOT_URL_TTL_SECONDS,
+  );
 
 
   // A connection in subscribe mode cannot run ordinary commands, so the event
@@ -110,7 +121,9 @@ async function main(): Promise<void> {
       configuration,
       metering,
       config.SESSION_LEASE_SECONDS,
+      attachments,
     ),
+    attachments,
     sessionEvents: new SessionEvents(redis, subscriber, {
       maxEventBytes: config.SESSION_EVENT_MAX_BYTES,
       retentionSeconds: config.SESSION_EVENT_RETENTION_SECONDS,

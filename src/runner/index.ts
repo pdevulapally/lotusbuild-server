@@ -19,6 +19,7 @@ import type { SandboxAdapter } from '../sandboxes/provider.ts';
 import { SandboxService } from '../sandboxes/service.ts';
 import { SessionEvents } from '../sessions/events.ts';
 import { SessionRepository } from '../sessions/repository.ts';
+import { AttachmentStore } from '../storage/attachments.ts';
 import { SnapshotStore } from '../storage/snapshots.ts';
 import { SnapshotMaintenance } from '../storage/maintenance.ts';
 import { UserRepository } from '../users/repository.ts';
@@ -110,6 +111,7 @@ async function main(): Promise<void> {
     configuration,
     metering,
     sandboxes: new SandboxService(configuration, metering, adapters),
+    attachments: new AttachmentStore(firebase.app, config.FIREBASE_STORAGE_BUCKET),
     persistence: new ProjectPersistence(
       sessions,
       snapshots,
