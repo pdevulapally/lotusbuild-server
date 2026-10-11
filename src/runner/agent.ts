@@ -5,6 +5,7 @@ import type {
   Message,
   MessageParam,
   MessageStreamEvent,
+  OutputConfig,
   Tool,
   ToolUnion,
   ToolUseBlock,
@@ -12,6 +13,7 @@ import type {
 
 import type { Registry, SandboxProvider, SpecialistDefinition } from '../entitlements/schema.ts';
 import type { UserEntitlements } from '../entitlements/service.ts';
+import type { AiEffort } from '../entitlements/build-admission.ts';
 import { AppError } from '../http/errors.ts';
 import type { MeteringService } from '../metering/service.ts';
 import type { Project } from '../projects/repository.ts';
@@ -329,7 +331,17 @@ export function screenInstructions(
   ];
 }
 
-export function systemPrompt(provider: SandboxProvider, access?: ScreenAccess): string {
+const planModeInstructions = [
+  'This session is in plan mode. Inspect the project and produce an implementation plan only.',
+  'Do not modify files, run commands, operate the desktop, start previews, or claim changes were made.',
+  'Ground the plan in files you actually read, identify checks to run later, and call out unresolved decisions.',
+].join('\n');
+
+export function systemPrompt(
+  provider: SandboxProvider,
+  access?: ScreenAccess,
+  mode: BuildSession['mode'] = 'build',
+): string {
   return [
     'You are LotusBuild\'s software engineering agent, working on a user\'s project in a sandbox.',
     `The sandbox is at ${provider.workdir}, which is the project directory and the working directory`,
@@ -338,6 +350,7 @@ export function systemPrompt(provider: SandboxProvider, access?: ScreenAccess): 
     provider.agentInstructions,
     '',
     ...screenInstructions(access, provider.desktop),
+    ...(mode === 'plan' ? [planModeInstructions, ''] : []),
     agentWorkingInstructions,
     '',
     agentSafetyInstructions,
@@ -517,6 +530,7 @@ interface ModelLoopInput {
   readonly outputReservationId?: string;
   readonly anthropic: Anthropic;
   readonly model: string;
+  readonly effort: AiEffort;
   readonly system: string;
   /** Mutated as the loop runs, so a caller may inspect what was said. */
   readonly conversation: MessageParam[];
@@ -581,6 +595,8 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
     ...(input.computer === undefined ? [] : [input.computer.toolset]),
   ];
   const spoken: string[] = [];
+  const providerEffort: NonNullable<OutputConfig['effort']> =
+    input.effort === 'standard' ? 'medium' : input.effort;
 
   for (let step = 1; step <= input.maxSteps; step += 1) {
     input.assertStillOurs();
@@ -599,7 +615,13 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
     // Before admission, so what is counted and reserved is what is sent.
     if (input.computer !== undefined) pruneScreenshots(input.conversation, screenshotLimits);
     const admitted = await input.admission.begin({
-      params: { model: input.model, system: input.system, tools: [...specs], messages: input.conversation },
+      params: {
+        model: input.model,
+        system: input.system,
+        tools: [...specs],
+        messages: input.conversation,
+        output_config: { effort: providerEffort },
+      },
       maxOutputTokens: input.maxOutputTokens, signal: input.signal,
       ...(input.outputReservationId === undefined ? {} : { outputReservationId: input.outputReservationId }),
     });
@@ -623,6 +645,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
         system: input.system,
         tools: [...specs],
         messages: input.conversation,
+        output_config: { effort: providerEffort },
       };
       // Only the generation SDK invocation crosses this boundary, not admission,
       // parameter preparation or the marker. A synchronous SDK throw is uncertain.
@@ -990,6 +1013,7 @@ async function consultSpecialist(
       outputReservationId: reservation.id,
       anthropic: call.anthropic,
       model: call.session.model,
+      effort: call.session.effort,
       system: specialistSystemPrompt(call.specialist, call.project, call.provider),
       conversation,
       tools,
@@ -1203,15 +1227,18 @@ export async function runAgentTurn(input: {
   const screenAccess: ScreenAccess | undefined =
     desktop === undefined ? undefined
       : !input.desktopReady ? 'unavailable'
-        : desktop.computerModels?.includes(input.session.model) === true && input.sandbox.readBytes !== undefined
+        : input.session.mode === 'build'
+          && desktop.computerModels?.includes(input.session.model) === true
+          && input.sandbox.readBytes !== undefined
           ? 'operate' : 'watch';
   const computer = screenAccess === 'operate' && desktop !== undefined ? createComputer(input.sandbox, desktop) : undefined;
 
   const ledger = new BlockerLedger();
-  const available = [...input.registry.specialists.values()];
+  const available = [...input.registry.specialists.values()]
+    .filter((specialist) => input.session.mode === 'build' || !specialist.validation);
   let consultations = 0;
 
-  const tools = new Map(workspaceTools);
+  const tools = new Map(input.session.mode === 'plan' ? readOnlyTools : workspaceTools);
   if (available.length > 0) {
     tools.set('consult_specialist', {
       // Safe to run concurrently with itself: every consultation reads through
@@ -1363,7 +1390,8 @@ export async function runAgentTurn(input: {
     admission: input.admission,
     anthropic: input.anthropic,
     model: input.session.model,
-    system: systemPrompt(input.provider, screenAccess),
+    effort: input.session.effort,
+    system: systemPrompt(input.provider, screenAccess, input.session.mode),
     conversation: conversationFrom(input.messages, input.project),
     tools,
     computer,

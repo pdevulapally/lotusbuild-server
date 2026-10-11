@@ -9,7 +9,12 @@ import {
 } from 'firebase-admin/firestore';
 
 import type { EntitlementService, UserEntitlements } from '../entitlements/service.ts';
-import { assertBuildAllowed } from '../entitlements/build-admission.ts';
+import {
+  aiEfforts,
+  assertBuildAllowed,
+  resolveAiEffort,
+  type AiEffort,
+} from '../entitlements/build-admission.ts';
 import type { ConfigurationStore } from '../entitlements/store.ts';
 import { AppError } from '../http/errors.ts';
 import type { MeteringService, Reservation } from '../metering/service.ts';
@@ -37,6 +42,8 @@ import {
 export const sessionsCollectionPath = 'sessions';
 export const messagesCollectionName = 'messages';
 export const queuedMessagesCollectionName = 'queued_messages';
+export const sessionModes = ['build', 'plan'] as const;
+export type SessionMode = (typeof sessionModes)[number];
 
 /**
  * Recovered from the previous schema. IDLE is not "finished": a session that has
@@ -89,7 +96,8 @@ export interface BuildSession {
   readonly ownerUid: string;
   readonly status: BuildSessionStatus;
   readonly model: string;
-  readonly effort: string;
+  readonly effort: AiEffort;
+  readonly mode: SessionMode;
   readonly sandboxId: string | undefined;
   readonly claimedBy: string | undefined;
   readonly leaseToken: string | undefined;
@@ -170,7 +178,8 @@ function parseSession(id: string, fields: Fields, where: string): BuildSession {
     ownerUid: stringField(fields, 'ownerUid', where),
     status: enumField(fields, 'status', where, buildSessionStatuses),
     model: stringField(fields, 'model', where),
-    effort: stringField(fields, 'effort', where),
+    effort: enumField(fields, 'effort', where, aiEfforts),
+    mode: fields['mode'] === undefined ? 'build' : enumField(fields, 'mode', where, sessionModes),
     sandboxId: optionalStringField(fields, 'sandboxId'),
     claimedBy: optionalStringField(fields, 'claimedBy'),
     leaseToken: optionalStringField(fields, 'leaseToken'),
@@ -209,6 +218,8 @@ function parseQueuedMessage(id: string, sessionId: string, fields: Fields, where
 export interface NewSession {
   readonly prompt: string;
   readonly model: string;
+  readonly effort?: AiEffort;
+  readonly mode?: SessionMode;
 }
 
 /** What a runner reports when it stops working on a session. */
@@ -298,9 +309,8 @@ export class SessionRepository {
 
     assertBuildAllowed(entitlements, project.platform, input.model);
 
-    // Effort comes from the plan, never the request: it is what the customer is
-    // paying for, so it is not theirs to raise.
-    const effort = entitlements.capabilities.string('ai.effort');
+    const effort = resolveAiEffort(entitlements, input.effort);
+    const mode = input.mode ?? 'build';
     const { registry } = await this.#configuration.get();
 
     const now = new Date();
@@ -334,6 +344,7 @@ export class SessionRepository {
         status: 'QUEUED',
         model: input.model,
         effort,
+        mode,
         messageCount: 1,
         // The single field a runner queries on. See `claim`.
         claimableAt: Timestamp.fromDate(now),
@@ -360,6 +371,7 @@ export class SessionRepository {
       status: 'QUEUED',
       model: input.model,
       effort,
+      mode,
       sandboxId: undefined,
       claimedBy: undefined,
       leaseToken: undefined,
