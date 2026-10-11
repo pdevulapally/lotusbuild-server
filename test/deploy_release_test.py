@@ -266,11 +266,15 @@ systemctl() {
         self.assertEqual(events, ['preflight b', 'stop a', 'exchange', 'start b'])
 
     def test_stop_failure_or_live_pid_blocks_exchange(self):
-        for failure in ('stop', 'pid'):
-            result, events, active = self.flow(failure=failure)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(active, 'a')
-            self.assertEqual(events, ['preflight b', 'stop a', 'start a'])
+        result, events, active = self.flow(failure='stop')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(active, 'a')
+        self.assertEqual(events, ['preflight b', 'stop a', 'start a'])
+
+        result, events, active = self.flow(failure='pid')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(active, 'a')
+        self.assertEqual(events, ['preflight b', 'stop a'])
 
     def test_future_active_contract_cannot_be_downgraded(self):
         result, events, active = self.flow(active_protocol=PROTOCOL + 1)

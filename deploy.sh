@@ -48,6 +48,21 @@ stop_services() {
     [[ "$(systemctl show --property=MainPID --value "$unit")" == 0 ]] || return 1
   done
 }
+restart_active_services_if_safe() {
+  local safe_units=()
+  local unit pid
+  for unit in lotusbuild-api lotusbuild-runner; do
+    pid="$(systemctl show --property=MainPID --value "$unit")"
+    if [[ "$pid" == 0 ]]; then
+      safe_units+=("$unit")
+    else
+      echo "Recovery left $unit alone because process $pid is still running." >&2
+    fi
+  done
+  if [[ "${#safe_units[@]}" -gt 0 ]]; then
+    sudo -n systemctl start "${safe_units[@]}"
+  fi
+}
 rollback() {
   code=$?
   trap - EXIT
@@ -69,7 +84,7 @@ rollback() {
       # stop_services can partially succeed: one unit may be down even though
       # systemctl returned failure for the other. The active directory has not
       # changed, so always bring the known-good release back before exiting.
-      sudo -n systemctl start lotusbuild-api lotusbuild-runner
+      restart_active_services_if_safe
       echo 'Deployment stopped before promotion; active release restarted.' >&2
     fi
   fi

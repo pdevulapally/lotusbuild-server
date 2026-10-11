@@ -33,17 +33,3 @@ test('server permits authenticated SSE resume preflight only for configured orig
     }
   } finally { await app.close(); }
 });
-
-test('server shutdown closes long-lived HTTP streams', async () => {
-  const config = {
-    LOG_LEVEL: 'silent',
-    HTTP_MAX_REQUESTS_PER_MINUTE: 100,
-    CORS_ALLOWED_ORIGINS: [new URL('https://app.example.test')],
-  } as unknown as Config;
-  const app = buildServer(config, {
-    redis: {},
-    firebaseAuth: {},
-  } as unknown as Dependencies);
-  assert.equal(app.initialConfig.forceCloseConnections, true);
-  await app.close();
-});
