@@ -86,6 +86,11 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     // Reject oversized bodies at the parser rather than buffering them; this
     // process shares a box with build sandboxes and cannot afford the memory.
     bodyLimit: 1_048_576,
+    // SSE requests are intentionally long-lived. Waiting for every active
+    // response during app.close() would make a deploy wait until systemd kills
+    // the process, so close their sockets after the shutdown hooks have told
+    // WebSocket viewers why the server is going away.
+    forceCloseConnections: true,
   });
 
   registerErrorHandler(app);

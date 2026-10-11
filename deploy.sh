@@ -51,19 +51,27 @@ stop_services() {
 rollback() {
   code=$?
   trap - EXIT
-  if [[ "$code" != 0 && "$switched" == 1 ]]; then
-    if ! python3 "$active/deploy/exchange-directories.py" --check --rollback "$active" "$candidate"; then
-      echo 'rollback/recovery-protocol-incompatible: rollback refused; compatible release retained at the active path.' >&2
-      exit "$code"
+  if [[ "$code" != 0 ]]; then
+    if [[ "$switched" == 1 ]]; then
+      if ! python3 "$active/deploy/exchange-directories.py" --check --rollback "$active" "$candidate"; then
+        echo 'rollback/recovery-protocol-incompatible: rollback refused; compatible release retained at the active path.' >&2
+        exit "$code"
+      fi
+      # Stop all writers before validating and exchanging back. No legacy worker
+      # may overlap a newly started writer, even during automatic failure recovery.
+      stop_services
+      (cd "$candidate" && node --env-file=.env dist/preflight.js)
+      python3 "$active/deploy/exchange-directories.py" --rollback "$active" "$candidate"
+      cd "$active"
+      sudo -n systemctl start lotusbuild-api lotusbuild-runner
+      echo 'Candidate failed; previous directory restored. Verify both units and health.' >&2
+    else
+      # stop_services can partially succeed: one unit may be down even though
+      # systemctl returned failure for the other. The active directory has not
+      # changed, so always bring the known-good release back before exiting.
+      sudo -n systemctl start lotusbuild-api lotusbuild-runner
+      echo 'Deployment stopped before promotion; active release restarted.' >&2
     fi
-    # Stop all writers before validating and exchanging back. No legacy worker
-    # may overlap a newly started writer, even during automatic failure recovery.
-    stop_services
-    (cd "$candidate" && node --env-file=.env dist/preflight.js)
-    python3 "$active/deploy/exchange-directories.py" --rollback "$active" "$candidate"
-    cd "$active"
-    sudo -n systemctl start lotusbuild-api lotusbuild-runner
-    echo 'Candidate failed; previous directory restored. Verify both units and health.' >&2
   fi
   exit "$code"
 }
