@@ -442,8 +442,10 @@ export function registerSessionRoutes(
   let openStreams = 0;
   const streamsByUser = new Map<string, number>();
   const activeStreams = new Set<(reason?: StreamClosingReason) => void>();
+  let closing = false;
 
   app.addHook('preClose', async () => {
+    closing = true;
     for (const finish of [...activeStreams]) finish('server-shutdown');
   });
 
@@ -474,6 +476,12 @@ export function registerSessionRoutes(
       const user = authenticatedUser(request);
       const session = await sessions.readOwned(user.uid, request.params.sessionId);
 
+      // A request whose authorization finished after the shutdown sweep must not
+      // become a stream app.close() then waits on; tell the client to reconnect.
+      if (closing) {
+        throw new AppError({ code: 'stream/server-shutdown', statusCode: 503,
+          message: 'This server is restarting. Reconnect shortly.' });
+      }
       if ((streamsByUser.get(user.uid) ?? 0) >= options.maxConnectionsPerUser) {
         throw new AppError({ code: 'stream/account-capacity-reached', statusCode: 429,
           message: 'Close an existing event stream before opening another.' });
@@ -587,6 +595,7 @@ export function registerSessionRoutes(
         finally { closeSocket(reason); }
       };
       activeStreams.add(finish);
+      if (closing) { finish('server-shutdown'); return; }
 
       request.raw.on('close', () => finish());
       request.raw.on('error', () => finish());

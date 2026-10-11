@@ -49,19 +49,18 @@ stop_services() {
   done
 }
 restart_active_services_if_safe() {
-  local safe_units=()
+  # The sudoers grant only permits starting the pair together, and a unit whose
+  # previous process is still exiting must not gain a second writer. Refuse the
+  # whole restart in that case rather than racing the old process.
   local unit pid
   for unit in lotusbuild-api lotusbuild-runner; do
     pid="$(systemctl show --property=MainPID --value "$unit")"
-    if [[ "$pid" == 0 ]]; then
-      safe_units+=("$unit")
-    else
-      echo "Recovery left $unit alone because process $pid is still running." >&2
+    if [[ "$pid" != 0 ]]; then
+      echo "Recovery refused: $unit process $pid is still running; start both units once it has exited." >&2
+      return 0
     fi
   done
-  if [[ "${#safe_units[@]}" -gt 0 ]]; then
-    sudo -n systemctl start "${safe_units[@]}"
-  fi
+  sudo -n systemctl start lotusbuild-api lotusbuild-runner
 }
 rollback() {
   code=$?
