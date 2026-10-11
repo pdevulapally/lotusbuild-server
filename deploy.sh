@@ -50,17 +50,26 @@ stop_services() {
 }
 restart_active_services_if_safe() {
   # The sudoers grant only permits starting the pair together, and a unit whose
-  # previous process is still exiting must not gain a second writer. Refuse the
-  # whole restart in that case rather than racing the old process.
-  local unit pid
-  for unit in lotusbuild-api lotusbuild-runner; do
-    pid="$(systemctl show --property=MainPID --value "$unit")"
-    if [[ "$pid" != 0 ]]; then
-      echo "Recovery refused: $unit process $pid is still running; start both units once it has exited." >&2
+  # previous process is still exiting must not gain a second writer. Wait for
+  # any lingering process to leave, then start both; never start one alone.
+  local unit pid waited=0 live
+  while :; do
+    live=''
+    for unit in lotusbuild-api lotusbuild-runner; do
+      pid="$(systemctl show --property=MainPID --value "$unit")"
+      [[ "$pid" == 0 ]] || live="$unit process $pid"
+    done
+    if [[ -z "$live" ]]; then
+      sudo -n systemctl start lotusbuild-api lotusbuild-runner
+      echo 'Deployment stopped before promotion; active release restarted.' >&2
       return 0
     fi
+    if (( waited >= 60 )); then
+      echo "Recovery could not restart the active release: $live is still running. Run 'sudo systemctl start lotusbuild-api lotusbuild-runner' once it exits." >&2
+      return 0
+    fi
+    sleep 2; waited=$((waited + 2))
   done
-  sudo -n systemctl start lotusbuild-api lotusbuild-runner
 }
 rollback() {
   code=$?
@@ -84,7 +93,6 @@ rollback() {
       # systemctl returned failure for the other. The active directory has not
       # changed, so always bring the known-good release back before exiting.
       restart_active_services_if_safe
-      echo 'Deployment stopped before promotion; active release restarted.' >&2
     fi
   fi
   exit "$code"
