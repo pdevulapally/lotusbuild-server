@@ -3,6 +3,7 @@ import type { OutgoingHttpHeaders } from 'node:http';
 import type { FastifyBaseLogger, FastifyInstance, FastifyReply } from 'fastify';
 
 import { authenticatedUser, bearerToken } from '../auth/plugin.ts';
+import { aiEfforts, type AiEffort } from '../entitlements/build-admission.ts';
 import { AppError, safeErrorDiagnostic } from '../http/errors.ts';
 import {
   type SessionEvent,
@@ -16,6 +17,7 @@ import {
   type SessionMessage,
   type SessionRepository,
   promptMaxLength,
+  sessionModes,
 } from './repository.ts';
 
 
@@ -57,6 +59,7 @@ function toResponse(session: BuildSession) {
     status: session.status,
     model: session.model,
     effort: session.effort,
+    mode: session.mode,
     sandboxId: session.sandboxId,
     error: session.error,
     messageCount: session.messageCount,
@@ -141,7 +144,12 @@ export function registerSessionRoutes(
     });
   };
 
-  app.post<{ Params: { projectId: string }; Body: { prompt: string; model: string } }>(
+  app.post<{ Params: { projectId: string }; Body: {
+    prompt: string;
+    model: string;
+    effort?: AiEffort;
+    mode?: (typeof sessionModes)[number];
+  } }>(
     '/projects/:projectId/sessions',
     {
       preHandler: [app.requireAuth, app.requireVerifiedEmail, app.enforceRateLimit('build')],
@@ -164,6 +172,8 @@ export function registerSessionRoutes(
               pattern: promptText,
             },
             model: { type: 'string', pattern: modelIdentifier },
+            effort: { type: 'string', enum: [...aiEfforts] },
+            mode: { type: 'string', enum: [...sessionModes] },
           },
         },
       },
@@ -173,11 +183,14 @@ export function registerSessionRoutes(
       const session = await sessions.create(user.uid, request.params.projectId, {
         prompt: request.body.prompt.trim(),
         model: request.body.model,
+        ...(request.body.effort === undefined ? {} : { effort: request.body.effort }),
+        ...(request.body.mode === undefined ? {} : { mode: request.body.mode }),
       });
       publish(request.log, session.id, 'session.queued', {
         status: session.status,
         model: session.model,
         effort: session.effort,
+        mode: session.mode,
       });
       return reply.code(201).send(toResponse(session));
     },

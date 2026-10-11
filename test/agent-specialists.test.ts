@@ -119,6 +119,7 @@ const session: BuildSession = {
   status: 'RUNNING',
   model: 'model-1',
   effort: 'standard',
+  mode: 'build',
   sandboxId: 'sandbox-1',
   claimedBy: 'runner-a',
   leaseToken: 'lease-a',
@@ -145,6 +146,7 @@ const limits: AgentLimits = {
 interface ModelCall {
   readonly system: string;
   readonly toolNames: readonly string[];
+  readonly outputConfig: { readonly effort?: string | null } | undefined;
   /** What was sent, untouched: a toolset entry has no name, so `toolNames` cannot show it. */
   readonly tools: readonly Record<string, unknown>[];
   readonly messages: readonly MessageParam[];
@@ -233,12 +235,18 @@ class ScriptedAnthropic {
   get messages() {
     return {
       stream: (
-        params: { system: string; tools: readonly { name: string }[]; messages: MessageParam[] },
+        params: {
+          system: string;
+          tools: readonly { name: string }[];
+          messages: MessageParam[];
+          output_config?: { effort?: string | null };
+        },
         options?: { signal?: AbortSignal },
       ) => {
         const recorded: ModelCall = {
           system: params.system,
           toolNames: params.tools.map((tool) => tool.name),
+          outputConfig: params.output_config,
           tools: params.tools as readonly Record<string, unknown>[],
           messages: [...params.messages],
         };
@@ -452,6 +460,7 @@ async function turn(options: {
   readonly drainSteer?: () => Promise<string | undefined>;
   readonly provider?: SandboxProvider;
   readonly desktopReady?: boolean;
+  readonly session?: BuildSession;
 }) {
   const { client, scripted } = anthropicOf(options.script);
   const sandbox = options.sandbox ?? new FakeSandbox();
@@ -471,7 +480,7 @@ async function turn(options: {
       }
     } }) },
     anthropic: client,
-    session,
+    session: options.session ?? session,
     project: options.project ?? project,
     provider: options.provider ?? provider,
     sandbox,
@@ -2931,6 +2940,38 @@ test('an agent with a desktop is offered the computer toolset, told about its sc
   assert.equal(answer.is_error, false);
   assert.deepEqual(answer.content, [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: screenPng().toString('base64') } }]);
   assert.ok(sandbox.commands.some((command) => command.includes('scrot')));
+});
+
+test('plan mode is enforced with read-only tools and no computer control', async () => {
+  const { scripted } = await turn({
+    provider: desktopProvider,
+    desktopReady: true,
+    sandbox: new ScreenSandbox(),
+    session: { ...session, mode: 'plan' },
+    script: [() => say('Plan ready.')],
+  });
+
+  const invocation = scripted.calls[0]!;
+  assert.deepEqual([...invocation.toolNames].sort(), [
+    'consult_specialist',
+    'list_files',
+    'read_file',
+    'search_files',
+  ]);
+  assert.equal(hasComputer(invocation.tools), false);
+  assert.match(invocation.system, /This session is in plan mode/);
+  assert.match(invocation.system, /Do not modify files, run commands, operate the desktop, start previews/);
+});
+
+test('session effort is sent to the provider and standard maps to medium', async () => {
+  const standard = await turn({ script: [() => say('Done')] });
+  assert.deepEqual(standard.scripted.calls[0]?.outputConfig, { effort: 'medium' });
+
+  const low = await turn({
+    session: { ...session, effort: 'low' },
+    script: [() => say('Done')],
+  });
+  assert.deepEqual(low.scripted.calls[0]?.outputConfig, { effort: 'low' });
 });
 
 test('the computer toolset is withheld unless the desktop is up, the model is listed for it, and the sandbox can return an image', async () => {

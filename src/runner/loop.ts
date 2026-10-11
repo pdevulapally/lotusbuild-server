@@ -377,7 +377,12 @@ export class SessionRunner {
         return;
       }
 
-      await publish('session.running', { runnerId, model: session.model, effort: session.effort });
+      await publish('session.running', {
+        runnerId,
+        model: session.model,
+        effort: session.effort,
+        mode: session.mode,
+      });
 
       signal.throwIfAborted();
       acquired = await sandboxes.acquire({
