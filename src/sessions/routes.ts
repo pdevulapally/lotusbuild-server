@@ -3,6 +3,8 @@ import type { OutgoingHttpHeaders } from 'node:http';
 import type { FastifyBaseLogger, FastifyInstance, FastifyReply } from 'fastify';
 
 import { authenticatedUser, bearerToken } from '../auth/plugin.ts';
+import type { MessageAttachment } from '../attachments/repository.ts';
+import { attachmentsPerMessageMax } from '../storage/attachments.ts';
 import { aiEfforts, type AiEffort } from '../entitlements/build-admission.ts';
 import { AppError, safeErrorDiagnostic } from '../http/errors.ts';
 import {
@@ -74,8 +76,21 @@ function toMessageResponse(message: SessionMessage) {
     role: message.role,
     content: message.content,
     createdAt: message.createdAt.toISOString(),
+    ...(message.attachments === undefined ? {} : { attachments: message.attachments.map(toAttachmentResponse) }),
   };
 }
+
+/** Storage coordinates stay server-side; clients only learn what was attached. */
+function toAttachmentResponse(attachment: MessageAttachment) {
+  return { id: attachment.id, name: attachment.name, contentType: attachment.contentType, bytes: attachment.bytes };
+}
+
+const attachmentIds = {
+  type: 'array',
+  maxItems: attachmentsPerMessageMax,
+  uniqueItems: true,
+  items: { type: 'string', pattern: documentId },
+} as const;
 
 function toQueuedMessageResponse(msg: QueuedMessage) {
   return {
@@ -149,6 +164,7 @@ export function registerSessionRoutes(
     model: string;
     effort?: AiEffort;
     mode?: (typeof sessionModes)[number];
+    attachments?: string[];
   } }>(
     '/projects/:projectId/sessions',
     {
@@ -174,6 +190,7 @@ export function registerSessionRoutes(
             model: { type: 'string', pattern: modelIdentifier },
             effort: { type: 'string', enum: [...aiEfforts] },
             mode: { type: 'string', enum: [...sessionModes] },
+            attachments: attachmentIds,
           },
         },
       },
@@ -185,6 +202,7 @@ export function registerSessionRoutes(
         model: request.body.model,
         ...(request.body.effort === undefined ? {} : { effort: request.body.effort }),
         ...(request.body.mode === undefined ? {} : { mode: request.body.mode }),
+        ...(request.body.attachments === undefined ? {} : { attachments: request.body.attachments }),
       });
       publish(request.log, session.id, 'session.queued', {
         status: session.status,
@@ -273,7 +291,7 @@ export function registerSessionRoutes(
     },
   );
 
-  app.post<{ Params: { sessionId: string }; Body: { prompt: string; steer?: boolean } }>(
+  app.post<{ Params: { sessionId: string }; Body: { prompt: string; steer?: boolean; attachments?: string[] } }>(
     '/sessions/:sessionId/messages',
     {
       preHandler: [app.requireAuth, app.requireVerifiedEmail, app.enforceRateLimit('build')],
@@ -298,6 +316,7 @@ export function registerSessionRoutes(
             steer: {
               type: 'boolean',
             },
+            attachments: attachmentIds,
           },
         },
       },
@@ -305,16 +324,21 @@ export function registerSessionRoutes(
     async (request, reply) => {
       const user = authenticatedUser(request);
       const prompt = request.body.prompt.trim();
+      const attachments = request.body.attachments;
       const current = await sessions.readOwned(user.uid, request.params.sessionId);
 
       if (request.body.steer === true) {
+        if (current.status === 'RUNNING' && attachments !== undefined && attachments.length > 0) {
+          throw new AppError({ code: 'attachment/steer-unsupported', statusCode: 400,
+            message: 'Files cannot be attached to a steering message. Send them as a follow-up instead.' });
+        }
         if (current.status === 'RUNNING') {
           await sessions.queueSteerMessage(user.uid, current.id, prompt);
           publish(request.log, current.id, 'session.steer', { prompt });
           return reply.code(200).send({ steered: true, sessionId: current.id });
         }
         if (current.status === 'QUEUED') {
-          const queued = await sessions.enqueueMessage(user.uid, current.id, prompt);
+          const queued = await sessions.enqueueMessage(user.uid, current.id, prompt, attachments);
           publish(request.log, current.id, 'session.message_queued', {
             queuedMessageId: queued.id,
             prompt: queued.prompt,
@@ -327,7 +351,7 @@ export function registerSessionRoutes(
       }
 
       if (current.status === 'QUEUED' || current.status === 'RUNNING') {
-        const queued = await sessions.enqueueMessage(user.uid, current.id, prompt);
+        const queued = await sessions.enqueueMessage(user.uid, current.id, prompt, attachments);
         publish(request.log, current.id, 'session.message_queued', {
           queuedMessageId: queued.id,
           prompt: queued.prompt,
@@ -338,7 +362,7 @@ export function registerSessionRoutes(
         });
       }
 
-      const session = await sessions.appendPrompt(user.uid, current.id, prompt);
+      const session = await sessions.appendPrompt(user.uid, current.id, prompt, attachments);
       publish(request.log, session.id, 'session.queued', {
         status: session.status,
         messageCount: session.messageCount,

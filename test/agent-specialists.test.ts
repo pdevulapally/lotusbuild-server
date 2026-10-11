@@ -469,6 +469,7 @@ async function turn(options: {
   const reservations = options.reservations ?? new FakeReservations(metering);
   const problems = options.problems ?? [];
   const run = await runAgentTurn({
+      readAttachment: async () => { throw new Error("No attachments in this fixture."); },
     withValidationSandbox: sandbox instanceof ValidationSandbox ? sandbox.withCopy.bind(sandbox) : undefined,
     // Agent orchestration tests inject the billing boundary. The real admission
     // service's reserve-before-dispatch protocol is covered independently.

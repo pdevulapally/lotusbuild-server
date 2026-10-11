@@ -1,3 +1,5 @@
+import type { MessageAttachment } from '../attachments/repository.ts';
+import type { AttachmentStorage } from '../storage/attachments.ts';
 import { createCallAdmission } from './call-admission.ts';
 import { readOnlyTools, workspaceTools } from './tools.ts';
 import { assertBuildAllowed } from '../entitlements/build-admission.ts';
@@ -99,6 +101,7 @@ export interface RunnerDependencies {
   readonly metering: MeteringService;
   readonly sandboxes: SandboxService;
   readonly persistence: ProjectPersistence;
+  readonly attachments: AttachmentStorage;
   readonly events: SessionEvents;
   readonly limits: AgentLimits;
   readonly heartbeatSeconds: number;
@@ -425,6 +428,8 @@ export class SessionRunner {
         session.id,
         this.#deps.messageHistoryLimit,
       );
+      const readAttachment = (attachment: MessageAttachment) =>
+        this.#deps.attachments.read(attachment.objectName, attachment.generation, attachment.bytes);
       const toolCall = async (name: string, input: Record<string, unknown>) => {
         if (persists && workspaceTools.has(name) && !readOnlyTools.has(name)) {
           await sessions.requireWorkspaceSalvage(authority, acquired!.running.externalId);
@@ -464,6 +469,7 @@ export class SessionRunner {
         provider: acquired.provider,
         sandbox: acquired.running,
         messages,
+        readAttachment,
         entitlements,
         registry,
         metering: this.#deps.metering,
@@ -545,6 +551,7 @@ export class SessionRunner {
           provider: acquired.provider,
           sandbox: acquired.running,
           messages: chainMessages,
+          readAttachment,
           entitlements,
           registry,
           metering: this.#deps.metering,

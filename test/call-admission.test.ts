@@ -124,7 +124,8 @@ async function modelFixture() {
     inputMeterKey: registry.inputTokenMeterKey, outputMeterKey: registry.outputTokenMeterKey, metering, reservations,
     authorize: () => sessions.assertPersistenceLease(authority), onProblem });
   const begin = () => admission.begin({ params: { model: session.model, messages: [] }, maxOutputTokens: 20, signal: controller.signal });
-  const run = async () => runAgentTurn({ admission, anthropic, session, project: await projects.readOwned('u', 'p'),
+  const run = async () => runAgentTurn({
+      readAttachment: async () => { throw new Error("No attachments in this fixture."); }, admission, anthropic, session, project: await projects.readOwned('u', 'p'),
     provider: registry.sandboxProviders.get('web')!, sandbox: { readFile: async () => 'Fixture file' } as unknown as RunningSandbox, withValidationSandbox: undefined,
     messages: [{ seq: 0, role: 'user', content: 'Build', createdAt: new Date() }], entitlements, registry, metering,
     limits: { maxSteps: 2, maxOutputTokens: 20, toolOutputMaxChars: 4096, maxSpecialistConsultations: 1,
