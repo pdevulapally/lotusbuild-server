@@ -35,6 +35,7 @@ const promptText = '^[^\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F]+$';
 const modelIdentifier = '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$';
 
 export interface SessionRouteOptions {
+  readonly validateModel?: (uid: string, model: string, effort?: AiEffort) => Promise<AiEffort | undefined>;
   /**
    * How often a comment is written down an idle stream. Proxies and load
    * balancers close a connection that has said nothing, and the client cannot
@@ -180,10 +181,12 @@ export function registerSessionRoutes(
     },
     async (request, reply) => {
       const user = authenticatedUser(request);
+      const defaultEffort = await options.validateModel?.(user.uid, request.body.model, request.body.effort);
+      const effort = request.body.effort ?? defaultEffort;
       const session = await sessions.create(user.uid, request.params.projectId, {
         prompt: request.body.prompt.trim(),
         model: request.body.model,
-        ...(request.body.effort === undefined ? {} : { effort: request.body.effort }),
+        ...(effort === undefined ? {} : { effort }),
         ...(request.body.mode === undefined ? {} : { mode: request.body.mode }),
       });
       publish(request.log, session.id, 'session.queued', {
