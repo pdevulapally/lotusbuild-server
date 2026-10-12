@@ -251,3 +251,16 @@ test('actual Stripe signature rejection logs safe metadata without the SDK signa
   assert.ok(logs.includes('billing/bad-signature'));
   assert.equal((response.body + logs).includes(marker), false, 'Signature rejection copied sensitive input');
 });
+
+test('a Firestore error is reported by its gRPC status, and only a status can get through', () => {
+  const marker = 'sk-live-marker-that-must-not-appear';
+  // What Firestore threw for a query with no index: a plain Error carrying the status as a number.
+  const missingIndex = Object.assign(new Error(`9 FAILED_PRECONDITION: The query requires an index. ${marker}`), { code: 9 });
+  assert.deepEqual(safeErrorDiagnostic(missingIndex), { category: 'error/runtime', grpcCode: 9 });
+  assert.equal(JSON.stringify(safeErrorDiagnostic(missingIndex)).includes(marker), false);
+
+  // Anything that is not a whole number from 1 to 16 is not a status, so it is not repeated.
+  for (const code of [0, 17, 9.5, -1, '9', marker, Number.NaN, null, { toString: () => marker }]) {
+    assert.deepEqual(safeErrorDiagnostic(Object.assign(new Error(marker), { code })), { category: 'error/runtime' }, String(code));
+  }
+});

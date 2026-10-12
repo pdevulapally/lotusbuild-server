@@ -144,7 +144,7 @@ test('a desktop provider is never handed public preview, and a plain one still i
 
 // ---- the runner: announces the desktop, withdraws it, and never lets it break a build ----
 
-function runnerFixture(options: { desktop: boolean; startDesktop?: (signal?: AbortSignal) => Promise<DesktopHandoff>; withoutHandoffPort?: boolean }) {
+function runnerFixture(options: { desktop: boolean; startDesktop?: (signal?: AbortSignal) => Promise<DesktopHandoff>; withoutHandoffPort?: boolean; failModelWith?: Error }) {
   const { db } = ledger();
   const registry = registryWith(options.desktop ? desktopSize : undefined);
   const plans = new Map(planDocuments.map((doc) => [doc.key, parsePlan(doc, doc.key, registry)]));
@@ -168,8 +168,8 @@ function runnerFixture(options: { desktop: boolean; startDesktop?: (signal?: Abo
     start: async (_provider, context) => { await context.lifecycle!.beforeCreate(); await context.lifecycle!.created(running); return running; } };
   const anthropic = { messages: {
     countTokens: async () => ({ input_tokens: 2 }),
-    stream: () => { modelCalls++; order.push('model'); return { on: () => {}, finalMessage: async () => ({ content: [{ type: 'text', text: 'Complete' }],
-      usage: { input_tokens: 2, output_tokens: 1 }, stop_reason: 'end_turn' }) }; },
+    stream: () => { modelCalls++; order.push('model'); return { on: () => {}, finalMessage: async () => { if (options.failModelWith !== undefined) throw options.failModelWith; return { content: [{ type: 'text', text: 'Complete' }],
+      usage: { input_tokens: 2, output_tokens: 1 }, stop_reason: 'end_turn' }; } }; },
   } } as unknown as Anthropic;
   const session = { id: 's', projectId: 'p', ownerUid: 'u', model: entitlements.capabilities.stringList('ai.model.allowlist')[0],
     leaseToken: 'lease', reservationIds: [], specialistReservationIds: [] };
@@ -187,8 +187,8 @@ function runnerFixture(options: { desktop: boolean; startDesktop?: (signal?: Abo
     publish: async (sessionId, handoff, ttl) => { handoffCalls.push({ call: 'publish', sessionId, handoff, ttl }); order.push('publish'); },
     clear: async (sessionId) => { handoffCalls.push({ call: 'clear', sessionId }); order.push('clear'); return true; },
   };
-  const logs: { message: string }[] = [];
-  const capture = (_details: object, message: string) => { logs.push({ message }); };
+  const logs: { message: string; details: Record<string, unknown> }[] = [];
+  const capture = (details: object, message: string) => { logs.push({ message, details: details as Record<string, unknown> }); };
   const deps = { runnerId: 'runner', anthropic, sessions, metering, configuration,
     entitlements: { forUser: async () => entitlements },
     projects: { readOwned: async () => ({ id: 'p', platform: 'web', ownerUid: 'u', name: 'Fixture', snapshot: { kind: 'none' } }) },
@@ -278,4 +278,21 @@ test('cancelling while the desktop starts stops the build instead of being swall
   assert.equal(h.modelCalls(), 0, 'a cancelled session must not go on to run the agent');
   assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended' && (event.data as { reason?: string }).reason === 'error'), []);
   assert.ok(h.types().includes('session.failed'));
+});
+
+test('a failed session records what failed in the log, and neither the user nor the log gets the provider message', async () => {
+  const failure = Object.assign(new Error('secret provider detail sk-ant-not-for-logs'), { status: 529 });
+  const h = runnerFixture({ desktop: false, failModelWith: failure });
+  await h.runner.runOnce();
+
+  const failed = h.logs.find((entry) => entry.message === 'session failed');
+  assert.ok(failed, h.diagnostics());
+  assert.equal(failed.details['sessionId'], 's');
+  // Which kind of error, and its status: enough to tell a provider outage from our own bug.
+  assert.deepEqual(failed.details['diagnostic'], { category: 'error/runtime', statusCode: 529 });
+  assert.equal(JSON.stringify(h.logs).includes('secret provider detail'), false);
+  // The user is told only that it was on our side.
+  const shown = h.emitted.find((event) => event.type === 'session.failed');
+  assert.equal(shown?.data['error'], 'The build stopped because of an unexpected problem on our side.');
+  assert.equal(JSON.stringify(h.emitted).includes('secret provider detail'), false);
 });

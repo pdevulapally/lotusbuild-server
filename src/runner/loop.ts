@@ -620,7 +620,10 @@ export class SessionRunner {
       const reason = this.#reason(error);
       const shuttingDown = shutdown?.aborted === true && !cancellation.signal.aborted;
       if (shuttingDown) log.info({ sessionId: session.id }, 'runner shutdown: draining active session');
-      else log.error({ sessionId: session.id }, 'session failed');
+      // The user is told only that something went wrong on our side, so this line is the
+      // one place the cause of a failed build is recorded. It carries the safe diagnostic,
+      // never the message: which error it was, its status and exit code, and what it wrapped.
+      else log.error({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'session failed');
 
       if (acquired !== undefined) {
         // Withdrawn first: some of the paths below keep the machine for salvage and
