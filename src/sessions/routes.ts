@@ -69,7 +69,7 @@ function toResponse(session: BuildSession) {
   };
 }
 
-function toMessageResponse(message: SessionMessage) {
+export function toMessageResponse(message: SessionMessage) {
   return {
     seq: message.seq,
     role: message.role,
@@ -276,7 +276,7 @@ export function registerSessionRoutes(
     },
   );
 
-  app.post<{ Params: { sessionId: string }; Body: { prompt: string; steer?: boolean } }>(
+  app.post<{ Params: { sessionId: string }; Body: { prompt: string; steer?: boolean; mode?: (typeof sessionModes)[number] } }>(
     '/sessions/:sessionId/messages',
     {
       preHandler: [app.requireAuth, app.requireVerifiedEmail, app.enforceRateLimit('build')],
@@ -301,6 +301,7 @@ export function registerSessionRoutes(
             steer: {
               type: 'boolean',
             },
+            mode: { type: 'string', enum: [...sessionModes] },
           },
         },
       },
@@ -309,6 +310,11 @@ export function registerSessionRoutes(
       const user = authenticatedUser(request);
       const prompt = request.body.prompt.trim();
       const current = await sessions.readOwned(user.uid, request.params.sessionId);
+      const mode = request.body.mode;
+      // A mode switch applies to the next turn, so it is refused rather than queued behind a running one.
+      if (mode !== undefined && (request.body.steer === true || current.status === 'QUEUED' || current.status === 'RUNNING')) {
+        throw new AppError({ code: 'session/mode-change-busy', statusCode: 409, message: 'Wait for the agent to finish before switching mode.' });
+      }
 
       if (request.body.steer === true) {
         if (current.status === 'RUNNING') {
@@ -341,7 +347,7 @@ export function registerSessionRoutes(
         });
       }
 
-      const session = await sessions.appendPrompt(user.uid, current.id, prompt);
+      const session = await sessions.appendPrompt(user.uid, current.id, prompt, mode);
       publish(request.log, session.id, 'session.queued', {
         status: session.status,
         messageCount: session.messageCount,

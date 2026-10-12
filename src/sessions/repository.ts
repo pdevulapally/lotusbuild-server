@@ -451,13 +451,35 @@ export class SessionRepository {
   }
 
   /**
+   * The latest session's transcript for a project the caller has already been
+   * authorised to read through `ProjectRepository.readShared`. Never call it
+   * without that check: it does not prove ownership itself.
+   */
+  async sharedTranscript(projectId: string, limit: number): Promise<readonly SessionMessage[]> {
+    const latest = await this.#firestore
+      .collection(sessionsCollectionPath)
+      .where('projectId', '==', projectId)
+      .orderBy('createdAt', 'desc')
+      .limit(1)
+      .get();
+    const session = latest.docs[0];
+    if (session === undefined) return [];
+    const messages = await this.#ref(session.id)
+      .collection(messagesCollectionName)
+      .orderBy(FieldPath.documentId(), 'desc')
+      .limit(limit)
+      .get();
+    return messages.docs.map((doc) => parseMessage(doc.id, doc.data(), doc.ref.path)).reverse();
+  }
+
+  /**
    * Adds the user's next turn and puts the session back in the queue.
    *
    * Refused while a runner holds it: a prompt arriving mid-build would either be
    * silently dropped or race the agent's own message into the transcript, and
    * neither is something the user can see happening.
    */
-  async appendPrompt(uid: string, sessionId: string, prompt: string): Promise<BuildSession> {
+  async appendPrompt(uid: string, sessionId: string, prompt: string, mode?: SessionMode): Promise<BuildSession> {
     this.#validatePrompt(prompt);
     const session = await this.readOwned(uid, sessionId);
     const entitlements = await this.#entitlements.forUser(uid);
@@ -517,6 +539,7 @@ export class SessionRepository {
       });
       transaction.update(ref, {
         status: 'QUEUED',
+        ...(mode !== undefined ? { mode } : {}),
         messageCount: FieldValue.increment(1),
         claimableAt: Timestamp.fromDate(now),
         cancelRequested: FieldValue.delete(),
@@ -528,7 +551,7 @@ export class SessionRepository {
         updatedAt: FieldValue.serverTimestamp(),
       });
 
-      return { ...current, status: 'QUEUED' as const, error: undefined, cancelRequested: undefined, messageCount: seq + 1 };
+      return { ...current, ...(mode !== undefined ? { mode } : {}), status: 'QUEUED' as const, error: undefined, cancelRequested: undefined, messageCount: seq + 1 };
     });
   }
 

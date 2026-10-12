@@ -12,6 +12,8 @@ import type { Config } from './config/index.ts';
 import type { EntitlementService } from './entitlements/service.ts';
 import type { ConfigurationStore } from './entitlements/store.ts';
 import type { MeteringService } from './metering/service.ts';
+import { registerProjectContentRoutes } from './projects/content-routes.ts';
+import type { ProjectFiles } from './projects/files.ts';
 import { registerProjectRoutes } from './projects/routes.ts';
 import type { ProjectRepository } from './projects/repository.ts';
 import type Stripe from 'stripe';
@@ -45,6 +47,7 @@ export interface Dependencies {
   readonly metering: MeteringService;
   readonly users: UserRepository;
   readonly projects: ProjectRepository;
+  readonly projectFiles: ProjectFiles;
   readonly sessions: SessionRepository;
   readonly sessionEvents: SessionEvents;
   readonly configuration: ConfigurationStore;
@@ -234,6 +237,7 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
       ),
     });
     registerProjectRoutes(api, projects);
+    registerProjectContentRoutes(api, projects, dependencies.projectFiles, sessions);
     registerPrivacyRoutes(api, dependencies.privacyRequests);
     registerFamilyRoutes(api, dependencies.family, projects, sessions);
     registerSessionRoutes(api, sessions, sessionEvents, {

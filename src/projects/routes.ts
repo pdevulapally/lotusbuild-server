@@ -47,6 +47,7 @@ function toResponse(project: Project) {
     platform: project.platform,
     status: project.status,
     publicPreviewEnabled: project.publicPreviewEnabled === true,
+    visibility: project.visibility,
     createdAt: project.createdAt.toISOString(),
   };
 }
