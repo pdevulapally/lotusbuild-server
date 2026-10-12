@@ -26,6 +26,26 @@ export interface ProjectFile {
   readonly truncated: boolean;
 }
 
+export interface ProjectCommit {
+  readonly sha: string;
+  readonly parent: string | null;
+  readonly committedAt: string;
+  readonly sessionId: string | null;
+  readonly message: string;
+}
+export interface ProjectChangedFile {
+  readonly path: string;
+  readonly previousPath: string | null;
+  /** null for binary files. */
+  readonly additions: number | null;
+  readonly deletions: number | null;
+}
+export interface ProjectChanges {
+  readonly sha: string;
+  readonly files: readonly ProjectChangedFile[];
+  readonly patch: string;
+  readonly truncated: boolean;
+}
 export interface ProjectFilesOptions {
   readonly maxArchiveBytes: number;
   readonly maxFiles: number;
@@ -39,6 +59,11 @@ const defaults: ProjectFilesOptions = {
 
 const empty: ProjectTree = { head: null, ref: null, branches: [], files: [], truncated: false };
 const unavailable = () => new AppError({ code: 'project/files-unavailable', statusCode: 503, message: 'Project files could not be read. Try again shortly.' });
+const commitNotFound = () => new AppError({ code: 'project/commit-not-found', statusCode: 404, message: 'No such saved change in this project.' });
+const commitSha = /^[0-9a-f]{40,64}$/;
+const maxHistory = 100;
+const maxPatchBytes = 1024 * 1024;
+const maxChangedFiles = 1000;
 const notFound = () => new AppError({ code: 'project/file-not-found', statusCode: 404, message: 'No such file in this project.' });
 
 /** Paths the API accepts: relative, printable, no traversal and nothing inside `.git`. */
@@ -92,6 +117,46 @@ export class ProjectFiles {
     const truncated = !binary && blob.length > this.#options.maxFileBytes;
     return { path, size: entry.size, binary, truncated,
       content: binary ? null : blob.subarray(0, this.#options.maxFileBytes).toString('utf8') };
+  }
+
+  /** Saved versions on the current branch, newest first. Each agent save is one commit tagged with its session. */
+  async history(project: Project, limit = 50): Promise<{ commits: ProjectCommit[] }> {
+    if (project.snapshot.kind === 'none') return { commits: [] };
+    const git = await this.#repository(project.id, project.snapshot);
+    const count = Math.min(Math.max(Math.trunc(limit), 1), maxHistory);
+    const raw = await git(['log', '-z', `--max-count=${count}`, '--no-color', '--format=%H%x1f%P%x1f%cI%x1f%s', 'HEAD'])
+      .then((out) => out.toString('utf8'), () => '');
+    const commits = raw.split('\0').filter(Boolean).flatMap((record): ProjectCommit[] => {
+      const [sha = '', parents = '', committedAt = '', subject = ''] = record.split('\x1f');
+      const when = new Date(committedAt);
+      if (!commitSha.test(sha) || Number.isNaN(when.getTime())) return [];
+      const parent = parents.split(' ')[0] ?? '';
+      const session = /^LotusBuild (?:session|recovery) ([A-Za-z0-9_-]{1,128})$/.exec(subject);
+      return [{ sha, parent: commitSha.test(parent) ? parent : null, committedAt: when.toISOString(), sessionId: session?.[1] ?? null, message: subject.slice(0, 200) }];
+    });
+    return { commits };
+  }
+
+  /** What one saved version changed compared with its parent, as stats plus a capped unified diff. */
+  async changes(project: Project, sha: string): Promise<ProjectChanges> {
+    if (!commitSha.test(sha) || project.snapshot.kind === 'none') throw commitNotFound();
+    const git = await this.#repository(project.id, project.snapshot);
+    const type = await git(['cat-file', '-t', sha]).then((out) => out.toString('utf8').trim(), () => null);
+    if (type !== 'commit') throw commitNotFound();
+    const base = ['diff-tree', '-r', '--root', '--no-commit-id', '-M', '--no-color', '--no-ext-diff', '--no-textconv'];
+    const tokens = (await git([...base, '--numstat', '-z', sha], 16 * 1024 * 1024)).toString('utf8').split('\0');
+    const files: ProjectChangedFile[] = [];
+    for (let index = 0; index < tokens.length && files.length < maxChangedFiles;) {
+      const match = /^(\d+|-)\t(\d+|-)\t(.*)$/s.exec(tokens[index] ?? '');
+      if (match === null) { index++; continue; }
+      let path = match[3]!;
+      let previousPath: string | null = null;
+      if (path === '') { previousPath = tokens[index + 1] ?? ''; path = tokens[index + 2] ?? ''; index += 3; } else index++;
+      if (!isProjectPath(path) || (previousPath !== null && !isProjectPath(previousPath))) continue;
+      files.push({ path, previousPath, additions: match[1] === '-' ? null : Number(match[1]), deletions: match[2] === '-' ? null : Number(match[2]) });
+    }
+    const patch = await git([...base, '-p', '--unified=3', sha], 64 * 1024 * 1024);
+    return { sha, files, patch: patch.subarray(0, maxPatchBytes).toString('utf8'), truncated: patch.length > maxPatchBytes || tokens.length > maxChangedFiles * 3 };
   }
 
   async #list(git: Git, commit: string): Promise<{ path: string; size: number; sha: string }[]> {
