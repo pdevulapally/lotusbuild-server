@@ -71,7 +71,7 @@ export const requestLogSerializer = (request: FastifyRequest) => ({
 });
 
 /** Headers a browser may read off a cross-origin response; everything else is hidden from its JavaScript. */
-export const exposedResponseHeaders = ['Retry-After', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'];
+export const exposedResponseHeaders = ['Content-Disposition', 'Retry-After', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'];
 
 export function buildServer(config: Config, dependencies: Dependencies): FastifyInstance {
   const { firebaseAuth, redis, entitlements, metering, users, projects, sessions, sessionEvents } =
