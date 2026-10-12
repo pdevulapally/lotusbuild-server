@@ -43,6 +43,18 @@ export function registerProjectContentRoutes(app: FastifyInstance, projects: Pro
     preHandler: read, schema: { params: projectParams, querystring: query({ path, ref }, ['path']) },
   }, async (request) => files.read(await projects.readOwned(authenticatedUser(request).uid, request.params.projectId), request.query.path, request.query.ref));
 
+  app.get<{ Params: { projectId: string }; Querystring: { ref?: string } }>('/projects/:projectId/archive', {
+    preHandler: [app.requireAuth, app.enforceRateLimit('write')], schema: { params: projectParams, querystring: query({ ref }) },
+  }, async (request, reply) => {
+    const project = await projects.readOwned(authenticatedUser(request).uid, request.params.projectId);
+    const zip = await files.archive(project, request.query.ref);
+    const slug = project.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'project';
+    return reply
+      .header('cache-control', 'no-store')
+      .header('content-type', 'application/zip')
+      .header('content-disposition', `attachment; filename="${slug}.zip"`)
+      .send(zip);
+  });
   app.get<{ Params: { projectId: string } }>('/projects/:projectId/changes', {
     preHandler: read, schema: { params: projectParams },
   }, async (request, reply) => {

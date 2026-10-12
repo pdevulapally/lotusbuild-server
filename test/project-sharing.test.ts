@@ -114,3 +114,13 @@ test('saved changes list each commit and diff it against its parent, refusing un
     await assert.rejects(files.changes(project, bad), { code: 'project/commit-not-found' }, bad);
   }
 });
+
+test('the saved version downloads as a zip of the branch, without git internals', async () => {
+  const { files, project } = snapshotOf(() => {});
+  const zip = await files.archive(project);
+  assert.equal(zip.subarray(0, 2).toString('latin1'), 'PK');
+  assert.ok(zip.includes(Buffer.from('index.html')));
+  assert.ok(!zip.includes(Buffer.from('feature.md')));
+  assert.ok((await files.archive(project, 'feature')).includes(Buffer.from('feature.md')));
+  await assert.rejects(files.archive(project, 'nope'), { code: 'project/branch-not-found' });
+});

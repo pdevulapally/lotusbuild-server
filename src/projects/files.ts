@@ -119,6 +119,16 @@ export class ProjectFiles {
       content: binary ? null : blob.subarray(0, this.#options.maxFileBytes).toString('utf8') };
   }
 
+  /** The saved version of a branch as a zip, built by git from the snapshot (never from a live sandbox). */
+  async archive(project: Project, ref?: string): Promise<Buffer> {
+    const tree = await this.tree(project, ref);
+    if (tree.files.length === 0) throw notFound();
+    const git = await this.#repository(project.id, project.snapshot as PersistedSnapshot);
+    const target = tree.ref === null ? 'HEAD' : `refs/heads/${tree.ref}`;
+    return git(['-c', 'tar.umask=0022', 'archive', '--format=zip', target], Math.min(this.#options.maxArchiveBytes, 128 * 1024 * 1024))
+      .catch(() => { throw unavailable(); });
+  }
+
   /** Saved versions on the current branch, newest first. Each agent save is one commit tagged with its session. */
   async history(project: Project, limit = 50): Promise<{ commits: ProjectCommit[] }> {
     if (project.snapshot.kind === 'none') return { commits: [] };
