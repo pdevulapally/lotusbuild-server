@@ -187,6 +187,17 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
       };
     });
 
+    api.get<{ Params: { sessionId: string } }>('/sessions/:sessionId/usage', {
+      preHandler: [api.requireAuth, api.enforceRateLimit('read')],
+      schema: { params: { type: 'object', required: ['sessionId'], additionalProperties: false,
+        properties: { sessionId: { type: 'string', pattern: '^[A-Za-z0-9_-]{1,128}$' } } } },
+    }, async (request, reply) => {
+      const user = authenticatedUser(request);
+      const session = await sessions.readOwned(user.uid, request.params.sessionId);
+      reply.header('cache-control', 'no-store');
+      return { sessionId: session.id, meters: await metering.readOperationUsage(user.uid, session.id) };
+    });
+
     api.get(
       '/me/usage',
       { preHandler: [api.requireAuth, api.enforceRateLimit('read')] },
