@@ -426,6 +426,24 @@ export class SessionRepository {
   }
 
   /**
+   * The owner's newest sessions across all projects, for the activity inbox.
+   * Equality-only on `ownerUid` so no composite index is needed; ordering is
+   * done in memory over a bounded read.
+   */
+  async listRecentForOwner(ownerUid: string, limit: number): Promise<readonly BuildSession[]> {
+    const snapshot = await this.#firestore
+      .collection(sessionsCollectionPath)
+      .where('ownerUid', '==', ownerUid)
+      .limit(500)
+      .get();
+    return snapshot.docs
+      .map((doc) => parseSession(doc.id, doc.data(), doc.ref.path))
+      .filter((session) => session.ownerUid === ownerUid)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+      .slice(0, limit);
+  }
+
+  /**
    * The most recent `limit` messages, in chronological order.
    *
    * Every caller — the primary agent's context and the message-history route
