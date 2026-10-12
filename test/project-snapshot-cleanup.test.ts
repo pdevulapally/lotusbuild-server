@@ -67,7 +67,7 @@ const project: Project = {
   name: 'Project',
   description: undefined,
   platform: 'web',
-  status: 'draft',
+  status: 'draft', visibility: 'private',
   snapshotBytes: supersededBytes,
   snapshot: superseded,
   activeSessionId: 'session-1',

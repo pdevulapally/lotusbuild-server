@@ -69,7 +69,7 @@ function toResponse(session: BuildSession) {
   };
 }
 
-function toMessageResponse(message: SessionMessage) {
+export function toMessageResponse(message: SessionMessage) {
   return {
     seq: message.seq,
     role: message.role,

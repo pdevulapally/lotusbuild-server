@@ -1,3 +1,5 @@
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+
 import { FieldValue, type Firestore, type Transaction } from 'firebase-admin/firestore';
 
 import type { ConfigurationStore } from '../entitlements/store.ts';
@@ -28,6 +30,14 @@ export const projectDescriptionMaxLength = 500;
 
 export const projectStatuses = ['draft', 'deleting'] as const;
 
+/**
+ * Who may read a project besides its owner. `link` needs the unguessable share
+ * token; `public` needs only the project id. Anything else reads as private.
+ */
+export const projectVisibilities = ['private', 'link', 'public'] as const;
+export type ProjectVisibility = (typeof projectVisibilities)[number];
+const shareTokenPattern = /^[A-Za-z0-9_-]{32}$/;
+
 export interface Project {
   readonly id: string;
   readonly ownerUid: string;
@@ -40,6 +50,8 @@ export interface Project {
   readonly snapshot: StoredSnapshot;
   readonly snapshotUploadId?: string;
   readonly publicPreviewEnabled?: boolean;
+  readonly visibility: ProjectVisibility;
+  readonly shareToken?: string;
   /**
    * The session allowed to mutate this project's workspace. `null` is an
    * explicitly unlocked project; `undefined` is a legacy document that must be
@@ -111,6 +123,8 @@ function parseProject(id: string, fields: Fields, where: string): Project {
     status: enumField(fields, 'status', where, projectStatuses),
     snapshotBytes,
     publicPreviewEnabled: fields['publicPreviewEnabled'] === true,
+    visibility: projectVisibilities.find((value) => value === fields['visibility']) ?? 'private',
+    ...(typeof fields['shareToken'] === 'string' && shareTokenPattern.test(fields['shareToken']) ? { shareToken: fields['shareToken'] } : {}),
     snapshot: storedSnapshot(fields, where, snapshotBytes),
     ...(typeof fields['snapshotUploadId'] === 'string' ? { snapshotUploadId: fields['snapshotUploadId'] } : {}),
     activeSessionId: activeSessionIdField(fields, where),
@@ -209,6 +223,7 @@ export class ProjectRepository {
         description: input.description,
         platform: input.platform,
         status: 'draft',
+        visibility: 'private',
         activeSessionId: null,
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
@@ -228,6 +243,7 @@ export class ProjectRepository {
       description: input.description,
       platform: input.platform,
       status: 'draft',
+      visibility: 'private',
       snapshotBytes: 0,
       snapshot: { kind: 'none' },
       activeSessionId: null,
@@ -371,6 +387,43 @@ export class ProjectRepository {
   /** For callers that update a project inside their own transaction. */
   refFor(projectId: string) {
     return this.#firestore.doc(`${projectsCollectionPath}/${projectId}`);
+  }
+
+  /**
+   * Leaving `link` always discards the token, so a link shared earlier can never
+   * come back to life when the project is made link-only again.
+   */
+  async setVisibility(ownerUid: string, projectId: string, visibility: ProjectVisibility, rotateLink = false): Promise<{ visibility: ProjectVisibility; shareToken: string | null }> {
+    const ref = this.refFor(projectId);
+    return this.#firestore.runTransaction(async (tx) => {
+      const project = await this.readOwnedInTransaction(tx, ownerUid, projectId);
+      const shareToken = visibility !== 'link' ? null
+        : rotateLink || project.shareToken === undefined ? randomBytes(24).toString('base64url') : project.shareToken;
+      tx.update(ref, { visibility, shareToken: shareToken ?? FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() });
+      return { visibility, shareToken };
+    });
+  }
+
+  /**
+   * A project as seen by someone who is not its owner. Every refusal — missing,
+   * private, wrong or absent token, closed account — is the same 404, so the id
+   * space cannot be probed.
+   */
+  async readShared(projectId: string, token: string | undefined): Promise<Project> {
+    const ref = this.refFor(projectId);
+    const snapshot = await ref.get();
+    const missing = new AppError({ code: 'project/not-found', statusCode: 404, message: 'No such project.' });
+    if (!snapshot.exists) throw missing;
+    const ownerUid = parseProject(snapshot.id, snapshot.data() ?? {}, ref.path).ownerUid;
+    const project = this.#ownedFromSnapshot(ownerUid, ref.path, snapshot);
+    if ((await this.#firestore.doc(`accountErasures/${ownerUid}`).get()).exists) throw missing;
+    if (project.visibility === 'public') return project;
+    if (project.visibility === 'link' && token !== undefined && project.shareToken !== undefined) {
+      const given = Buffer.from(token);
+      const expected = Buffer.from(project.shareToken);
+      if (given.length === expected.length && timingSafeEqual(given, expected)) return project;
+    }
+    throw missing;
   }
 
   async readOwnedInTransaction(

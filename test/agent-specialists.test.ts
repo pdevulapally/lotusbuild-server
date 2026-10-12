@@ -105,7 +105,7 @@ const project: Project = {
   name: 'Project',
   description: undefined,
   platform: 'web',
-  status: 'draft',
+  status: 'draft', visibility: 'private',
   snapshotBytes: 0,
   snapshot: { kind: 'none' },
   activeSessionId: 'session-1',
