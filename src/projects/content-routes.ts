@@ -13,6 +13,7 @@ const projectParams = {
 } as const;
 const ref = { type: 'string', minLength: 1, maxLength: 255, pattern: '^[A-Za-z0-9._/-]+$' } as const;
 const path = { type: 'string', minLength: 1, maxLength: 1024 } as const;
+const sha = { type: 'string', pattern: '^[0-9a-f]{40,64}$' } as const;
 const token = { type: 'string', pattern: '^[A-Za-z0-9_-]{32}$' } as const;
 const query = (properties: Record<string, unknown>, required: string[] = []) =>
   ({ type: 'object', additionalProperties: false, required, properties }) as const;
@@ -42,6 +43,31 @@ export function registerProjectContentRoutes(app: FastifyInstance, projects: Pro
     preHandler: read, schema: { params: projectParams, querystring: query({ path, ref }, ['path']) },
   }, async (request) => files.read(await projects.readOwned(authenticatedUser(request).uid, request.params.projectId), request.query.path, request.query.ref));
 
+  app.get<{ Params: { projectId: string }; Querystring: { ref?: string } }>('/projects/:projectId/archive', {
+    preHandler: [app.requireAuth, app.enforceRateLimit('write')], schema: { params: projectParams, querystring: query({ ref }) },
+  }, async (request, reply) => {
+    const project = await projects.readOwned(authenticatedUser(request).uid, request.params.projectId);
+    const zip = await files.archive(project, request.query.ref);
+    const slug = project.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'project';
+    return reply
+      .header('cache-control', 'no-store')
+      .header('content-type', 'application/zip')
+      .header('content-disposition', `attachment; filename="${slug}.zip"`)
+      .send(zip);
+  });
+  app.get<{ Params: { projectId: string } }>('/projects/:projectId/changes', {
+    preHandler: read, schema: { params: projectParams },
+  }, async (request, reply) => {
+    reply.header('cache-control', 'no-store');
+    return files.history(await projects.readOwned(authenticatedUser(request).uid, request.params.projectId));
+  });
+  app.get<{ Params: { projectId: string; sha: string } }>('/projects/:projectId/changes/:sha', {
+    preHandler: read,
+    schema: { params: { type: 'object', required: ['projectId', 'sha'], additionalProperties: false, properties: { ...projectParams.properties, sha } } },
+  }, async (request, reply) => {
+    reply.header('cache-control', 'no-store');
+    return files.changes(await projects.readOwned(authenticatedUser(request).uid, request.params.projectId), request.params.sha);
+  });
   app.get<{ Params: { projectId: string } }>('/projects/:projectId/share', {
     preHandler: read, schema: { params: projectParams },
   }, async (request, reply) => {

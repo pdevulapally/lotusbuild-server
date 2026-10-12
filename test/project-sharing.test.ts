@@ -100,3 +100,27 @@ test('project paths reject traversal, absolute paths and git internals', () => {
   for (const bad of ['', '/etc/passwd', 'a/../b', '.git/HEAD', 'a//b', 'a\\b', 'x\u0000']) assert.equal(isProjectPath(bad), false, bad);
   assert.equal(isProjectPath('src/app.ts'), true);
 });
+
+test('saved changes list each commit and diff it against its parent, refusing unknown or malformed commits', async () => {
+  const { files, project } = snapshotOf(() => {});
+  const { commits } = await files.history(project);
+  assert.ok(commits.length >= 1);
+  assert.match(commits[0]!.sha, /^[0-9a-f]{40,64}$/);
+  const changes = await files.changes(project, commits[0]!.sha);
+  assert.ok(changes.files.length > 0);
+  assert.ok(changes.files.every((file) => !file.path.startsWith('.git')));
+  assert.match(changes.patch, /^diff --git /m);
+  for (const bad of ['a'.repeat(40), '../HEAD', 'HEAD', '--output=/tmp/x']) {
+    await assert.rejects(files.changes(project, bad), { code: 'project/commit-not-found' }, bad);
+  }
+});
+
+test('the saved version downloads as a zip of the branch, without git internals', async () => {
+  const { files, project } = snapshotOf(() => {});
+  const zip = await files.archive(project);
+  assert.equal(zip.subarray(0, 2).toString('latin1'), 'PK');
+  assert.ok(zip.includes(Buffer.from('index.html')));
+  assert.ok(!zip.includes(Buffer.from('feature.md')));
+  assert.ok((await files.archive(project, 'feature')).includes(Buffer.from('feature.md')));
+  await assert.rejects(files.archive(project, 'nope'), { code: 'project/branch-not-found' });
+});
