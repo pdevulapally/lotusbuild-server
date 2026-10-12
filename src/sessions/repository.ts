@@ -479,7 +479,7 @@ export class SessionRepository {
    * silently dropped or race the agent's own message into the transcript, and
    * neither is something the user can see happening.
    */
-  async appendPrompt(uid: string, sessionId: string, prompt: string): Promise<BuildSession> {
+  async appendPrompt(uid: string, sessionId: string, prompt: string, mode?: SessionMode): Promise<BuildSession> {
     this.#validatePrompt(prompt);
     const session = await this.readOwned(uid, sessionId);
     const entitlements = await this.#entitlements.forUser(uid);
@@ -539,6 +539,7 @@ export class SessionRepository {
       });
       transaction.update(ref, {
         status: 'QUEUED',
+        ...(mode !== undefined ? { mode } : {}),
         messageCount: FieldValue.increment(1),
         claimableAt: Timestamp.fromDate(now),
         cancelRequested: FieldValue.delete(),
@@ -550,7 +551,7 @@ export class SessionRepository {
         updatedAt: FieldValue.serverTimestamp(),
       });
 
-      return { ...current, status: 'QUEUED' as const, error: undefined, cancelRequested: undefined, messageCount: seq + 1 };
+      return { ...current, ...(mode !== undefined ? { mode } : {}), status: 'QUEUED' as const, error: undefined, cancelRequested: undefined, messageCount: seq + 1 };
     });
   }
 
