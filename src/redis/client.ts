@@ -78,4 +78,6 @@ export const redisKeyPrefixes = {
   desktopTicket: 'dkt:',
   /** Where a running desktop is, handed from the runner to the API's relay. Holds a bearer token. */
   desktopHandoff: 'dkh:',
+  /** Short-lived hashed email verification codes, scoped to one Firebase uid. */
+  emailVerification: 'emv:',
 } as const;

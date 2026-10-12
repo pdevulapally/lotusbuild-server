@@ -6,6 +6,8 @@ import type { Auth } from 'firebase-admin/auth';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 
 import { authenticatedUser, registerAuth } from './auth/plugin.ts';
+import { registerEmailVerificationRoutes } from './auth/email-verification-routes.ts';
+import type { EmailVerificationService } from './auth/email-verification.ts';
 import type { BillingRepository } from './billing/repository.ts';
 import { registerBillingRoutes } from './billing/routes.ts';
 import type { Config } from './config/index.ts';
@@ -42,6 +44,7 @@ export interface Dependencies {
   readonly privacyRequests: PrivacyRequests;
   readonly family: FamilyService;
   readonly firebaseAuth: Auth;
+  readonly emailVerification: EmailVerificationService;
   readonly redis: Redis;
   readonly entitlements: EntitlementService;
   readonly metering: MeteringService;
@@ -186,6 +189,8 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
         })),
       };
     });
+
+    registerEmailVerificationRoutes(api, dependencies.emailVerification);
 
     api.get<{ Params: { sessionId: string } }>('/sessions/:sessionId/usage', {
       preHandler: [api.requireAuth, api.enforceRateLimit('read')],

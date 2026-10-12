@@ -79,6 +79,12 @@ const apiSpec = {
   SSE_MAX_CONNECTIONS_PER_USER: asInteger('maximum simultaneous event streams per account per API process', { min: 1, max: 100 }),
   SSE_BUFFER_MAX_BYTES: asInteger('maximum buffered event bytes per connection', { min: 1024, max: 1048576 }),
   HTTP_MAX_REQUESTS_PER_MINUTE: asInteger('pre-authentication requests per client IP per minute', { min: 1, max: 100000 }),
+  RESEND_API_KEY: asString('Resend API key used only by the API to deliver transactional email', { minLength: 10 }),
+  EMAIL_VERIFICATION_FROM: asString('verified sender address for email verification codes'),
+  EMAIL_VERIFICATION_CODE_SECRET: asString('server-only HMAC secret for email verification codes', { minLength: 32 }),
+  EMAIL_VERIFICATION_CODE_TTL_SECONDS: asInteger('lifetime of a one-use email verification code', { min: 300, max: 1800 }),
+  EMAIL_VERIFICATION_RESEND_SECONDS: asInteger('minimum delay before another verification email', { min: 30, max: 300 }),
+  EMAIL_VERIFICATION_MAX_ATTEMPTS: asInteger('wrong code attempts allowed before a code is invalidated', { min: 3, max: 10 }),
   STRIPE_SECRET_KEY: asString('Stripe secret key this service bills with'),
   STRIPE_WEBHOOK_SECRET: asString('signing secret for the Stripe webhook endpoint'),
   STRIPE_EVENT_REPLAY_WINDOW_SECONDS: asInteger(
