@@ -21,6 +21,7 @@ import type { SessionRepository } from './sessions/repository.ts';
 import { registerSessionRoutes } from './sessions/routes.ts';
 import type { UserRepository } from './users/repository.ts';
 import { registerErrorHandler, safeErrorDiagnostic } from './http/errors.ts';
+import { allowedModelCatalog, assertModelSelection } from './models/catalog.ts';
 import { registerRateLimiting } from './http/rate-limit.ts';
 import { redisKeyPrefixes } from './redis/client.ts';
 import { DesktopRelay, registerDesktopRoutes } from './desktop/relay.ts';
@@ -173,6 +174,7 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
         plan: { key: resolved.planKey, name: resolved.planName },
         subscriptionStatus: resolved.subscriptionStatus,
         capabilities: resolved.capabilities.entries(),
+        models: await allowedModelCatalog(redis, resolved),
         limits: [...resolved.meterLimits.values()].map((limit) => ({
           meterKey: limit.meterKey,
           includedAllowance: limit.includedAllowance,
@@ -235,6 +237,12 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     registerPrivacyRoutes(api, dependencies.privacyRequests);
     registerFamilyRoutes(api, dependencies.family, projects, sessions);
     registerSessionRoutes(api, sessions, sessionEvents, {
+      validateModel: async (uid, model, effort) => {
+        const resolved = await entitlements.forUser(uid);
+        const models = await allowedModelCatalog(redis, resolved);
+        assertModelSelection(models, model, effort);
+        return models.find(item => item.id === model)?.efforts.at(-1);
+      },
       heartbeatSeconds: config.SSE_HEARTBEAT_SECONDS,
       maxConnections: config.SSE_MAX_CONNECTIONS,
       maxConnectionsPerUser: config.SSE_MAX_CONNECTIONS_PER_USER,

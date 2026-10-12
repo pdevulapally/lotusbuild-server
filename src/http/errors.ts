@@ -35,6 +35,7 @@ export class AppError extends Error {
 // Logging allowlists, not a domain-code registry: unknown codes remain explicit
 // generic categories. Never copy message, stack, details or arbitrary properties.
 const diagnosticCodes = new Set([
+  'session/model-unavailable', 'session/effort-unsupported', 'session/effort-not-permitted',
   'release/recovery-protocol-incompatible', 'session/recovery-protocol-incompatible',
   'usage/limit-reached', 'usage/reconciliation-required', 'entitlement/misconfigured',
   'session/cancelled', 'session/lease-lost', 'session/project-guard-lost',

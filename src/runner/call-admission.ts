@@ -2,19 +2,23 @@ import type Anthropic from '@anthropic-ai/sdk';
 import type { MessageCountTokensParams } from '@anthropic-ai/sdk/resources/messages';
 import type { MeteringService } from '../metering/service.ts';
 import type { AuthoritativeUsage, SpecialistReservations, ProblemReporter } from './agent.ts';
+import { modelOutputConfig, type ModelResolver } from '../models/catalog.ts';
+import type { AiEffort } from '../entitlements/build-admission.ts';
 
 export interface CallAdmission {
   begin(input: {
     readonly params: MessageCountTokensParams;
+    readonly effort: AiEffort;
     readonly maxOutputTokens: number;
     readonly outputReservationId?: string;
     readonly signal: AbortSignal;
-  }): Promise<{ settle(usage: AuthoritativeUsage): Promise<void> }>;
+  }): Promise<{ settle(usage: AuthoritativeUsage): Promise<void>; params: MessageCountTokensParams; maxOutputTokens: number }>;
 }
 
 /** Admission is shared by primary and specialist calls, including every tool loop. */
 export function createCallAdmission(deps: {
   readonly anthropic: Anthropic;
+  readonly models: ModelResolver;
   readonly uid: string;
   readonly sessionId: string;
   readonly inputMeterKey: string;
@@ -29,7 +33,13 @@ export function createCallAdmission(deps: {
       input.signal.throwIfAborted();
       await deps.authorize();
       input.signal.throwIfAborted();
-      const count = await deps.anthropic.messages.countTokens(input.params, { signal: input.signal });
+      const model = await deps.models.get(input.params.model);
+      input.signal.throwIfAborted();
+      const outputConfig = modelOutputConfig(model, input.effort);
+      const { output_config: _ignored, ...base } = input.params;
+      const params = { ...base, ...(outputConfig === undefined ? {} : { output_config: outputConfig }) };
+      const maxOutputTokens = Math.min(input.maxOutputTokens, model.maxOutputTokens);
+      const count = await deps.anthropic.messages.countTokens(params, { signal: input.signal });
       input.signal.throwIfAborted();
       if (!Number.isSafeInteger(count.input_tokens) || count.input_tokens <= 0) {
         throw new Error('Anthropic returned no usable input-token estimate.');
@@ -57,7 +67,7 @@ export function createCallAdmission(deps: {
           quantity: count.input_tokens, operationId: `model-input:${deps.sessionId}` }), kind: 'input' });
         if (input.outputReservationId === undefined) {
           holds.push({ ...await deps.reservations.take({ meterKey: deps.outputMeterKey,
-            quantity: input.maxOutputTokens, operationId: `model-output:${deps.sessionId}` }), kind: 'output' });
+            quantity: maxOutputTokens, operationId: `model-output:${deps.sessionId}` }), kind: 'output' });
         }
         // A downgrade, cancellation or lease loss during the count/holds must
         // be observed before generation. No provider work has started yet.
@@ -80,7 +90,7 @@ export function createCallAdmission(deps: {
         }
         throw cause;
       }
-      return { settle };
+      return { settle, params, maxOutputTokens };
     },
   };
 }

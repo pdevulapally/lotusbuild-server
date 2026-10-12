@@ -1,6 +1,7 @@
 import { createCallAdmission } from './call-admission.ts';
+import type { ModelResolver } from '../models/catalog.ts';
 import { readOnlyTools, workspaceTools } from './tools.ts';
-import { assertBuildAllowed } from '../entitlements/build-admission.ts';
+import { assertBuildAllowed, resolveAiEffort } from '../entitlements/build-admission.ts';
 import type Anthropic from '@anthropic-ai/sdk';
 
 import type { EntitlementService, UserEntitlements } from '../entitlements/service.ts';
@@ -90,6 +91,7 @@ export interface RunnerLogger {
 }
 
 export interface RunnerDependencies {
+  readonly models: ModelResolver;
   readonly runnerId: string;
   readonly anthropic: Anthropic;
   readonly sessions: SessionRepository;
@@ -359,6 +361,7 @@ export class SessionRunner {
       persists = entitlements.capabilities.boolean('git.persistence');
       const { registry } = await this.#deps.configuration.get();
       const admission = createCallAdmission({
+        models: this.#deps.models,
         anthropic: this.#deps.anthropic, uid: session.ownerUid, sessionId: session.id,
         inputMeterKey: registry.inputTokenMeterKey, outputMeterKey: registry.outputTokenMeterKey,
         metering: this.#deps.metering, reservations: tokenReservations,
@@ -366,6 +369,7 @@ export class SessionRunner {
           await sessions.assertPersistenceLease(authority);
           const latest = await this.#deps.entitlements.forUser(session.ownerUid, new Date(), true);
           assertBuildAllowed(latest, project!.platform, session.model);
+          if ((await this.#deps.models.get(session.model)).efforts.length > 0) resolveAiEffort(latest, session.effort);
         },
         onProblem: (error) => log.error({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'model admission reconciliation failed'),
       });
@@ -425,12 +429,12 @@ export class SessionRunner {
         session.id,
         this.#deps.messageHistoryLimit,
       );
-      const toolCall = async (name: string, input: Record<string, unknown>) => {
+      const toolCall = async (name: string, input: Record<string, unknown>, callId?: string) => {
         if (persists && workspaceTools.has(name) && !readOnlyTools.has(name)) {
           await sessions.requireWorkspaceSalvage(authority, acquired!.running.externalId);
           workspaceMayBeDirty = true;
         }
-        await publish('agent.tool_call', { name, input });
+        await publish('agent.tool_call', { name, input, ...(callId === undefined ? {} : {callId}) });
       };
 
       const withValidationSandbox: NonNullable<import('./tools.ts').ToolContext['withValidationSandbox']> = async (run) => {
@@ -483,8 +487,9 @@ export class SessionRunner {
           },
           step: (step) => publish('agent.step', step),
           toolCall,
-          toolResult: (name, result) =>
+          toolResult: (name, result, callId) =>
             publish('agent.tool_result', {
+              ...(callId === undefined ? {} : {callId}),
               name,
               isError: result.isError,
               // Bounded for the same reason the model's copy is: an event log
@@ -562,8 +567,9 @@ export class SessionRunner {
             },
             step: (step) => publish('agent.step', step),
             toolCall,
-            toolResult: (name, result) =>
+            toolResult: (name, result, callId) =>
               publish('agent.tool_result', {
+                ...(callId === undefined ? {} : {callId}),
                 name,
                 isError: result.isError,
                 text: result.text.slice(0, this.#deps.limits.toolOutputMaxChars),
@@ -620,7 +626,7 @@ export class SessionRunner {
       const reason = this.#reason(error);
       const shuttingDown = shutdown?.aborted === true && !cancellation.signal.aborted;
       if (shuttingDown) log.info({ sessionId: session.id }, 'runner shutdown: draining active session');
-      else log.error({ sessionId: session.id }, 'session failed');
+      else log.error({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'session failed');
 
       if (acquired !== undefined) {
         // Withdrawn first: some of the paths below keep the machine for salvage and

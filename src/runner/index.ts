@@ -23,6 +23,7 @@ import { SnapshotStore } from '../storage/snapshots.ts';
 import { SnapshotMaintenance } from '../storage/maintenance.ts';
 import { UserRepository } from '../users/repository.ts';
 import { SessionRunner, runUntilStopped, withDrainDeadline } from './loop.ts';
+import { ProviderModels } from '../models/catalog.ts';
 
 /**
  * The build runner.
@@ -97,13 +98,23 @@ async function main(): Promise<void> {
   // time means a build that ran, cost money and threw its result away.
   await snapshots.assertReachable();
 
+  const anthropic = new Anthropic({
+    logger: safeProviderLogger(log, 'anthropic'),
+    apiKey: config.ANTHROPIC_API_KEY,
+    baseURL: config.ANTHROPIC_BASE_URL.toString(),
+  });
+  const models = new ProviderModels(anthropic, redis, config.CONFIG_CACHE_TTL_SECONDS, async () => {
+    const { plans } = await configuration.get();
+    return [...plans.values()].flatMap(plan => {
+      const allowed = plan.entitlements.get('ai.model.allowlist');
+      return allowed?.kind === 'stringList' ? [...allowed.value] : [];
+    });
+  });
+  await models.refresh();
   const runner = new SessionRunner({
     runnerId,
-    anthropic: new Anthropic({
-      logger: safeProviderLogger(log, 'anthropic'),
-      apiKey: config.ANTHROPIC_API_KEY,
-      baseURL: config.ANTHROPIC_BASE_URL.toString(),
-    }),
+    anthropic,
+    models,
     sessions,
     projects,
     entitlements,
@@ -154,7 +165,11 @@ async function main(): Promise<void> {
   log.info({ runnerId }, 'runner started');
   await withDrainDeadline(shutdown.signal, config.RUNNER_DRAIN_TIMEOUT_SECONDS * 1000, async () => {
     await runUntilStopped(runner, {
-      maintenance: () => new SnapshotMaintenance(firebase.firestore, metering, snapshots).sweep(),
+      maintenance: async () => {
+        try { await models.refresh(); }
+        catch (error) { log.warn({ diagnostic: safeErrorDiagnostic(error) }, 'model catalog refresh failed'); }
+        await new SnapshotMaintenance(firebase.firestore, metering, snapshots).sweep();
+      },
       idlePollSeconds: config.RUNNER_IDLE_POLL_SECONDS,
       shouldContinue: () => !shutdown.signal.aborted,
       signal: shutdown.signal,
