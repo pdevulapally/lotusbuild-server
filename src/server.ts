@@ -198,6 +198,27 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
       return { sessionId: session.id, meters: await metering.readOperationUsage(user.uid, session.id) };
     });
 
+    api.get<{ Querystring: { limit?: number } }>('/me/sessions', {
+      preHandler: [api.requireAuth, api.enforceRateLimit('read')],
+      schema: { querystring: { type: 'object', additionalProperties: false,
+        properties: { limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 } } } },
+    }, async (request, reply) => {
+      const user = authenticatedUser(request);
+      const recent = await sessions.listRecentForOwner(user.uid, request.query.limit ?? 20);
+      reply.header('cache-control', 'no-store');
+      return {
+        sessions: recent.map((session) => ({
+          id: session.id,
+          projectId: session.projectId,
+          status: session.status,
+          mode: session.mode,
+          messageCount: session.messageCount,
+          heartbeatAt: session.heartbeatAt?.toISOString() ?? null,
+          createdAt: session.createdAt.toISOString(),
+        })),
+      };
+    });
+
     api.get(
       '/me/usage',
       { preHandler: [api.requireAuth, api.enforceRateLimit('read')] },
