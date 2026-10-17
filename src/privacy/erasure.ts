@@ -58,6 +58,12 @@ export class AccountErasure {
     await this.#db.doc(`familyInvitations/${uid}`).delete();
     await this.#clearCaches(uid);
     await this.#ignoreAbsent(() => this.#auth.deleteUser(uid));
+    // Receipts can contain accepted chat text; they are operational state, not a financial ledger.
+    for (;;) {
+      const receipts = await this.#db.collection('mutationReceipts').where('uid', '==', uid).limit(100).get();
+      if (receipts.empty) break;
+      for (const receipt of receipts.docs) await receipt.ref.delete();
+    }
     // Financial subcollections remain segregated from the removed account profile.
     // Their disposal follows the reviewed retention decision, not blanket account deletion.
     await this.#db.doc(`users/${uid}`).delete();

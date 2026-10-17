@@ -5,6 +5,7 @@ import type { FastifyBaseLogger, FastifyInstance, FastifyReply } from 'fastify';
 import { authenticatedUser, bearerToken } from '../auth/plugin.ts';
 import { aiEfforts, type AiEffort } from '../entitlements/build-admission.ts';
 import { AppError, safeErrorDiagnostic } from '../http/errors.ts';
+import { mutation } from '../http/idempotency.ts';
 import {
   type SessionEvent,
   type SessionEvents,
@@ -183,12 +184,15 @@ export function registerSessionRoutes(
       const user = authenticatedUser(request);
       const defaultEffort = await options.validateModel?.(user.uid, request.body.model, request.body.effort);
       const effort = request.body.effort ?? defaultEffort;
-      const session = await sessions.create(user.uid, request.params.projectId, {
+      const input = {
         prompt: request.body.prompt.trim(),
         model: request.body.model,
         ...(effort === undefined ? {} : { effort }),
         ...(request.body.mode === undefined ? {} : { mode: request.body.mode }),
-      });
+      };
+      const session = await sessions.create(user.uid, request.params.projectId, input, undefined,
+        mutation<BuildSession>(user.uid, `POST /projects/${request.params.projectId}/sessions`,
+          request.headers['idempotency-key'], { ...input, effort: request.body.effort }, (value) => ({ statusCode: 201, body: toResponse(value) })));
       publish(request.log, session.id, 'session.queued', {
         status: session.status,
         model: session.model,
@@ -311,19 +315,26 @@ export function registerSessionRoutes(
       const prompt = request.body.prompt.trim();
       const current = await sessions.readOwned(user.uid, request.params.sessionId);
       const mode = request.body.mode;
+      const operation = <T>(response: (value: T) => { statusCode: number; body: unknown }) =>
+        mutation<T>(user.uid, `POST /sessions/${current.id}/messages`, request.headers['idempotency-key'],
+          { prompt, steer: request.body.steer === true, mode }, response);
+      const queuedOperation = () => operation<QueuedMessage>((value) => ({ statusCode: 202,
+        body: { queued: true, queuedMessage: toQueuedMessageResponse(value) } }));
       // A mode switch applies to the next turn, so it is refused rather than queued behind a running one.
-      if (mode !== undefined && (request.body.steer === true || current.status === 'QUEUED' || current.status === 'RUNNING')) {
+      // Busy-state validation lives after receipt replay inside appendPrompt's transaction.
+      if (mode !== undefined && request.body.steer === true) {
         throw new AppError({ code: 'session/mode-change-busy', statusCode: 409, message: 'Wait for the agent to finish before switching mode.' });
       }
 
       if (request.body.steer === true) {
         if (current.status === 'RUNNING') {
-          await sessions.queueSteerMessage(user.uid, current.id, prompt);
+          await sessions.queueSteerMessage(user.uid, current.id, prompt, operation<void>(() => ({ statusCode: 200,
+            body: { steered: true, sessionId: current.id } })));
           publish(request.log, current.id, 'session.steer', { prompt });
           return reply.code(200).send({ steered: true, sessionId: current.id });
         }
         if (current.status === 'QUEUED') {
-          const queued = await sessions.enqueueMessage(user.uid, current.id, prompt);
+          const queued = await sessions.enqueueMessage(user.uid, current.id, prompt, queuedOperation());
           publish(request.log, current.id, 'session.message_queued', {
             queuedMessageId: queued.id,
             prompt: queued.prompt,
@@ -335,8 +346,8 @@ export function registerSessionRoutes(
         }
       }
 
-      if (current.status === 'QUEUED' || current.status === 'RUNNING') {
-        const queued = await sessions.enqueueMessage(user.uid, current.id, prompt);
+      if (mode === undefined && (current.status === 'QUEUED' || current.status === 'RUNNING')) {
+        const queued = await sessions.enqueueMessage(user.uid, current.id, prompt, queuedOperation());
         publish(request.log, current.id, 'session.message_queued', {
           queuedMessageId: queued.id,
           prompt: queued.prompt,
@@ -347,7 +358,8 @@ export function registerSessionRoutes(
         });
       }
 
-      const session = await sessions.appendPrompt(user.uid, current.id, prompt, mode);
+      const session = await sessions.appendPrompt(user.uid, current.id, prompt, mode,
+        operation<BuildSession>((value) => ({ statusCode: 202, body: { queued: false, session: toResponse(value) } })));
       publish(request.log, session.id, 'session.queued', {
         status: session.status,
         messageCount: session.messageCount,
@@ -432,7 +444,9 @@ export function registerSessionRoutes(
     },
     async (request, reply) => {
       const user = authenticatedUser(request);
-      const session = await sessions.cancel(user.uid, request.params.sessionId);
+      const session = await sessions.cancel(user.uid, request.params.sessionId,
+        mutation<BuildSession>(user.uid, `POST /sessions/${request.params.sessionId}/cancel`,
+          request.headers['idempotency-key'], {}, (value) => ({ statusCode: 200, body: toResponse(value) })));
       if (session.status === 'FAILED') {
         publish(request.log, session.id, 'session.failed', {
           error: session.error ?? 'Cancelled by user',

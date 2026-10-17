@@ -6,6 +6,7 @@ import type { ConfigurationStore } from '../entitlements/store.ts';
 import type { EntitlementService } from '../entitlements/service.ts';
 import { type Platform, platforms } from '../entitlements/schema.ts';
 import { AppError } from '../http/errors.ts';
+import { readMutation, writeMutation, type Mutation } from '../http/idempotency.ts';
 import type { MeteringService } from '../metering/service.ts';
 import type { SnapshotStore, StoredSnapshot } from '../storage/snapshots.ts';
 import { SnapshotMaintenance } from '../storage/maintenance.ts';
@@ -185,7 +186,7 @@ export class ProjectRepository {
    * arriving together both see the old total and both succeed, so the plan limit
    * a customer pays for is bypassed by the simplest possible retry.
    */
-  async create(ownerUid: string, input: NewProject): Promise<Project> {
+  async create(ownerUid: string, input: NewProject, operation?: Mutation<Project>): Promise<Project> {
     this.#validateName(input.name);
     const entitlements = await this.#entitlements.forUser(ownerUid);
 
@@ -207,6 +208,7 @@ export class ProjectRepository {
 
     const createdAt = await this.#firestore.runTransaction(async (transaction) => {
       const user = await this.#users.readInTransaction(transaction, ownerUid);
+      await readMutation(transaction, this.#firestore, operation);
 
       if (user.projectCount >= limit) {
         throw new AppError({
@@ -233,7 +235,13 @@ export class ProjectRepository {
         updatedAt: FieldValue.serverTimestamp(),
       });
 
-      return new Date();
+      const now = new Date();
+      writeMutation(transaction, this.#firestore, operation, {
+        id: ref.id, ownerUid, name: input.name, description: input.description,
+        platform: input.platform, status: 'draft', visibility: 'private', snapshotBytes: 0,
+        snapshot: { kind: 'none' }, activeSessionId: null, createdAt: now,
+      });
+      return now;
     });
 
     return {

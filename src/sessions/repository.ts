@@ -17,6 +17,7 @@ import {
 } from '../entitlements/build-admission.ts';
 import type { ConfigurationStore } from '../entitlements/store.ts';
 import { AppError } from '../http/errors.ts';
+import { readMutation, writeMutation, type Mutation } from '../http/idempotency.ts';
 import type { MeteringService, Reservation } from '../metering/service.ts';
 import { randomUUID } from 'node:crypto';
 
@@ -301,7 +302,7 @@ export class SessionRepository {
    * creation: a plan can be downgraded, and a mobile project created on pro must
    * not keep building after the subscription lapses.
    */
-  async create(uid: string, projectId: string, input: NewSession, idempotencyId?: string): Promise<BuildSession> {
+  async create(uid: string, projectId: string, input: NewSession, idempotencyId?: string, operation?: Mutation<BuildSession>): Promise<BuildSession> {
     this.#validatePrompt(input.prompt);
     if (idempotencyId !== undefined && !/^[A-Za-z0-9_-]{1,128}$/.test(idempotencyId)) throw new Error('Invalid internal session id.');
     const project = await this.#projects.readOwned(uid, projectId);
@@ -317,6 +318,12 @@ export class SessionRepository {
     const collection = this.#firestore.collection(sessionsCollectionPath);
     const ref = idempotencyId === undefined ? collection.doc() : collection.doc(idempotencyId);
     const firstMessage = ref.collection(messagesCollectionName).doc(messageId(0));
+    const result: BuildSession = {
+      id: ref.id, projectId: project.id, ownerUid: uid, status: 'QUEUED',
+      model: input.model, effort, mode, sandboxId: undefined, claimedBy: undefined,
+      leaseToken: undefined, heartbeatAt: undefined, error: undefined,
+      reservationIds: [], specialistReservationIds: [], messageCount: 1, createdAt: now,
+    };
 
     const existing = await this.#firestore.runTransaction(async (transaction) => {
       if (idempotencyId !== undefined) {
@@ -328,6 +335,7 @@ export class SessionRepository {
         }
       }
       const currentProject = await this.#projects.readOwnedInTransaction(transaction, uid, project.id);
+      await readMutation(transaction, this.#firestore, operation);
       this.#assertProjectCanActivate(currentProject);
 
       await this.#metering.consumeIn(transaction, {
@@ -360,28 +368,12 @@ export class SessionRepository {
         activeSessionId: ref.id,
         updatedAt: FieldValue.serverTimestamp(),
       });
+      writeMutation(transaction, this.#firestore, operation, result);
     });
 
     if (existing !== undefined) return existing;
 
-    return {
-      id: ref.id,
-      projectId: project.id,
-      ownerUid: uid,
-      status: 'QUEUED',
-      model: input.model,
-      effort,
-      mode,
-      sandboxId: undefined,
-      claimedBy: undefined,
-      leaseToken: undefined,
-      heartbeatAt: undefined,
-      error: undefined,
-      reservationIds: [],
-      specialistReservationIds: [],
-      messageCount: 1,
-      createdAt: now,
-    };
+    return result;
   }
 
   /** A session owned by someone else is reported as missing, as projects are. */
@@ -497,7 +489,7 @@ export class SessionRepository {
    * silently dropped or race the agent's own message into the transcript, and
    * neither is something the user can see happening.
    */
-  async appendPrompt(uid: string, sessionId: string, prompt: string, mode?: SessionMode): Promise<BuildSession> {
+  async appendPrompt(uid: string, sessionId: string, prompt: string, mode?: SessionMode, operation?: Mutation<BuildSession>): Promise<BuildSession> {
     this.#validatePrompt(prompt);
     const session = await this.readOwned(uid, sessionId);
     const entitlements = await this.#entitlements.forUser(uid);
@@ -522,21 +514,18 @@ export class SessionRepository {
           message: 'No such session.',
         });
       }
+      const project = await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId);
+      await readMutation(transaction, this.#firestore, operation);
       this.#assertPromptRecoveryEligible(current);
       if (current.status === 'QUEUED' || current.status === 'RUNNING') {
         throw new AppError({
-          code: 'session/busy',
+          code: mode === undefined ? 'session/busy' : 'session/mode-change-busy',
           statusCode: 409,
           message: 'This session is still working. Wait for it to finish before sending more.',
           details: { status: current.status },
         });
       }
 
-      const project = await this.#projects.readOwnedInTransaction(
-        transaction,
-        uid,
-        current.projectId,
-      );
       this.#assertProjectCanActivate(project, current.id);
       assertBuildAllowed(entitlements, project.platform, current.model);
 
@@ -569,30 +558,34 @@ export class SessionRepository {
         updatedAt: FieldValue.serverTimestamp(),
       });
 
-      return { ...current, ...(mode !== undefined ? { mode } : {}), status: 'QUEUED' as const, error: undefined, cancelRequested: undefined, messageCount: seq + 1 };
+      const result = { ...current, ...(mode !== undefined ? { mode } : {}), status: 'QUEUED' as const, error: undefined, cancelRequested: undefined, messageCount: seq + 1 };
+      writeMutation(transaction, this.#firestore, operation, result);
+      return result;
     });
   }
 
   /**
    * Staging a prompt in the session queue while a turn is active.
    */
-  async enqueueMessage(uid: string, sessionId: string, prompt: string): Promise<QueuedMessage> {
+  async enqueueMessage(uid: string, sessionId: string, prompt: string, operation?: Mutation<QueuedMessage>): Promise<QueuedMessage> {
     this.#validatePrompt(prompt);
     const entitlements = await this.#entitlements.forUser(uid);
     const limit = await this.#queueLimit(entitlements);
     const parent = this.#ref(sessionId);
     const ref = parent.collection(queuedMessagesCollectionName).doc();
+    const result = { id: ref.id, sessionId, prompt, createdAt: new Date() };
     await this.#firestore.runTransaction(async (transaction) => {
       const snapshot = await transaction.get(parent);
       if (!snapshot.exists || snapshot.data()?.['ownerUid'] !== uid) {
         throw new AppError({ code: 'session/not-found', statusCode: 404, message: 'No such session.' });
       }
       const session = parseSession(snapshot.id, snapshot.data() ?? {}, parent.path);
+      const project = await this.#projects.readOwnedInTransaction(transaction, uid, session.projectId);
+      await readMutation(transaction, this.#firestore, operation);
       this.#assertPromptRecoveryEligible(session);
       if (!isActiveSessionStatus(session.status) || session.cancelRequested === true) {
         throw new AppError({ code: 'session/not-active', statusCode: 409, message: 'This session is no longer accepting queued messages.' });
       }
-      const project = await this.#projects.readOwnedInTransaction(transaction, uid, session.projectId);
       this.#assertProjectGuard(project, session);
       assertBuildAllowed(entitlements, project.platform, session.model);
       const queued = await transaction.get(parent.collection(queuedMessagesCollectionName).limit(limit + 1));
@@ -602,8 +595,9 @@ export class SessionRepository {
       transaction.create(ref, { prompt, createdAt: FieldValue.serverTimestamp() });
       // Enqueue and deletion/dequeue share this parent conflict boundary.
       transaction.update(parent, { updatedAt: FieldValue.serverTimestamp() });
+      writeMutation(transaction, this.#firestore, operation, result);
     });
-    return { id: ref.id, sessionId, prompt, createdAt: new Date() };
+    return result;
   }
 
   // There is no reason to stage more builds than the plan permits in a whole
@@ -712,7 +706,7 @@ export class SessionRepository {
   }
 
   /** Redis is only a notification: acceptance commits before the API acknowledges. */
-  async queueSteerMessage(uid: string, sessionId: string, prompt: string): Promise<void> {
+  async queueSteerMessage(uid: string, sessionId: string, prompt: string, operation?: Mutation<void>): Promise<void> {
     this.#validatePrompt(prompt);
     const entitlements = await this.#entitlements.forUser(uid);
     const ref = this.#ref(sessionId);
@@ -722,14 +716,16 @@ export class SessionRepository {
         throw new AppError({ code: 'session/not-found', statusCode: 404, message: 'No such session.' });
       }
       const session = parseSession(snapshot.id, snapshot.data() ?? {}, ref.path);
+      const project = await this.#projects.readOwnedInTransaction(transaction, uid, session.projectId);
+      await readMutation(transaction, this.#firestore, operation);
       this.#assertPromptRecoveryEligible(session);
       if (session.status !== 'RUNNING' || session.cancelRequested === true) {
         throw new AppError({ code: 'session/not-running', statusCode: 409, message: 'This session is no longer accepting steering instructions.' });
       }
-      const project = await this.#projects.readOwnedInTransaction(transaction, uid, session.projectId);
       this.#assertProjectGuard(project, session);
       assertBuildAllowed(entitlements, project.platform, session.model);
       transaction.update(ref, { pendingSteer: prompt, updatedAt: FieldValue.serverTimestamp() });
+      writeMutation(transaction, this.#firestore, operation, undefined);
     });
   }
 
@@ -796,7 +792,7 @@ export class SessionRepository {
    * If the session is RUNNING, cancelRequested is set to true so the active runner halts on its
    * next step, tears down resources, and transitions the session to FAILED.
    */
-  async cancel(uid: string, sessionId: string): Promise<BuildSession> {
+  async cancel(uid: string, sessionId: string, operation?: Mutation<BuildSession>): Promise<BuildSession> {
     const session = await this.readOwned(uid, sessionId);
     const entitlements = await this.#entitlements.forUser(uid);
     const { registry } = await this.#configuration.get();
@@ -821,6 +817,8 @@ export class SessionRepository {
         });
       }
 
+      const project = await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId, true);
+      await readMutation(transaction, this.#firestore, operation);
       if (current.status === 'IDLE' || current.status === 'FAILED') {
         throw new AppError({
           code: 'session/not-cancellable',
@@ -831,12 +829,6 @@ export class SessionRepository {
       }
 
 
-      const project = await this.#projects.readOwnedInTransaction(
-        transaction,
-        uid,
-        current.projectId,
-        true,
-      );
       this.#assertProjectGuard(project, current);
 
       if (current.status === 'QUEUED') {
@@ -863,12 +855,14 @@ export class SessionRepository {
           updatedAt: FieldValue.serverTimestamp(),
         });
 
-        return {
+        const result = {
           ...current,
           status: 'FAILED' as const,
           error: 'Cancelled by user',
           cancelRequested: undefined,
         };
+        writeMutation(transaction, this.#firestore, operation, result);
+        return result;
       }
 
       transaction.update(ref, {
@@ -876,10 +870,12 @@ export class SessionRepository {
         updatedAt: FieldValue.serverTimestamp(),
       });
 
-      return {
+      const result = {
         ...current,
         cancelRequested: true,
       };
+      writeMutation(transaction, this.#firestore, operation, result);
+      return result;
     });
   }
 
