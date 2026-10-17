@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { fixtureModels } from './support/models.ts';
 import test, { type TestContext } from 'node:test';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -114,7 +115,7 @@ function fixture(t: TestContext) {
   data.set('sessions/s', { ownerUid: 'u', projectId: 'p', status: 'QUEUED', model: entitlements.capabilities.stringList('ai.model.allowlist')[0],
     effort: 'high', claimableAt: Timestamp.now(), messageCount: 1, createdAt: Timestamp.now() });
   data.set('sessions/s/messages/000000', { role: 'user', content: 'Build', createdAt: Timestamp.now() });
-  const runner = (runnerId: string) => new SessionRunner({ runnerId, anthropic, sessions, projects, metering, configuration,
+  const runner = (runnerId: string) => new SessionRunner({ models: fixtureModels, runnerId, anthropic, sessions, projects, metering, configuration,
     entitlements: entitlementService, sandboxes, persistence, events: { subscribe: async () => () => {}, append: async () => {} },
     limits: { maxSteps: 2, maxOutputTokens: 10, toolOutputMaxChars: 4096, maxSpecialistConsultations: 0,
       specialistMaxSteps: 1, commandTimeoutMs: 10000, previewReadyTimeoutSeconds: 1 }, heartbeatSeconds: 60, messageHistoryLimit: 10, log,

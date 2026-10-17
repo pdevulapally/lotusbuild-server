@@ -418,6 +418,24 @@ export class SessionRepository {
   }
 
   /**
+   * The owner's newest sessions across all projects, for the activity inbox.
+   * Equality-only on `ownerUid` so no composite index is needed; ordering is
+   * done in memory over a bounded read.
+   */
+  async listRecentForOwner(ownerUid: string, limit: number): Promise<readonly BuildSession[]> {
+    const snapshot = await this.#firestore
+      .collection(sessionsCollectionPath)
+      .where('ownerUid', '==', ownerUid)
+      .limit(500)
+      .get();
+    return snapshot.docs
+      .map((doc) => parseSession(doc.id, doc.data(), doc.ref.path))
+      .filter((session) => session.ownerUid === ownerUid)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+      .slice(0, limit);
+  }
+
+  /**
    * The most recent `limit` messages, in chronological order.
    *
    * Every caller — the primary agent's context and the message-history route
@@ -443,13 +461,35 @@ export class SessionRepository {
   }
 
   /**
+   * The latest session's transcript for a project the caller has already been
+   * authorised to read through `ProjectRepository.readShared`. Never call it
+   * without that check: it does not prove ownership itself.
+   */
+  async sharedTranscript(projectId: string, limit: number): Promise<readonly SessionMessage[]> {
+    const latest = await this.#firestore
+      .collection(sessionsCollectionPath)
+      .where('projectId', '==', projectId)
+      .orderBy('createdAt', 'desc')
+      .limit(1)
+      .get();
+    const session = latest.docs[0];
+    if (session === undefined) return [];
+    const messages = await this.#ref(session.id)
+      .collection(messagesCollectionName)
+      .orderBy(FieldPath.documentId(), 'desc')
+      .limit(limit)
+      .get();
+    return messages.docs.map((doc) => parseMessage(doc.id, doc.data(), doc.ref.path)).reverse();
+  }
+
+  /**
    * Adds the user's next turn and puts the session back in the queue.
    *
    * Refused while a runner holds it: a prompt arriving mid-build would either be
    * silently dropped or race the agent's own message into the transcript, and
    * neither is something the user can see happening.
    */
-  async appendPrompt(uid: string, sessionId: string, prompt: string, operation?: Mutation<BuildSession>): Promise<BuildSession> {
+  async appendPrompt(uid: string, sessionId: string, prompt: string, mode?: SessionMode, operation?: Mutation<BuildSession>): Promise<BuildSession> {
     this.#validatePrompt(prompt);
     const session = await this.readOwned(uid, sessionId);
     const entitlements = await this.#entitlements.forUser(uid);
@@ -479,7 +519,7 @@ export class SessionRepository {
       this.#assertPromptRecoveryEligible(current);
       if (current.status === 'QUEUED' || current.status === 'RUNNING') {
         throw new AppError({
-          code: 'session/busy',
+          code: mode === undefined ? 'session/busy' : 'session/mode-change-busy',
           statusCode: 409,
           message: 'This session is still working. Wait for it to finish before sending more.',
           details: { status: current.status },
@@ -506,6 +546,7 @@ export class SessionRepository {
       });
       transaction.update(ref, {
         status: 'QUEUED',
+        ...(mode !== undefined ? { mode } : {}),
         messageCount: FieldValue.increment(1),
         claimableAt: Timestamp.fromDate(now),
         cancelRequested: FieldValue.delete(),
@@ -517,7 +558,7 @@ export class SessionRepository {
         updatedAt: FieldValue.serverTimestamp(),
       });
 
-      const result = { ...current, status: 'QUEUED' as const, error: undefined, cancelRequested: undefined, messageCount: seq + 1 };
+      const result = { ...current, ...(mode !== undefined ? { mode } : {}), status: 'QUEUED' as const, error: undefined, cancelRequested: undefined, messageCount: seq + 1 };
       writeMutation(transaction, this.#firestore, operation, result);
       return result;
     });

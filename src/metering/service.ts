@@ -292,6 +292,30 @@ export class MeteringService {
   /**
    * Reads the current usage summary across all declared meters for a user.
    */
+  /** What one operation (a session) has drawn from each meter: settled holds, plus holds still open. */
+  async readOperationUsage(uid: string, operationId: string): Promise<readonly { meterKey: string; unit: string; label: string; settled: number; open: number }[]> {
+    const { registry } = await this.#configuration.get();
+    const snapshot = await this.#firestore
+      .collection(`${usersCollectionPath}/${uid}/${reservationsCollectionName}`)
+      .where('operationId', '==', operationId)
+      .limit(500)
+      .get();
+    const totals = new Map<string, { settled: number; open: number }>();
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      const meterKey = data['meterKey'];
+      if (typeof meterKey !== 'string' || !registry.meters.has(meterKey)) continue;
+      const entry = totals.get(meterKey) ?? { settled: 0, open: 0 };
+      if (data['status'] === 'SETTLED' && Number.isSafeInteger(data['settledQuantity'])) entry.settled += data['settledQuantity'] as number;
+      else if (data['status'] === 'OPEN' && Number.isSafeInteger(data['estimatedQuantity'])) entry.open += data['estimatedQuantity'] as number;
+      totals.set(meterKey, entry);
+    }
+    return [...totals].map(([meterKey, total]) => {
+      const meter = registry.meters.get(meterKey)!;
+      return { meterKey, unit: meter.unit, label: meter.label, ...total };
+    });
+  }
+
   async readUsageBreakdown(
     uid: string,
     entitlements: UserEntitlements,

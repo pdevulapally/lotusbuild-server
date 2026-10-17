@@ -5,7 +5,6 @@ import type {
   Message,
   MessageParam,
   MessageStreamEvent,
-  OutputConfig,
   Tool,
   ToolUnion,
   ToolUseBlock,
@@ -64,8 +63,8 @@ export interface SpecialistCompleted extends SpecialistStarted {
 
 export interface AgentEvents {
   text(delta: string): void;
-  toolCall(name: string, input: Record<string, unknown>): Promise<void>;
-  toolResult(name: string, result: { text: string; isError: boolean }): Promise<void>;
+  toolCall(name: string, input: Record<string, unknown>, callId?: string): Promise<void>;
+  toolResult(name: string, result: { text: string; isError: boolean }, callId?: string): Promise<void>;
   preview(preview: { url: string; port: number }): Promise<void>;
   step(step: { number: number; of: number; steered?: boolean }): Promise<void>;
   specialistStarted(detail: SpecialistStarted): Promise<void>;
@@ -552,9 +551,9 @@ interface ModelLoopInput {
   readonly onProblem: ProblemReporter;
   readonly onText?: ((delta: string) => void) | undefined;
   readonly onStep?: ((step: { number: number; of: number; steered?: boolean }) => Promise<void>) | undefined;
-  readonly onToolCall?: ((name: string, input: Record<string, unknown>) => Promise<void>) | undefined;
+  readonly onToolCall?: ((name: string, input: Record<string, unknown>, callId?: string) => Promise<void>) | undefined;
   readonly onToolResult?:
-    | ((name: string, result: { text: string; isError: boolean }) => Promise<void>)
+    | ((name: string, result: { text: string; isError: boolean }, callId?: string) => Promise<void>)
     | undefined;
   /** Injects a pending user correction before the next call. */
   readonly beforeStep?: (() => string | undefined | Promise<string | undefined>) | undefined;
@@ -595,8 +594,6 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
     ...(input.computer === undefined ? [] : [input.computer.toolset]),
   ];
   const spoken: string[] = [];
-  const providerEffort: NonNullable<OutputConfig['effort']> =
-    input.effort === 'standard' ? 'medium' : input.effort;
 
   for (let step = 1; step <= input.maxSteps; step += 1) {
     input.assertStillOurs();
@@ -620,8 +617,8 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
         system: input.system,
         tools: [...specs],
         messages: input.conversation,
-        output_config: { effort: providerEffort },
       },
+      effort: input.effort,
       maxOutputTokens: input.maxOutputTokens, signal: input.signal,
       ...(input.outputReservationId === undefined ? {} : { outputReservationId: input.outputReservationId }),
     });
@@ -635,17 +632,13 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
       const params = {
         // From the session, which took it from the plan's allowlist. Never a
         // literal: which model a plan may use is a commercial decision.
-        model: input.model,
-        max_tokens: input.maxOutputTokens,
+        ...admitted.params,
+        max_tokens: admitted.maxOutputTokens,
         // An agent turn resends the whole conversation, so the prefix is paid for
         // again on every step. Caching the last cacheable block means each step
         // writes the prefix once and the next step reads it at a fraction of the
         // rate — the same tokens, most of the cost removed.
         cache_control: { type: 'ephemeral' as const },
-        system: input.system,
-        tools: [...specs],
-        messages: input.conversation,
-        output_config: { effort: providerEffort },
       };
       // Only the generation SDK invocation crosses this boundary, not admission,
       // parameter preparation or the marker. A synchronous SDK throw is uncertain.
@@ -754,7 +747,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
       input.assertStillOurs();
       input.signal.throwIfAborted();
       const toolInput = (toolUse.input ?? {}) as Record<string, unknown>;
-      await input.onToolCall?.(toolUse.name, toolInput);
+      await input.onToolCall?.(toolUse.name, toolInput, toolUse.id);
       input.assertStillOurs();
       input.signal.throwIfAborted();
       if (input.computer !== undefined && toolUse.toolset_name === computerToolsetName) {
@@ -764,7 +757,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
         if (outcome.isError) computerFailed = true;
         input.assertStillOurs();
         input.signal.throwIfAborted();
-        await input.onToolResult?.(toolUse.name, outcome);
+        await input.onToolResult?.(toolUse.name, outcome, toolUse.id);
         return {
           type: 'tool_result',
           tool_use_id: toolUse.id,
@@ -778,7 +771,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
       const result = await runTool(toolUse.name, toolInput, input.toolContext, input.tools);
       input.assertStillOurs();
       input.signal.throwIfAborted();
-      await input.onToolResult?.(toolUse.name, result);
+      await input.onToolResult?.(toolUse.name, result, toolUse.id);
       return {
         type: 'tool_result',
         tool_use_id: toolUse.id,

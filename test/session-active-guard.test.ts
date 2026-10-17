@@ -1107,3 +1107,19 @@ test('steering accepted after the last step is scheduled without an additional b
   assert.equal(h.charges(), 1);
   assert.equal((await h.sessions.listMessages('user-1', created.id, 100)).at(-1)?.content, 'Late correction');
 });
+
+test('plan approval retries replay the accepted mode change while the session is queued', async (t) => {
+  const h = harness(); h.seedSession('approval-retry', 'project-1', 'IDLE');
+  h.firestore.seed('sessions/approval-retry', { ...h.session('approval-retry'), mode: 'plan' });
+  assert.equal(h.session('approval-retry')?.['mode'], 'plan');
+  const app = await routeApp(h); t.after(() => app.close());
+  const request = { method: 'POST' as const, url: '/sessions/approval-retry/messages',
+    headers: { ...authHeaders, 'idempotency-key': 'approve-plan-operation-1' }, payload: { prompt: 'Build the reviewed plan', mode: 'build' } };
+  const first = await app.inject(request);
+  assert.equal(first.statusCode, 202); assert.equal(first.json().session.mode, 'build');
+  const replay = await app.inject(request);
+  assert.equal(replay.statusCode, 202); assert.deepEqual(replay.json(), first.json());
+  const conflict = await app.inject({ ...request, payload: { prompt: 'Build the reviewed plan', mode: 'plan' } });
+  assert.equal(conflict.statusCode, 409); assert.equal(conflict.json().error.code, 'request/idempotency-conflict');
+  assert.equal(h.charges(), 1);
+});

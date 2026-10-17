@@ -1,3 +1,4 @@
+import { ProjectFiles } from './projects/files.ts';
 import { safeErrorDiagnostic } from './http/errors.ts';
 import { BillingRepository } from './billing/repository.ts';
 import { createStripe } from './billing/stripe.ts';
@@ -86,6 +87,7 @@ async function main(): Promise<void> {
   catch { throw new EnvironmentError(['REDIS_URL subscriber connection failed.']); }
 
   const app = buildServer(config, {
+    projectFiles: new ProjectFiles(snapshots),
     privacyRequests: new PrivacyRequests(firebase.firestore),
     family: new FamilyService(firebase.firestore, config.FAMILY_INVITATION_TTL_SECONDS),
     firebaseAuth: firebase.auth,

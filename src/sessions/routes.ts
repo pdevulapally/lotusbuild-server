@@ -36,6 +36,7 @@ const promptText = '^[^\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F]+$';
 const modelIdentifier = '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$';
 
 export interface SessionRouteOptions {
+  readonly validateModel?: (uid: string, model: string, effort?: AiEffort) => Promise<AiEffort | undefined>;
   /**
    * How often a comment is written down an idle stream. Proxies and load
    * balancers close a connection that has said nothing, and the client cannot
@@ -69,7 +70,7 @@ function toResponse(session: BuildSession) {
   };
 }
 
-function toMessageResponse(message: SessionMessage) {
+export function toMessageResponse(message: SessionMessage) {
   return {
     seq: message.seq,
     role: message.role,
@@ -181,15 +182,17 @@ export function registerSessionRoutes(
     },
     async (request, reply) => {
       const user = authenticatedUser(request);
+      const defaultEffort = await options.validateModel?.(user.uid, request.body.model, request.body.effort);
+      const effort = request.body.effort ?? defaultEffort;
       const input = {
         prompt: request.body.prompt.trim(),
         model: request.body.model,
-        ...(request.body.effort === undefined ? {} : { effort: request.body.effort }),
+        ...(effort === undefined ? {} : { effort }),
         ...(request.body.mode === undefined ? {} : { mode: request.body.mode }),
       };
       const session = await sessions.create(user.uid, request.params.projectId, input, undefined,
         mutation<BuildSession>(user.uid, `POST /projects/${request.params.projectId}/sessions`,
-          request.headers['idempotency-key'], input, (value) => ({ statusCode: 201, body: toResponse(value) })));
+          request.headers['idempotency-key'], { ...input, effort: request.body.effort }, (value) => ({ statusCode: 201, body: toResponse(value) })));
       publish(request.log, session.id, 'session.queued', {
         status: session.status,
         model: session.model,
@@ -277,7 +280,7 @@ export function registerSessionRoutes(
     },
   );
 
-  app.post<{ Params: { sessionId: string }; Body: { prompt: string; steer?: boolean } }>(
+  app.post<{ Params: { sessionId: string }; Body: { prompt: string; steer?: boolean; mode?: (typeof sessionModes)[number] } }>(
     '/sessions/:sessionId/messages',
     {
       preHandler: [app.requireAuth, app.requireVerifiedEmail, app.enforceRateLimit('build')],
@@ -302,6 +305,7 @@ export function registerSessionRoutes(
             steer: {
               type: 'boolean',
             },
+            mode: { type: 'string', enum: [...sessionModes] },
           },
         },
       },
@@ -310,11 +314,17 @@ export function registerSessionRoutes(
       const user = authenticatedUser(request);
       const prompt = request.body.prompt.trim();
       const current = await sessions.readOwned(user.uid, request.params.sessionId);
+      const mode = request.body.mode;
       const operation = <T>(response: (value: T) => { statusCode: number; body: unknown }) =>
         mutation<T>(user.uid, `POST /sessions/${current.id}/messages`, request.headers['idempotency-key'],
-          { prompt, steer: request.body.steer === true }, response);
+          { prompt, steer: request.body.steer === true, mode }, response);
       const queuedOperation = () => operation<QueuedMessage>((value) => ({ statusCode: 202,
         body: { queued: true, queuedMessage: toQueuedMessageResponse(value) } }));
+      // A mode switch applies to the next turn, so it is refused rather than queued behind a running one.
+      // Busy-state validation lives after receipt replay inside appendPrompt's transaction.
+      if (mode !== undefined && request.body.steer === true) {
+        throw new AppError({ code: 'session/mode-change-busy', statusCode: 409, message: 'Wait for the agent to finish before switching mode.' });
+      }
 
       if (request.body.steer === true) {
         if (current.status === 'RUNNING') {
@@ -336,7 +346,7 @@ export function registerSessionRoutes(
         }
       }
 
-      if (current.status === 'QUEUED' || current.status === 'RUNNING') {
+      if (mode === undefined && (current.status === 'QUEUED' || current.status === 'RUNNING')) {
         const queued = await sessions.enqueueMessage(user.uid, current.id, prompt, queuedOperation());
         publish(request.log, current.id, 'session.message_queued', {
           queuedMessageId: queued.id,
@@ -348,7 +358,7 @@ export function registerSessionRoutes(
         });
       }
 
-      const session = await sessions.appendPrompt(user.uid, current.id, prompt,
+      const session = await sessions.appendPrompt(user.uid, current.id, prompt, mode,
         operation<BuildSession>((value) => ({ statusCode: 202, body: { queued: false, session: toResponse(value) } })));
       publish(request.log, session.id, 'session.queued', {
         status: session.status,

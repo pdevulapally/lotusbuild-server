@@ -105,7 +105,7 @@ const project: Project = {
   name: 'Project',
   description: undefined,
   platform: 'web',
-  status: 'draft',
+  status: 'draft', visibility: 'private',
   snapshotBytes: 0,
   snapshot: { kind: 'none' },
   activeSessionId: 'session-1',
@@ -472,7 +472,8 @@ async function turn(options: {
     withValidationSandbox: sandbox instanceof ValidationSandbox ? sandbox.withCopy.bind(sandbox) : undefined,
     // Agent orchestration tests inject the billing boundary. The real admission
     // service's reserve-before-dispatch protocol is covered independently.
-    admission: { begin: async ({ outputReservationId }) => ({ settle: async (usage) => {
+    admission: { begin: async ({ outputReservationId, params, maxOutputTokens, effort }) => ({
+      params: { ...params, output_config: { effort: effort === 'standard' ? 'medium' : effort } }, maxOutputTokens, settle: async (usage) => {
       if (options.failSpecialistInput === true && outputReservationId !== undefined) throw new Error('Input settlement failed');
       if (usage.input !== undefined && usage.input > 0) await metering.consume({ meterKey: 'ai.tokens.input', quantity: usage.input });
       if (outputReservationId === undefined && usage.output !== undefined && usage.output > 0) {
