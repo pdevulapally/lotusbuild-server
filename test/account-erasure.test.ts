@@ -18,6 +18,13 @@ function fixture() {
   { cancel: async () => { events.push('cancel'); } } as unknown as SessionRepository, async () => { events.push('clear-cache'); });
   return { ...h, events, service };
 }
+test('account erasure removes operational receipts containing chat data only for that account', async () => {
+  const h = fixture();
+  h.data.set('mutationReceipts/a', { uid: 'u', body: { prompt: 'Private instruction' } });
+  h.data.set('mutationReceipts/b', { uid: 'another-user', body: {} });
+  await h.service.apply('u', decision);
+  assert.ok(!h.data.has('mutationReceipts/a')); assert.ok(h.data.has('mutationReceipts/b'));
+});
 test('erasure disables access but waits for active work without deleting project data', async () => {
   const h = fixture();
   h.data.set('sessions/s', { ownerUid: 'u', status: 'RUNNING' });

@@ -5,6 +5,7 @@ import type { FastifyBaseLogger, FastifyInstance, FastifyReply } from 'fastify';
 import { authenticatedUser, bearerToken } from '../auth/plugin.ts';
 import { aiEfforts, type AiEffort } from '../entitlements/build-admission.ts';
 import { AppError, safeErrorDiagnostic } from '../http/errors.ts';
+import { mutation } from '../http/idempotency.ts';
 import {
   type SessionEvent,
   type SessionEvents,
@@ -180,12 +181,15 @@ export function registerSessionRoutes(
     },
     async (request, reply) => {
       const user = authenticatedUser(request);
-      const session = await sessions.create(user.uid, request.params.projectId, {
+      const input = {
         prompt: request.body.prompt.trim(),
         model: request.body.model,
         ...(request.body.effort === undefined ? {} : { effort: request.body.effort }),
         ...(request.body.mode === undefined ? {} : { mode: request.body.mode }),
-      });
+      };
+      const session = await sessions.create(user.uid, request.params.projectId, input, undefined,
+        mutation<BuildSession>(user.uid, `POST /projects/${request.params.projectId}/sessions`,
+          request.headers['idempotency-key'], input, (value) => ({ statusCode: 201, body: toResponse(value) })));
       publish(request.log, session.id, 'session.queued', {
         status: session.status,
         model: session.model,
@@ -306,15 +310,21 @@ export function registerSessionRoutes(
       const user = authenticatedUser(request);
       const prompt = request.body.prompt.trim();
       const current = await sessions.readOwned(user.uid, request.params.sessionId);
+      const operation = <T>(response: (value: T) => { statusCode: number; body: unknown }) =>
+        mutation<T>(user.uid, `POST /sessions/${current.id}/messages`, request.headers['idempotency-key'],
+          { prompt, steer: request.body.steer === true }, response);
+      const queuedOperation = () => operation<QueuedMessage>((value) => ({ statusCode: 202,
+        body: { queued: true, queuedMessage: toQueuedMessageResponse(value) } }));
 
       if (request.body.steer === true) {
         if (current.status === 'RUNNING') {
-          await sessions.queueSteerMessage(user.uid, current.id, prompt);
+          await sessions.queueSteerMessage(user.uid, current.id, prompt, operation<void>(() => ({ statusCode: 200,
+            body: { steered: true, sessionId: current.id } })));
           publish(request.log, current.id, 'session.steer', { prompt });
           return reply.code(200).send({ steered: true, sessionId: current.id });
         }
         if (current.status === 'QUEUED') {
-          const queued = await sessions.enqueueMessage(user.uid, current.id, prompt);
+          const queued = await sessions.enqueueMessage(user.uid, current.id, prompt, queuedOperation());
           publish(request.log, current.id, 'session.message_queued', {
             queuedMessageId: queued.id,
             prompt: queued.prompt,
@@ -327,7 +337,7 @@ export function registerSessionRoutes(
       }
 
       if (current.status === 'QUEUED' || current.status === 'RUNNING') {
-        const queued = await sessions.enqueueMessage(user.uid, current.id, prompt);
+        const queued = await sessions.enqueueMessage(user.uid, current.id, prompt, queuedOperation());
         publish(request.log, current.id, 'session.message_queued', {
           queuedMessageId: queued.id,
           prompt: queued.prompt,
@@ -338,7 +348,8 @@ export function registerSessionRoutes(
         });
       }
 
-      const session = await sessions.appendPrompt(user.uid, current.id, prompt);
+      const session = await sessions.appendPrompt(user.uid, current.id, prompt,
+        operation<BuildSession>((value) => ({ statusCode: 202, body: { queued: false, session: toResponse(value) } })));
       publish(request.log, session.id, 'session.queued', {
         status: session.status,
         messageCount: session.messageCount,
@@ -423,7 +434,9 @@ export function registerSessionRoutes(
     },
     async (request, reply) => {
       const user = authenticatedUser(request);
-      const session = await sessions.cancel(user.uid, request.params.sessionId);
+      const session = await sessions.cancel(user.uid, request.params.sessionId,
+        mutation<BuildSession>(user.uid, `POST /sessions/${request.params.sessionId}/cancel`,
+          request.headers['idempotency-key'], {}, (value) => ({ statusCode: 200, body: toResponse(value) })));
       if (session.status === 'FAILED') {
         publish(request.log, session.id, 'session.failed', {
           error: session.error ?? 'Cancelled by user',

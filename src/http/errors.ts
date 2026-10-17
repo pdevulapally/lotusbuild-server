@@ -1,5 +1,6 @@
 import type { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { configurationKeys } from '../config/index.ts';
+import { MutationReplay } from './mutation-response.ts';
 
 /**
  * The single error shape the API ever returns:
@@ -155,6 +156,9 @@ function body(
 
 export function registerErrorHandler(app: FastifyInstance): void {
   app.setErrorHandler((error: FastifyError | AppError, request: FastifyRequest, reply: FastifyReply) => {
+    if (error instanceof MutationReplay) {
+      return reply.code(error.response.statusCode).send(error.response.body);
+    }
     if (error instanceof AppError) {
       if (error.statusCode >= 500) {
         // Internal configuration values and provider diagnostics are not public

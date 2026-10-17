@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 
 import { authenticatedUser } from '../auth/plugin.ts';
+import { mutation } from '../http/idempotency.ts';
 import type { Platform } from '../entitlements/schema.ts';
 import {
   type Project,
@@ -89,11 +90,14 @@ export function registerProjectRoutes(app: FastifyInstance, projects: ProjectRep
     },
     async (request, reply) => {
       const user = authenticatedUser(request);
-      const project = await projects.create(user.uid, {
+      const input = {
         name: request.body.name.trim(),
         description: request.body.description?.trim(),
         platform: newProjectPlatform,
-      });
+      };
+      const project = await projects.create(user.uid, input,
+        mutation<Project>(user.uid, 'POST /projects', request.headers['idempotency-key'], input,
+          (value) => ({ statusCode: 201, body: toResponse(value) })));
       return reply.code(201).send(toResponse(project));
     },
   );
