@@ -83,16 +83,22 @@ ssh lotusbuild-vps 'chmod 600 ~/apps/lotusbuild-server/.env ~/apps/lotusbuild-se
 Email/password sign-ups also require these values in the server `.env`:
 
 ```dotenv
-RESEND_API_KEY=<Resend API key>
-EMAIL_VERIFICATION_FROM=LotusBuild <verify@mail.lotusbuild.co.uk>
+BREVO_API_KEY=<Brevo API key>
+EMAIL_VERIFICATION_FROM=verify@mail.lotusbuild.co.uk
 EMAIL_VERIFICATION_CODE_SECRET=<at least 32 random bytes, unique to this environment>
 EMAIL_VERIFICATION_CODE_TTL_SECONDS=600
 EMAIL_VERIFICATION_RESEND_SECONDS=60
 EMAIL_VERIFICATION_MAX_ATTEMPTS=5
+EMAIL_VERIFICATION_MAX_CODES_PER_DAY=10
+EMAIL_DAILY_SEND_LIMIT=300
 ```
 
+Verify the `mail.lotusbuild.co.uk` sender domain in Brevo before enabling
+verification emails. The free plan allows 300 sends per day for the entire
+Brevo account, so keep `EMAIL_DAILY_SEND_LIMIT` at or below 300.
+
 Keep the API key and code secret in the deployment secret store, not in Git. Before
-enabling sign-ups, verify `mail.lotusbuild.co.uk` in Resend using the DNS records
+enabling sign-ups, verify `mail.lotusbuild.co.uk` in Brevo using the DNS records
 shown in its dashboard and send a real code to an address outside the LotusBuild
 domain. Google accounts that Firebase already marks verified do not use this flow.
 

@@ -11,6 +11,9 @@ interface VerificationOptions {
   readonly ttlSeconds: number;
   readonly resendSeconds: number;
   readonly maxAttempts: number;
+  readonly dailyLimit: number;
+  readonly perAccountDailyLimit: number;
+  readonly now?: () => Date;
 }
 
 export interface VerificationCodeSent {
@@ -36,6 +39,32 @@ end
 return attempts
 `;
 
+const RESERVE_DAILY_SEND_SCRIPT = `
+local userCount = redis.call('INCR', KEYS[1])
+if userCount == 1 then
+  redis.call('EXPIRE', KEYS[1], 172800)
+end
+if userCount > tonumber(ARGV[1]) then
+  redis.call('DECR', KEYS[1])
+  return -1
+end
+local count = redis.call('INCR', KEYS[2])
+if count == 1 then
+  redis.call('EXPIRE', KEYS[2], 172800)
+end
+if count > tonumber(ARGV[2]) then
+  redis.call('DECR', KEYS[2])
+  redis.call('DECR', KEYS[1])
+  return -2
+end
+return count
+`;
+
+function retryAfterUtcMidnight(now: Date): number {
+  const nextMidnightUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
+  return Math.max(1, Math.ceil((nextMidnightUtc - now.getTime()) / 1000));
+}
+
 function normalizedEmail(value: string | undefined): string | undefined {
   const email = value?.trim().toLowerCase();
   return email === undefined || email === '' ? undefined : email;
@@ -46,12 +75,14 @@ export class EmailVerificationService {
   readonly #auth: Auth;
   readonly #sender: EmailSender;
   readonly #options: VerificationOptions;
+  readonly #now: () => Date;
 
   constructor(redis: Redis, auth: Auth, sender: EmailSender, options: VerificationOptions) {
     this.#redis = redis;
     this.#auth = auth;
     this.#sender = sender;
     this.#options = options;
+    this.#now = options.now ?? (() => new Date());
   }
 
   #codeKey(uid: string): string {
@@ -60,6 +91,14 @@ export class EmailVerificationService {
 
   #cooldownKey(uid: string): string {
     return `${redisKeyPrefixes.emailVerification}cooldown:${uid}`;
+  }
+
+  #dailyKey(date: Date): string {
+    return `${redisKeyPrefixes.emailVerification}daily:${date.toISOString().slice(0, 10)}`;
+  }
+
+  #userDailyKey(uid: string, date: Date): string {
+    return `${redisKeyPrefixes.emailVerification}user-daily:${uid}:${date.toISOString().slice(0, 10)}`;
   }
 
   #hash(uid: string, email: string, nonce: string, code: string): string {
@@ -105,28 +144,66 @@ export class EmailVerificationService {
       });
     }
 
+    const now = this.#now();
+    const dailyKey = this.#dailyKey(now);
+    const userDailyKey = this.#userDailyKey(uid, now);
+    const reservation = Number(await this.#redis.eval(
+      RESERVE_DAILY_SEND_SCRIPT,
+      2,
+      userDailyKey,
+      dailyKey,
+      String(this.#options.perAccountDailyLimit),
+      String(this.#options.dailyLimit),
+    ));
+    if (reservation < 0) {
+      await this.#redis.del(this.#cooldownKey(uid));
+      const retryAfterSeconds = retryAfterUtcMidnight(now);
+      if (reservation === -1) {
+        throw new AppError({
+          code: 'auth/verification-code-daily-limit',
+          statusCode: 429,
+          message: 'Too many codes requested today. Try again after midnight UTC.',
+          details: { retryAfterSeconds },
+        });
+      }
+      throw new AppError({
+        code: 'email/daily-limit-reached',
+        statusCode: 503,
+        message: "We've reached today's limit for verification emails. Try again after midnight UTC.",
+        details: { retryAfterSeconds },
+      });
+    }
+
     const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
     const nonce = randomBytes(16).toString('hex');
     const requestId = randomUUID();
     const key = this.#codeKey(uid);
-    await this.#redis
-      .multi()
-      .hset(key, {
-        requestId,
-        email,
-        nonce,
-        codeHash: this.#hash(uid, email, nonce, code),
-        attempts: String(this.#options.maxAttempts),
-      })
-      .expire(key, this.#options.ttlSeconds)
-      .exec();
+    try {
+      await this.#redis
+        .multi()
+        .hset(key, {
+          requestId,
+          email,
+          nonce,
+          codeHash: this.#hash(uid, email, nonce, code),
+          attempts: String(this.#options.maxAttempts),
+        })
+        .expire(key, this.#options.ttlSeconds)
+        .exec();
 
-    await this.#sender.sendVerificationCode({
-      to: email,
-      code,
-      expiresInMinutes: Math.ceil(this.#options.ttlSeconds / 60),
-      idempotencyKey: requestId,
-    });
+      await this.#sender.sendVerificationCode({
+        to: email,
+        code,
+        expiresInMinutes: Math.ceil(this.#options.ttlSeconds / 60),
+      });
+    } catch (error) {
+      await Promise.allSettled([
+        this.#redis.decr(userDailyKey),
+        this.#redis.decr(dailyKey),
+        this.#redis.del(this.#cooldownKey(uid), key),
+      ]);
+      throw error;
+    }
 
     return {
       expiresInSeconds: this.#options.ttlSeconds,

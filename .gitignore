@@ -10,4 +10,5 @@ dist/
 *.pem
 secrets/
 .env.example
+!.env.example
 .md*
