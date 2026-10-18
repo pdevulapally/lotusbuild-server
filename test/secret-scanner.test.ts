@@ -32,7 +32,7 @@ test('actual workflow scanner passes clean files including its own definition', 
   assert.ok(result.stdout.includes('No tracked secrets.'));
 });
 
-for (const path of ['credential.txt', '.github/settings.yml', '.github/workflows/extra.yml', '.github/workflows/ci.yml', '.env.example']) {
+for (const path of ['credential.txt', '.github/settings.yml', '.github/workflows/extra.yml', '.github/workflows/ci.yml']) {
   test(`actual workflow scanner detects content safely in ${path}`, (t) => {
     const h = fixture(t);
     const fake = ['sk', 'live', 'SYNTHETIC_CREDENTIAL_ONLY'].join('_');
@@ -51,14 +51,6 @@ test('actual workflow scanner rejects credential-shaped filenames without printi
   assert.equal(result.status, 1);
   assert.ok(result.stdout.includes('credential-shaped file'));
   assert.equal((result.stdout + result.stderr).includes('SYNTHETIC_PRIVATE_VALUE'), false);
-});
-
-test('actual workflow scanner allows the root .env.example template', (t) => {
-  const h = fixture(t);
-  writeFileSync(join(h.cwd, '.env.example'), 'EMAIL_DAILY_SEND_LIMIT=300\n'); h.track();
-  const result = h.run();
-  assert.equal(result.status, 0);
-  assert.ok(result.stdout.includes('No tracked secrets.'));
 });
 
 for (const stage of ['enumeration', 'filename', 'content']) {

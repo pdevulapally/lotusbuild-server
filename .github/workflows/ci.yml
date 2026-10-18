@@ -54,7 +54,7 @@ jobs:
           # Neither matched content nor scanner stderr may enter workflow logs.
           files=$(git ls-files 2>/dev/null) || { echo '::error::Secret scanner file enumeration failed.'; exit 2; }
           status=0
-          { grep -iE '(^|/)\.env($|\.)|adminsdk|service-account|\.pem$|\.p12$' <<< "$files" | grep -vE '^\.env\.example$'; } >/dev/null 2>&1 || status=$?
+          grep -iE '(^|/)\.env($|\.)|adminsdk|service-account|\.pem$|\.p12$' <<< "$files" >/dev/null 2>&1 || status=$?
           case "$status" in
             0) echo '::error::A credential-shaped file is tracked by git.'; exit 1 ;;
             1) ;;
