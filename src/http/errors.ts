@@ -45,6 +45,9 @@ const diagnosticCodes = new Set([
   'account/erasure-pending', 'account/reconciliation-required', 'project/deleting', 'project/not-found',
   'project/persistence-failed', 'sandbox/platform-unconfigured', 'billing/provider-unavailable',
   'billing/bad-signature', 'session/no-desktop', 'desktop/capacity-reached', 'auth/token-invalid', 'auth/token-expired', 'auth/token-revoked', 'auth/email-not-verified',
+  'auth/email-unavailable', 'auth/verification-code-cooldown', 'auth/verification-code-invalid',
+  'auth/verification-code-daily-limit',
+  'email/delivery-unavailable', 'email/daily-limit-reached',
   'runner/shutdown', 'runner/execution-failed',
 ]);
 const diagnosticStages = new Set([

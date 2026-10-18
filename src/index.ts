@@ -18,6 +18,8 @@ import { buildServer } from './server.ts';
 import { PrivacyRequests } from './privacy/requests.ts';
 import { FamilyService } from './family/service.ts';
 import { releaseRevision } from './release.ts';
+import { BrevoEmailSender } from './email/brevo.ts';
+import { EmailVerificationService } from './auth/email-verification.ts';
 
 
 async function main(): Promise<void> {
@@ -91,6 +93,19 @@ async function main(): Promise<void> {
     privacyRequests: new PrivacyRequests(firebase.firestore),
     family: new FamilyService(firebase.firestore, config.FAMILY_INVITATION_TTL_SECONDS),
     firebaseAuth: firebase.auth,
+    emailVerification: new EmailVerificationService(
+      redis,
+      firebase.auth,
+      new BrevoEmailSender(config.BREVO_API_KEY, config.EMAIL_VERIFICATION_FROM),
+      {
+        codeSecret: config.EMAIL_VERIFICATION_CODE_SECRET,
+        ttlSeconds: config.EMAIL_VERIFICATION_CODE_TTL_SECONDS,
+        resendSeconds: config.EMAIL_VERIFICATION_RESEND_SECONDS,
+        maxAttempts: config.EMAIL_VERIFICATION_MAX_ATTEMPTS,
+        perAccountDailyLimit: config.EMAIL_VERIFICATION_MAX_CODES_PER_DAY,
+        dailyLimit: config.EMAIL_DAILY_SEND_LIMIT,
+      },
+    ),
     ...(revision === undefined ? {} : { revision }),
     redis,
     entitlements,
