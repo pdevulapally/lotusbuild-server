@@ -353,6 +353,32 @@ test('a handoff that does not settle is covered by the desktop startup deadline'
   );
 });
 
+test('a handoff that completes after the startup deadline is withdrawn without announcing ready', async () => {
+  let releasePublish!: () => void;
+  const publish = new Promise<void>((resolve) => { releasePublish = resolve; });
+  const h = runnerFixture({
+    desktop: true,
+    desktopStartTimeoutMs: 50,
+    publishHandoff: () => publish,
+  });
+
+  await h.runner.runOnce();
+
+  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.deepEqual(
+    h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data),
+    [{ reason: 'error' }],
+  );
+  assert.ok(!h.types().includes('desktop.ready'));
+  assert.deepEqual(h.handoffCalls.map((call) => call.call), ['publish']);
+
+  releasePublish();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(h.handoffCalls.map((call) => call.call), ['publish', 'clear']);
+  assert.ok(h.order.indexOf('clear') > h.order.indexOf('publish'));
+});
+
 test('desktop startup overlaps project restoration', async () => {
   let resolveDesktop!: (handoff: DesktopHandoff) => void;
   const start = new Promise<DesktopHandoff>((resolve) => { resolveDesktop = resolve; });
