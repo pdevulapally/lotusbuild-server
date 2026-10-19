@@ -331,6 +331,7 @@ class E2BSandbox implements RunningSandbox {
     }
     const sandbox = this.#sandbox;
     const inBackground = async (command: string, envs?: Record<string, string>): Promise<void> => {
+      signal?.throwIfAborted();
       const handle = await sandbox.commands.run(command, { background: true, timeoutMs: 0, ...(envs === undefined ? {} : { envs }) });
       await handle.disconnect();
     };

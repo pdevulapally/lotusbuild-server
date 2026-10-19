@@ -6,7 +6,7 @@ import type Anthropic from '@anthropic-ai/sdk';
 
 import type { EntitlementService, UserEntitlements } from '../entitlements/service.ts';
 import type { ConfigurationStore } from '../entitlements/store.ts';
-import type { DesktopHandoffPort } from '../desktop/handoff.ts';
+import type { DesktopHandoff, DesktopHandoffPort } from '../desktop/handoff.ts';
 import { AppError, safeErrorDiagnostic } from '../http/errors.ts';
 import type { MeteringService } from '../metering/service.ts';
 import type { ProjectPersistence, RestoreOutcome } from '../projects/persistence.ts';
@@ -149,38 +149,50 @@ export class SessionRunner {
     acquired: AcquiredSandbox,
     publish: (type: string, data: Record<string, unknown>) => Promise<void>,
     signal: AbortSignal,
+    desktopAbort: AbortSignal,
   ): Promise<boolean> {
     const settings = acquired.provider.desktop;
     if (settings === undefined) return false;
+    let handoffPublished = false;
     try {
       const handoff = this.#deps.desktop;
       if (handoff === undefined) throw new Error('The runner has no desktop handoff configured.');
       if (acquired.running.startDesktop === undefined) throw new Error('This sandbox provider cannot show a desktop.');
       const startupSignal = AbortSignal.any([
         signal,
+        desktopAbort,
         AbortSignal.timeout(this.#deps.desktopStartTimeoutMs ?? DEFAULT_DESKTOP_START_TIMEOUT_MS),
       ]);
-      const start = acquired.running.startDesktop(settings, startupSignal);
+      const startAndPublish = async (): Promise<DesktopHandoff> => {
+        const endpoint = await acquired.running.startDesktop!(settings, startupSignal);
+        startupSignal.throwIfAborted();
+        await handoff.publish(session.id, endpoint, acquired.provider.timeoutSeconds + 60);
+        handoffPublished = true;
+        startupSignal.throwIfAborted();
+        return endpoint;
+      };
       let onAbort: (() => void) | undefined;
       const aborted = new Promise<never>((_, reject) => {
         onAbort = () => reject(startupSignal.reason ?? new Error('Desktop startup was aborted.'));
         if (startupSignal.aborted) onAbort();
         else startupSignal.addEventListener('abort', onAbort, { once: true });
       });
-      let endpoint;
       try {
-        endpoint = await Promise.race([start, aborted]);
+        await Promise.race([startAndPublish(), aborted]);
+        this.#desktops.add(session.id);
+        await publish('desktop.ready', { width: settings.width, height: settings.height });
+        return true;
       } finally {
         if (onAbort !== undefined) startupSignal.removeEventListener('abort', onAbort);
       }
-      // Written only once the stream is reachable, and expiring with the sandbox,
-      // so a deletion that never happens cannot leave a stale entry behind.
-      await handoff.publish(session.id, endpoint, acquired.provider.timeoutSeconds + 60);
-      this.#desktops.add(session.id);
-      await publish('desktop.ready', { width: settings.width, height: settings.height });
-      return true;
     } catch (error) {
+      if (handoffPublished) {
+        try { await this.#deps.desktop?.clear(session.id); }
+        catch { /* The handoff expires with the sandbox if withdrawal fails. */ }
+        this.#desktops.delete(session.id);
+      }
       signal.throwIfAborted();
+      desktopAbort.throwIfAborted();
       this.#deps.log.error(
         { sessionId: session.id, diagnostic: safeErrorDiagnostic(error) },
         'could not start the desktop; continuing without it',
@@ -429,25 +441,33 @@ export class SessionRunner {
         template: acquired.provider.template,
         platform: acquired.provider.platform,
       });
-      const desktopStart = this.#startDesktop(session, acquired, publish, signal);
+      const desktopAbort = new AbortController();
+      const desktopStart = this.#startDesktop(session, acquired, publish, signal, desktopAbort.signal);
       void desktopStart.catch(() => {});
 
-      // Only a plan that pays for it gets its work back. For everyone else the
-      // sandbox is genuinely disposable, which is the difference being sold.
-      if (persists) {
-        restored = await this.#deps.persistence.restore(
-          acquired.running,
-          acquired.provider,
-          project,
-        );
-        await publish('project.restored', { outcome: restored });
-      }
+      let messages: Awaited<ReturnType<typeof sessions.listMessages>>;
+      try {
+        // Only a plan that pays for it gets its work back. For everyone else the
+        // sandbox is genuinely disposable, which is the difference being sold.
+        if (persists) {
+          restored = await this.#deps.persistence.restore(
+            acquired.running,
+            acquired.provider,
+            project,
+          );
+          await publish('project.restored', { outcome: restored });
+        }
 
-      const messages = await sessions.listMessages(
-        session.ownerUid,
-        session.id,
-        this.#deps.messageHistoryLimit,
-      );
+        messages = await sessions.listMessages(
+          session.ownerUid,
+          session.id,
+          this.#deps.messageHistoryLimit,
+        );
+      } catch (error) {
+        desktopAbort.abort(error);
+        await desktopStart.catch(() => {});
+        throw error;
+      }
       const desktopReady = await desktopStart;
       const toolCall = async (name: string, input: Record<string, unknown>, callId?: string) => {
         if (persists && workspaceTools.has(name) && !readOnlyTools.has(name)) {
