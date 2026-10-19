@@ -145,7 +145,12 @@ test('a desktop provider is never handed public preview, and a plain one still i
 
 // ---- the runner: announces the desktop, withdraws it, and never lets it break a build ----
 
-function runnerFixture(options: { desktop: boolean; startDesktop?: (signal?: AbortSignal) => Promise<DesktopHandoff>; withoutHandoffPort?: boolean }) {
+function runnerFixture(options: {
+  desktop: boolean;
+  startDesktop?: (signal?: AbortSignal) => Promise<DesktopHandoff>;
+  desktopStartTimeoutMs?: number;
+  withoutHandoffPort?: boolean;
+}) {
   const { db } = ledger();
   const registry = registryWith(options.desktop ? desktopSize : undefined);
   const plans = new Map(planDocuments.map((doc) => [doc.key, parsePlan(doc, doc.key, registry)]));
@@ -157,6 +162,7 @@ function runnerFixture(options: { desktop: boolean; startDesktop?: (signal?: Abo
   const order: string[] = [];
   const emitted: { type: string; data: Record<string, unknown> }[] = [];
   const handoffCalls: { call: string; sessionId: string; handoff?: DesktopHandoff; ttl?: number }[] = [];
+  const systemPrompts: string[] = [];
   let cancelListener: ((event: { type: string }) => void) | undefined;
   let modelCalls = 0;
   const startDesktop = options.startDesktop ?? (async () => ({ host: '6080-abcdefghij1234567890x.e2b.test', token: 'traffic-token-fixture' }));
@@ -169,7 +175,11 @@ function runnerFixture(options: { desktop: boolean; startDesktop?: (signal?: Abo
     start: async (_provider, context) => { await context.lifecycle!.beforeCreate(); await context.lifecycle!.created(running); return running; } };
   const anthropic = { messages: {
     countTokens: async () => ({ input_tokens: 2 }),
-    stream: () => { modelCalls++; order.push('model'); return { on: () => {}, finalMessage: async () => ({ content: [{ type: 'text', text: 'Complete' }],
+    stream: (params: Record<string, unknown>) => {
+      modelCalls++;
+      order.push('model');
+      systemPrompts.push(typeof params.system === 'string' ? params.system : JSON.stringify(params.system ?? ''));
+      return { on: () => {}, finalMessage: async () => ({ content: [{ type: 'text', text: 'Complete' }],
       usage: { input_tokens: 2, output_tokens: 1 }, stop_reason: 'end_turn' }) }; },
   } } as unknown as Anthropic;
   const session = { id: 's', projectId: 'p', ownerUid: 'u', model: entitlements.capabilities.stringList('ai.model.allowlist')[0],
@@ -194,16 +204,18 @@ function runnerFixture(options: { desktop: boolean; startDesktop?: (signal?: Abo
     entitlements: { forUser: async () => entitlements },
     projects: { readOwned: async () => ({ id: 'p', platform: 'web', ownerUid: 'u', name: 'Fixture', snapshot: { kind: 'none' } }) },
     sandboxes: new SandboxService(configuration, metering, new Map([['e2b', adapter]])),
-    persistence: { restore: async () => 'fresh', save: async () => ({ bytes: 1, committed: true }) },
+    persistence: { restore: async () => { order.push('restore'); return 'fresh'; }, save: async () => ({ bytes: 1, committed: true }) },
     events: { subscribe: async (_id: string, listener: typeof cancelListener) => { cancelListener = listener; return () => {}; },
       append: async (_id: string, type: string, data: Record<string, unknown>) => { emitted.push({ type, data }); order.push(type); } },
     limits: { maxSteps: 3, maxOutputTokens: 10, toolOutputMaxChars: 4096, maxSpecialistConsultations: 0, specialistMaxSteps: 1,
       commandTimeoutMs: 1000, previewReadyTimeoutSeconds: 1 },
     heartbeatSeconds: 60, messageHistoryLimit: 10, log: { info: capture, warn: capture, error: capture },
+    ...(options.desktopStartTimeoutMs === undefined ? {} : { desktopStartTimeoutMs: options.desktopStartTimeoutMs }),
     ...(options.withoutHandoffPort === true ? {} : { desktop: handoffPort }),
   } as unknown as RunnerDependencies;
   return { runner: new SessionRunner(deps), order, emitted, handoffCalls, logs, timeoutSeconds: registry.sandboxProviders.get('web')!.timeoutSeconds,
     cancel: () => cancelListener?.({ type: 'session.cancel_requested' }), modelCalls: () => modelCalls,
+    systemPrompts: () => systemPrompts,
     types: () => emitted.map((event) => event.type),
     diagnostics: () => JSON.stringify({ events: emitted, logs: logs.map((entry) => entry.message), order }) };
 }
@@ -264,6 +276,43 @@ test('a provider with a desktop but a runner with no handoff is a loud failure t
   assert.ok(!h.order.includes('startDesktop'));
   assert.ok(h.logs.some((entry) => entry.message.includes('continuing without it')));
   assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data), [{ reason: 'error' }]);
+});
+
+test('a timed-out desktop start lets the build continue without screen access', async () => {
+  let startupSignal: AbortSignal | undefined;
+  const h = runnerFixture({
+    desktop: true,
+    desktopStartTimeoutMs: 50,
+    startDesktop: (signal) => {
+      startupSignal = signal;
+      return new Promise<DesktopHandoff>(() => {});
+    },
+  });
+
+  await h.runner.runOnce();
+
+  assert.equal(startupSignal?.aborted, true);
+  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data), [{ reason: 'error' }]);
+  assert.ok(h.systemPrompts().some((prompt) => prompt.includes('The desktop did not start in this session')));
+});
+
+test('desktop startup overlaps project restoration', async () => {
+  let resolveDesktop!: (handoff: DesktopHandoff) => void;
+  const start = new Promise<DesktopHandoff>((resolve) => { resolveDesktop = resolve; });
+  const h = runnerFixture({ desktop: true, startDesktop: () => start });
+  const run = h.runner.runOnce();
+
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.ok(h.order.indexOf('startDesktop') >= 0);
+  assert.ok(h.order.indexOf('restore') > h.order.indexOf('startDesktop'), h.diagnostics());
+  assert.ok(!h.types().includes('desktop.ready'));
+
+  resolveDesktop({ host: '6080-abcdefghij1234567890x.e2b.test', token: 'traffic-token-fixture' });
+  await run;
+
+  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.ok(h.order.indexOf('desktop.ready') > h.order.indexOf('restore'));
 });
 
 test('cancelling while the desktop starts stops the build instead of being swallowed as a desktop failure', async () => {

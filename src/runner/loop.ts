@@ -112,10 +112,12 @@ export interface RunnerDependencies {
    * fails to show its desktop, loudly, rather than silently skipping it.
    */
   readonly desktop?: DesktopHandoffPort;
+  readonly desktopStartTimeoutMs?: number;
 }
 
 /** Why a desktop stopped being available. Mirrors what the frontend is told. */
 type DesktopEndReason = 'session-ended' | 'sandbox-stopped' | 'error';
+const DEFAULT_DESKTOP_START_TIMEOUT_MS = 45_000;
 
 /**
  * The runner's whole contract with the rest of the system: take a session, do
@@ -154,7 +156,23 @@ export class SessionRunner {
       const handoff = this.#deps.desktop;
       if (handoff === undefined) throw new Error('The runner has no desktop handoff configured.');
       if (acquired.running.startDesktop === undefined) throw new Error('This sandbox provider cannot show a desktop.');
-      const endpoint = await acquired.running.startDesktop(settings, signal);
+      const startupSignal = AbortSignal.any([
+        signal,
+        AbortSignal.timeout(this.#deps.desktopStartTimeoutMs ?? DEFAULT_DESKTOP_START_TIMEOUT_MS),
+      ]);
+      const start = acquired.running.startDesktop(settings, startupSignal);
+      let onAbort: (() => void) | undefined;
+      const aborted = new Promise<never>((_, reject) => {
+        onAbort = () => reject(startupSignal.reason ?? new Error('Desktop startup was aborted.'));
+        if (startupSignal.aborted) onAbort();
+        else startupSignal.addEventListener('abort', onAbort, { once: true });
+      });
+      let endpoint;
+      try {
+        endpoint = await Promise.race([start, aborted]);
+      } finally {
+        if (onAbort !== undefined) startupSignal.removeEventListener('abort', onAbort);
+      }
       // Written only once the stream is reachable, and expiring with the sandbox,
       // so a deletion that never happens cannot leave a stale entry behind.
       await handoff.publish(session.id, endpoint, acquired.provider.timeoutSeconds + 60);
@@ -411,7 +429,8 @@ export class SessionRunner {
         template: acquired.provider.template,
         platform: acquired.provider.platform,
       });
-      const desktopReady = await this.#startDesktop(session, acquired, publish, signal);
+      const desktopStart = this.#startDesktop(session, acquired, publish, signal);
+      void desktopStart.catch(() => {});
 
       // Only a plan that pays for it gets its work back. For everyone else the
       // sandbox is genuinely disposable, which is the difference being sold.
@@ -429,6 +448,7 @@ export class SessionRunner {
         session.id,
         this.#deps.messageHistoryLimit,
       );
+      const desktopReady = await desktopStart;
       const toolCall = async (name: string, input: Record<string, unknown>, callId?: string) => {
         if (persists && workspaceTools.has(name) && !readOnlyTools.has(name)) {
           await sessions.requireWorkspaceSalvage(authority, acquired!.running.externalId);

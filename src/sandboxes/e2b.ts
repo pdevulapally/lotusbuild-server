@@ -340,7 +340,7 @@ class E2BSandbox implements RunningSandbox {
       for (let attempt = 0; attempt < attempts; attempt++) {
         signal?.throwIfAborted();
         try {
-          await sandbox.commands.run(check, { timeoutMs: 10_000 });
+          await sandbox.commands.run(check, { timeoutMs: 10_000, ...(signal === undefined ? {} : { signal }) });
           return;
         } catch (error) {
           if (!(error instanceof CommandExitError)) throw error;
