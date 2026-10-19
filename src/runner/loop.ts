@@ -153,7 +153,6 @@ export class SessionRunner {
   ): Promise<boolean> {
     const settings = acquired.provider.desktop;
     if (settings === undefined) return false;
-    let handoffPublished = false;
     try {
       const handoff = this.#deps.desktop;
       if (handoff === undefined) throw new Error('The runner has no desktop handoff configured.');
@@ -167,8 +166,11 @@ export class SessionRunner {
         const endpoint = await acquired.running.startDesktop!(settings, startupSignal);
         startupSignal.throwIfAborted();
         await handoff.publish(session.id, endpoint, acquired.provider.timeoutSeconds + 60);
-        handoffPublished = true;
-        startupSignal.throwIfAborted();
+        if (startupSignal.aborted) {
+          try { await handoff.clear(session.id); }
+          catch { /* The handoff expires with the sandbox. */ }
+          startupSignal.throwIfAborted();
+        }
         return endpoint;
       };
       let onAbort: (() => void) | undefined;
@@ -186,11 +188,6 @@ export class SessionRunner {
         if (onAbort !== undefined) startupSignal.removeEventListener('abort', onAbort);
       }
     } catch (error) {
-      if (handoffPublished) {
-        try { await this.#deps.desktop?.clear(session.id); }
-        catch { /* The handoff expires with the sandbox if withdrawal fails. */ }
-        this.#desktops.delete(session.id);
-      }
       signal.throwIfAborted();
       desktopAbort.throwIfAborted();
       this.#deps.log.error(
