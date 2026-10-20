@@ -4,7 +4,10 @@ import test from 'node:test';
 import Fastify from 'fastify';
 import type { Auth } from 'firebase-admin/auth';
 
+import { UploadBudgetGuard, uploadBudgetFor, type BudgetCounter } from '../src/attachments/budget.ts';
+import { assertImageMatches, inspectImage, stripMetadata } from '../src/attachments/image.ts';
 import { registerAttachmentRoutes } from '../src/attachments/routes.ts';
+import type { EntitlementService } from '../src/entitlements/service.ts';
 import { maxAttachmentBytes, validateAttachmentRefs, type AttachmentStore, type AttachmentRef } from '../src/attachments/store.ts';
 import { registerAuth } from '../src/auth/plugin.ts';
 import { AppError, registerErrorHandler } from '../src/http/errors.ts';
@@ -67,7 +70,13 @@ async function fixture(uid = 'alice') {
   const saved: { mediaType: string; bytes: number }[] = [];
   const calls: { method: string; args: unknown[] }[] = [];
   const store = fakeStore(saved);
-  registerAttachmentRoutes(app, store);
+  const counters = new Map<string, { uploads: number; bytes: number }>();
+  const counter: BudgetCounter = {
+    consume: async (key, bytes) => { const t = counters.get(key) ?? { uploads: 0, bytes: 0 }; t.uploads += 1; t.bytes += bytes; counters.set(key, t); return { ...t, ttlSeconds: 60 }; },
+    release: async (key, bytes) => { const t = counters.get(key)!; t.uploads -= 1; t.bytes -= bytes; },
+  };
+  const entitlements = { forUser: async () => ({ planKey: 'free', rateLimits: new Map([['build', { routeClass: 'build', maxRequests: 1, windowSeconds: 60 }]]) }) } as unknown as EntitlementService;
+  registerAttachmentRoutes(app, { store, entitlements, budget: new UploadBudgetGuard(counter) });
   const sessions = {
     readOwned: async (owner: string, sessionId: string) => ({ id: sessionId, ownerUid: owner, status: 'IDLE' }),
     appendPrompt: async (...args: unknown[]) => { calls.push({ method: 'appendPrompt', args }); return { id: 'owned', status: 'QUEUED', messageCount: 2, createdAt: new Date(0), updatedAt: new Date(0), model: 'm', mode: 'build', projectId: 'p', ownerUid: owner(args) }; },
@@ -77,15 +86,22 @@ async function fixture(uid = 'alice') {
   registerSessionRoutes(app, sessions, { subscribe: async () => () => {}, replay: async function* () {}, append: async () => {} } as unknown as SessionEvents,
     { heartbeatSeconds: 1, maxConnections: 1, maxConnectionsPerUser: 1, maxBufferedBytes: 1024, reauthenticate: async () => {}, attachments: store });
   const address = await app.listen({ host: '127.0.0.1', port: 0 });
-  return { app, address, saved, calls };
+  return { app, address, saved, calls, counters };
 }
 
 test('uploads accept raw images only, within the size limit', async () => {
   const h = await fixture();
   try {
-    const ok = await fetch(`${h.address}/attachments`, { method: 'POST', headers: { ...headers, 'Content-Type': 'image/png' }, body: Buffer.from('PNG') });
-    assert.equal(ok.status, 201);
-    assert.deepEqual(await ok.json(), { id: id(9), mediaType: 'image/png', bytes: 3 });
+    const ok = await fetch(`${h.address}/attachments`, { method: 'POST', headers: { ...headers, 'Content-Type': 'image/png' }, body: tinyPng() });
+    const okBody = await ok.json();
+    assert.equal(ok.status, 201, JSON.stringify(okBody));
+    // Stored size is after metadata stripping, so the text chunk never reaches Storage.
+    assert.deepEqual(okBody, { id: id(9), mediaType: 'image/png', bytes: stripMetadata(tinyPng(), 'image/png').length, width: 2, height: 3 });
+    assert.ok(okBody.bytes < tinyPng().length);
+    const lying = await fetch(`${h.address}/attachments`, { method: 'POST', headers: { ...headers, 'Content-Type': 'image/png' }, body: '<svg onload="alert(1)"/>' });
+    assert.equal(lying.status, 400);
+    const mismatched = await fetch(`${h.address}/attachments`, { method: 'POST', headers: { ...headers, 'Content-Type': 'image/jpeg' }, body: tinyPng() });
+    assert.equal(mismatched.status, 400);
     const svg = await fetch(`${h.address}/attachments`, { method: 'POST', headers: { ...headers, 'Content-Type': 'image/svg+xml' }, body: '<svg/>' });
     assert.equal(svg.status, 415);
     const json = await fetch(`${h.address}/attachments`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: '{}' });
@@ -93,6 +109,12 @@ test('uploads accept raw images only, within the size limit', async () => {
     const huge = await fetch(`${h.address}/attachments`, { method: 'POST', headers: { ...headers, 'Content-Type': 'image/jpeg' }, body: Buffer.alloc(maxAttachmentBytes + 1) });
     assert.equal(huge.status, 413);
     assert.equal(h.saved.length, 1);
+    // The plan allows 1 build per window, so 4 images; the budget refuses the fifth and keeps the count honest.
+    for (let n = 0; n < 3; n++) assert.equal((await fetch(`${h.address}/attachments`, { method: 'POST', headers: { ...headers, 'Content-Type': 'image/png' }, body: tinyPng() })).status, 201);
+    const over = await fetch(`${h.address}/attachments`, { method: 'POST', headers: { ...headers, 'Content-Type': 'image/png' }, body: tinyPng() });
+    assert.equal(over.status, 429);
+    assert.ok(over.headers.get('retry-after') === null || Number(over.headers.get('retry-after')) >= 1);
+    assert.equal([...h.counters.values()][0]?.uploads, 4);
   } finally { await h.app.close(); }
 });
 
@@ -103,6 +125,8 @@ test('an attachment is served only to its owner, with its stored content type', 
     const response = await fetch(`${mine.address}/attachments/${id(1)}`, { headers });
     assert.equal(response.status, 200);
     assert.equal(response.headers.get('content-type'), 'image/png');
+    assert.equal(response.headers.get('content-security-policy'), "default-src 'none'; sandbox");
+    assert.match(response.headers.get('content-disposition') ?? '', /^inline; filename=".*\.png"$/);
     assert.match(response.headers.get('cache-control') ?? '', /private/);
     assert.equal(await response.text(), 'PNG');
     assert.equal((await fetch(`${theirs.address}/attachments/${id(1)}`, { headers })).status, 404);
@@ -129,4 +153,49 @@ test('messages carry verified attachment references through to the repository', 
     assert.equal(badType.status, 400);
     assert.equal(h.calls.length, 1);
   } finally { await h.app.close(); }
+});
+
+function crc(buf: Buffer): number {
+  let c = ~0;
+  for (const byte of buf) { c ^= byte; for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1)); }
+  return ~c >>> 0;
+}
+function pngChunk(type: string, data: Buffer): Buffer {
+  const length = Buffer.alloc(4); length.writeUInt32BE(data.length);
+  const body = Buffer.concat([Buffer.from(type, 'latin1'), data]);
+  const sum = Buffer.alloc(4); sum.writeUInt32BE(crc(body));
+  return Buffer.concat([length, body, sum]);
+}
+/** A 2×3 PNG with a text chunk nobody should receive. */
+function tinyPng(): Buffer {
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(2, 0); ihdr.writeUInt32BE(3, 4); ihdr[8] = 8; ihdr[9] = 2;
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('tEXt', Buffer.from('Comment\0GPS 51.5,-0.1', 'latin1')),
+    pngChunk('IDAT', Buffer.from([0x78, 0x9c, 0x63, 0x60, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01])),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+test('images are identified by their bytes, bounded in size, and shed their metadata', () => {
+  const png = tinyPng();
+  assert.deepEqual(inspectImage(png), { mediaType: 'image/png', width: 2, height: 3 });
+  assert.deepEqual(inspectImage(Buffer.from('GIF89a\x05\x00\x07\x00\x00\x00\x00', 'latin1')), { mediaType: 'image/gif', width: 5, height: 7 });
+  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8]), Buffer.from([0xff, 0xe1, 0x00, 0x08, 0x45, 0x78, 0x69, 0x66, 0x00, 0x00]),
+    Buffer.from([0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x20, 0x00, 0x40, 0x01, 0x01, 0x11, 0x00]), Buffer.from([0xff, 0xda, 0x00, 0x02, 0x00, 0xff, 0xd9])]);
+  assert.deepEqual(inspectImage(jpeg), { mediaType: 'image/jpeg', width: 64, height: 32 });
+  const webp = Buffer.concat([Buffer.from('RIFF\x00\x00\x00\x00WEBPVP8 ', 'latin1'), Buffer.alloc(10), Buffer.from([0x09, 0x00, 0x05, 0x00])]);
+  assert.deepEqual(inspectImage(webp), { mediaType: 'image/webp', width: 9, height: 5 });
+  assert.throws(() => inspectImage(Buffer.from('<!doctype html><script>alert(1)</script>')), /not a PNG, JPEG, WEBP, GIF image/);
+  assert.throws(() => inspectImage(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>')), /not a/);
+  assert.throws(() => assertImageMatches({ mediaType: 'image/png', width: 2, height: 3 }, 'image/jpeg'), /is image\/png, not image\/jpeg/);
+  assert.throws(() => assertImageMatches({ mediaType: 'image/png', width: 8001, height: 3 }, 'image/png'), /8000px/);
+  const stripped = stripMetadata(png, 'image/png');
+  assert.ok(!stripped.toString('latin1').includes('GPS'));
+  assert.deepEqual(inspectImage(stripped), { mediaType: 'image/png', width: 2, height: 3 });
+  const strippedJpeg = stripMetadata(jpeg, 'image/jpeg');
+  assert.ok(!strippedJpeg.toString('latin1').includes('Exif'));
+  assert.deepEqual(inspectImage(strippedJpeg), { mediaType: 'image/jpeg', width: 64, height: 32 });
+  assert.deepEqual(uploadBudgetFor({ routeClass: 'build', maxRequests: 10, windowSeconds: 3600 }), { windowSeconds: 3600, maxUploads: 40, maxBytes: 20 * 5 * 1024 * 1024 });
 });

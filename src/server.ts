@@ -1,4 +1,5 @@
 import cors from '@fastify/cors';
+import { RedisBudgetCounter, UploadBudgetGuard } from './attachments/budget.ts';
 import { registerAttachmentRoutes } from './attachments/routes.ts';
 import type { AttachmentStore } from './attachments/store.ts';
 import helmet from '@fastify/helmet';
@@ -280,7 +281,7 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     registerProjectContentRoutes(api, projects, dependencies.projectFiles, sessions);
     registerPrivacyRoutes(api, dependencies.privacyRequests);
     registerFamilyRoutes(api, dependencies.family, projects, sessions);
-    registerAttachmentRoutes(api, dependencies.attachments);
+    registerAttachmentRoutes(api, { store: dependencies.attachments, entitlements, budget: new UploadBudgetGuard(new RedisBudgetCounter(redis)) });
     registerSessionRoutes(api, sessions, sessionEvents, {
       attachments: dependencies.attachments,
       validateModel: async (uid, model, effort) => {
