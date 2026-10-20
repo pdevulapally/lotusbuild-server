@@ -13,6 +13,7 @@ import { ProjectRepository } from './projects/repository.ts';
 import { SessionEvents } from './sessions/events.ts';
 import { SessionRepository } from './sessions/repository.ts';
 import { UserRepository } from './users/repository.ts';
+import { AttachmentStore } from './attachments/store.ts';
 import { SnapshotStore } from './storage/snapshots.ts';
 import { buildServer } from './server.ts';
 import { PrivacyRequests } from './privacy/requests.ts';
@@ -90,6 +91,7 @@ async function main(): Promise<void> {
 
   const app = buildServer(config, {
     projectFiles: new ProjectFiles(snapshots),
+    attachments: new AttachmentStore(firebase.app, config.FIREBASE_STORAGE_BUCKET),
     privacyRequests: new PrivacyRequests(firebase.firestore),
     family: new FamilyService(firebase.firestore, config.FAMILY_INVITATION_TTL_SECONDS),
     firebaseAuth: firebase.auth,
