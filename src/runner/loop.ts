@@ -1,5 +1,7 @@
 import { createCallAdmission } from './call-admission.ts';
 import type { AttachmentReader } from '../attachments/store.ts';
+import { mentionedSkills } from '../skills/prompt.ts';
+import type { SkillSource } from '../skills/repository.ts';
 import type { ModelResolver } from '../models/catalog.ts';
 import { readOnlyTools, workspaceTools } from './tools.ts';
 import { assertBuildAllowed, resolveAiEffort } from '../entitlements/build-admission.ts';
@@ -23,7 +25,7 @@ import {
   type AgentRun,
   type ProblemReporter,
   blockerExplanation,
-  runAgentTurn, imageBlock, type ConversationMessage, type SteerInput } from './agent.ts';
+  runAgentTurn, imageBlock, type ConversationMessage, type SteerInput, type SkillsForTurn } from './agent.ts';
 
 /** Safe primary/secondary categories; never retain raw provider payloads or stderr. */
 export class RunnerWorkError extends AggregateError {
@@ -106,6 +108,8 @@ export interface RunnerDependencies {
   readonly messageHistoryLimit: number;
   /** Loads the images a prompt referenced, so the model sees what the user attached. */
   readonly attachments: AttachmentReader;
+  /** The owner's enabled skills, offered to the agent each turn. */
+  readonly skills: SkillSource;
   readonly log: RunnerLogger;
   /**
    * Where a running desktop is announced to the API's relay. Needed only for a
@@ -161,6 +165,20 @@ export class SessionRunner {
       }));
       return { ...message, images };
     }));
+  }
+
+  /** Enabled skills plus the ones the latest user message named with @name or /name. Never fails a turn. */
+  async #skillsFor(ownerUid: string, messages: readonly ConversationMessage[]): Promise<SkillsForTurn | undefined> {
+    let available;
+    try {
+      available = await this.#deps.skills.enabledFor(ownerUid);
+    } catch (error) {
+      this.#deps.log.warn({ diagnostic: safeErrorDiagnostic(error) }, 'skills could not be loaded for this turn');
+      return undefined;
+    }
+    if (available.length === 0) return undefined;
+    const latest = [...messages].reverse().find((message) => message.role === 'user');
+    return { available, mentioned: latest === undefined ? [] : mentionedSkills(latest.content, available) };
   }
 
   async #drainSteer(session: BuildSession, authority: SessionLease): Promise<SteerInput | undefined> {
@@ -569,6 +587,7 @@ export class SessionRunner {
           }
         },
         drainSteer: () => this.#drainSteer(session, authority),
+        skills: await this.#skillsFor(session.ownerUid, messages),
         desktopReady,
         events: {
           // Text arrives as it is generated. Not awaited: the model does not
@@ -588,6 +607,7 @@ export class SessionRunner {
               text: result.text.slice(0, this.#deps.limits.toolOutputMaxChars),
             }),
           preview: (preview) => publish('preview.ready', preview),
+          skillUsed: (detail) => publish('agent.skill_used', { name: detail.name, title: detail.title, source: detail.source }),
           specialistStarted: (detail) =>
             publish('agent.specialist_started', { role: detail.role, label: detail.label }),
           // Verdict, count and the one-line conclusion. Never the instructions,
@@ -651,6 +671,7 @@ export class SessionRunner {
             }
           },
           drainSteer: () => this.#drainSteer(session, authority),
+          skills: await this.#skillsFor(session.ownerUid, chainMessages),
           desktopReady: desktopUp,
           events: {
             text: (delta) => {
@@ -666,6 +687,7 @@ export class SessionRunner {
                 text: result.text.slice(0, this.#deps.limits.toolOutputMaxChars),
               }),
             preview: (preview) => publish('preview.ready', preview),
+            skillUsed: (detail) => publish('agent.skill_used', { name: detail.name, title: detail.title, source: detail.source }),
             specialistStarted: (detail) =>
               publish('agent.specialist_started', { role: detail.role, label: detail.label }),
             // Verdict, count and the one-line conclusion. Never the instructions,

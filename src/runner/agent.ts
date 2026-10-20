@@ -1,4 +1,6 @@
 import type { CallAdmission } from './call-admission.ts';
+import type { Skill } from '../skills/model.ts';
+import { skillCatalogue, skillInstructionsText } from '../skills/prompt.ts';
 import type { ImageMediaType } from '../attachments/store.ts';
 import type Anthropic from '@anthropic-ai/sdk';
 import type {
@@ -70,6 +72,20 @@ export interface AgentEvents {
   step(step: { number: number; of: number; steered?: boolean }): Promise<void>;
   specialistStarted(detail: SpecialistStarted): Promise<void>;
   specialistCompleted(detail: SpecialistCompleted): Promise<void>;
+  /** A user skill's instructions entered the conversation, by mention or by the model's own call. */
+  skillUsed(detail: SkillUsed): Promise<void>;
+}
+
+export interface SkillUsed {
+  readonly name: string;
+  readonly title: string;
+  readonly source: 'mention' | 'tool';
+}
+
+/** The user's enabled skills for this run, and the ones the prompt named outright. */
+export interface SkillsForTurn {
+  readonly available: readonly Skill[];
+  readonly mentioned: readonly Skill[];
 }
 
 export const verdicts = ['ok', 'concern', 'blocking'] as const;
@@ -346,6 +362,7 @@ export function systemPrompt(
   provider: SandboxProvider,
   access?: ScreenAccess,
   mode: BuildSession['mode'] = 'build',
+  skills: readonly Pick<Skill, 'name' | 'title' | 'description'>[] = [],
 ): string {
   return [
     'You are LotusBuild\'s software engineering agent, working on a user\'s project in a sandbox.',
@@ -358,6 +375,7 @@ export function systemPrompt(
     ...(mode === 'plan' ? [planModeInstructions, ''] : []),
     agentWorkingInstructions,
     '',
+    ...(skills.length === 0 ? [] : [...skillCatalogue(skills), '']),
     agentSafetyInstructions,
   ].join('\n');
 }
@@ -1196,6 +1214,7 @@ export async function runAgentTurn(input: {
   readonly provider: SandboxProvider;
   readonly sandbox: RunningSandbox;
   readonly messages: readonly ConversationMessage[];
+  readonly skills?: SkillsForTurn | undefined;
   readonly entitlements: UserEntitlements;
   readonly registry: Registry;
   readonly metering: MeteringService;
@@ -1403,13 +1422,44 @@ export async function runAgentTurn(input: {
     } satisfies ToolDefinition);
   }
 
+  const skills = input.skills ?? { available: [], mentioned: [] };
+  if (skills.available.length > 0) {
+    tools.set('use_skill', {
+      parallelSafe: true,
+      spec: {
+        name: 'use_skill',
+        description:
+          'Load the full instructions of one of the user\'s skills listed in the system prompt. Call it ' +
+          'before starting work that matches a skill\'s description, then follow what it returns.',
+        input_schema: {
+          type: 'object',
+          required: ['name'],
+          properties: { name: { type: 'string', enum: skills.available.map((skill) => skill.name) } },
+        },
+      },
+      async run(toolInput) {
+        const name = requireText(toolInput, 'name', 'use_skill');
+        const skill = skills.available.find((candidate) => candidate.name === name);
+        if (skill === undefined) return { text: `No skill named "${name}". Available: ${skills.available.map((s) => s.name).join(', ')}.`, isError: true };
+        await input.events.skillUsed({ name: skill.name, title: skill.title, source: 'tool' });
+        return { text: skillInstructionsText(skill), isError: false };
+      },
+    } satisfies ToolDefinition);
+  }
+  const conversation = conversationFrom(input.messages, input.project);
+  // Mentioned skills are loaded before the first model call: no round trip, no judgement call.
+  for (const skill of skills.mentioned) {
+    conversation.push({ role: 'user', content: skillInstructionsText(skill) });
+    await input.events.skillUsed({ name: skill.name, title: skill.title, source: 'mention' });
+  }
+
   const outcome = await runModelLoop({
     admission: input.admission,
     anthropic: input.anthropic,
     model: input.session.model,
     effort: input.session.effort,
-    system: systemPrompt(input.provider, screenAccess, input.session.mode),
-    conversation: conversationFrom(input.messages, input.project),
+    system: systemPrompt(input.provider, screenAccess, input.session.mode, skills.available),
+    conversation,
     tools,
     computer,
     toolContext,

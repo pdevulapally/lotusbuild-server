@@ -2,6 +2,8 @@ import cors from '@fastify/cors';
 import { RedisBudgetCounter, UploadBudgetGuard } from './attachments/budget.ts';
 import { registerAttachmentRoutes } from './attachments/routes.ts';
 import type { AttachmentStore } from './attachments/store.ts';
+import type { SkillRepository } from './skills/repository.ts';
+import { registerSkillRoutes } from './skills/routes.ts';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import type { Redis } from 'ioredis';
@@ -55,6 +57,7 @@ export interface Dependencies {
   readonly projects: ProjectRepository;
   readonly projectFiles: ProjectFiles;
   readonly attachments: AttachmentStore;
+  readonly skills: SkillRepository;
   readonly sessions: SessionRepository;
   readonly sessionEvents: SessionEvents;
   readonly configuration: ConfigurationStore;
@@ -281,6 +284,7 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     registerProjectContentRoutes(api, projects, dependencies.projectFiles, sessions);
     registerPrivacyRoutes(api, dependencies.privacyRequests);
     registerFamilyRoutes(api, dependencies.family, projects, sessions);
+    registerSkillRoutes(api, dependencies.skills);
     registerAttachmentRoutes(api, { store: dependencies.attachments, entitlements, budget: new UploadBudgetGuard(new RedisBudgetCounter(redis)) });
     registerSessionRoutes(api, sessions, sessionEvents, {
       attachments: dependencies.attachments,

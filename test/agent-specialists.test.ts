@@ -423,6 +423,7 @@ function eventsOf(published: Published[]): AgentEvents {
     toolResult: async () => {},
     preview: async () => {},
     step: async () => {},
+    skillUsed: async (detail) => { published.push({ type: 'agent.skill_used', data: { ...detail } }); },
     specialistStarted: async (detail) => {
       published.push({ type: 'agent.specialist_started', data: { ...detail } });
     },

@@ -6,6 +6,7 @@ import pino from 'pino';
 
 import { EnvironmentError, loadRunnerConfig } from '../config/index.ts';
 import { AttachmentStore } from '../attachments/store.ts';
+import { SkillRepository } from '../skills/repository.ts';
 import { DesktopHandoffStore } from '../desktop/handoff.ts';
 import { EntitlementService } from '../entitlements/service.ts';
 import { ConfigurationStore } from '../entitlements/store.ts';
@@ -152,6 +153,7 @@ async function main(): Promise<void> {
     // into memory in full.
     messageHistoryLimit: config.AGENT_MESSAGE_HISTORY_LIMIT,
     attachments: new AttachmentStore(firebase.app, config.FIREBASE_STORAGE_BUCKET),
+    skills: new SkillRepository(firebase.firestore, entitlements),
     log,
   });
 
