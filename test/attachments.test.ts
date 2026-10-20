@@ -95,7 +95,9 @@ test('uploads accept raw images only, within the size limit', async () => {
     const ok = await fetch(`${h.address}/attachments`, { method: 'POST', headers: { ...headers, 'Content-Type': 'image/png' }, body: tinyPng() });
     const okBody = await ok.json();
     assert.equal(ok.status, 201, JSON.stringify(okBody));
-    assert.deepEqual(okBody, { id: id(9), mediaType: 'image/png', bytes: tinyPng().length, width: 2, height: 3 });
+    // Stored size is after metadata stripping, so the text chunk never reaches Storage.
+    assert.deepEqual(okBody, { id: id(9), mediaType: 'image/png', bytes: stripMetadata(tinyPng(), 'image/png').length, width: 2, height: 3 });
+    assert.ok(okBody.bytes < tinyPng().length);
     const lying = await fetch(`${h.address}/attachments`, { method: 'POST', headers: { ...headers, 'Content-Type': 'image/png' }, body: '<svg onload="alert(1)"/>' });
     assert.equal(lying.status, 400);
     const mismatched = await fetch(`${h.address}/attachments`, { method: 'POST', headers: { ...headers, 'Content-Type': 'image/jpeg' }, body: tinyPng() });
