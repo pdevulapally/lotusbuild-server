@@ -209,7 +209,7 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
     requireWorkspaceSalvage: async () => { events.push('salvage-required'); },
     claim: async () => session, heartbeat: async () => { if (!leaseValid) throw new Error('Lease authority lost'); }, assertPersistenceLease: async () => {}, attachSandbox: async () => {},
     detachSandbox: async () => { events.push('detach'); }, drainSteerMessage: async () => undefined,
-    listMessages: async () => [{ role: 'user', content: 'Build', seq: 0 }],
+    listMessages: async () => [{ role: 'user', content: 'Build', seq: 0, attachments: [] }],
     reserveSpecialistTokens: async (_id: string, _runner: string, input: { meterKey: string; quantity: number; operationId: string }) =>
       metering.reserve({ ...input, uid: 'u', entitlements, now: new Date() }),
     forgetSpecialistReservation: async () => {},

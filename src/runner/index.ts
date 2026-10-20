@@ -5,6 +5,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import pino from 'pino';
 
 import { EnvironmentError, loadRunnerConfig } from '../config/index.ts';
+import { AttachmentStore } from '../attachments/store.ts';
 import { DesktopHandoffStore } from '../desktop/handoff.ts';
 import { EntitlementService } from '../entitlements/service.ts';
 import { ConfigurationStore } from '../entitlements/store.ts';
@@ -150,6 +151,7 @@ async function main(): Promise<void> {
     // that bounds a message listing, so one enormous session cannot be loaded
     // into memory in full.
     messageHistoryLimit: config.AGENT_MESSAGE_HISTORY_LIMIT,
+    attachments: new AttachmentStore(firebase.app, config.FIREBASE_STORAGE_BUCKET),
     log,
   });
 

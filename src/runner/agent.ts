@@ -1,4 +1,5 @@
 import type { CallAdmission } from './call-admission.ts';
+import type { ImageMediaType } from '../attachments/store.ts';
 import type Anthropic from '@anthropic-ai/sdk';
 import type {
   ContentBlockParam,
@@ -7,7 +8,7 @@ import type {
   MessageStreamEvent,
   Tool,
   ToolUnion,
-  ToolUseBlock,
+  ToolUseBlock, ImageBlockParam,
 } from '@anthropic-ai/sdk/resources/messages';
 
 import type { Registry, SandboxProvider, SpecialistDefinition } from '../entitlements/schema.ts';
@@ -361,10 +362,28 @@ export function systemPrompt(
   ].join('\n');
 }
 
+/** A transcript message with any attached images already loaded for the model. */
+export type ConversationMessage = SessionMessage & { readonly images?: readonly ImageBlockParam[] };
+
+export interface SteerInput {
+  readonly text: string;
+  readonly images?: readonly ImageBlockParam[];
+}
+
+export function imageBlock(mediaType: ImageMediaType, data: Buffer): ImageBlockParam {
+  return { type: 'image', source: { type: 'base64', media_type: mediaType, data: data.toString('base64') } };
+}
+
+/** Images first, then the words, so the model reads the prompt with the pictures in view. */
+export function userContent(text: string, images: readonly ImageBlockParam[] | undefined): MessageParam['content'] {
+  if (images === undefined || images.length === 0) return text;
+  return [...images, { type: 'text', text }];
+}
+
 /** Firestore's transcript, as the model's conversation. */
-function conversationFrom(messages: readonly SessionMessage[], project: Project): MessageParam[] {
+export function conversationFrom(messages: readonly ConversationMessage[], project: Project): MessageParam[] {
   return [{ role: 'user', content: projectContext(project) },
-    ...messages.map((message) => ({ role: message.role, content: message.content }))];
+    ...messages.map((message) => ({ role: message.role, content: userContent(message.content, message.images) }))];
 }
 
 function requireText(input: Record<string, unknown>, name: string, where: string): string {
@@ -561,7 +580,7 @@ interface ModelLoopInput {
     | ((name: string, result: { text: string; isError: boolean }, callId?: string) => Promise<void>)
     | undefined;
   /** Injects a pending user correction before the next call. */
-  readonly beforeStep?: (() => string | undefined | Promise<string | undefined>) | undefined;
+  readonly beforeStep?: (() => SteerInput | undefined | Promise<SteerInput | undefined>) | undefined;
   /** Ends the loop after a tool call that has produced the caller's answer. */
   readonly stopWhen?: (() => boolean) | undefined;
   /**
@@ -606,7 +625,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
 
     const steer = await input.beforeStep?.();
     if (steer !== undefined) {
-      input.conversation.push({ role: 'user', content: steer });
+      input.conversation.push({ role: 'user', content: userContent(steer.text, steer.images) });
     }
     await input.onStep?.(
       steer === undefined
@@ -1176,7 +1195,7 @@ export async function runAgentTurn(input: {
   readonly project: Project;
   readonly provider: SandboxProvider;
   readonly sandbox: RunningSandbox;
-  readonly messages: readonly SessionMessage[];
+  readonly messages: readonly ConversationMessage[];
   readonly entitlements: UserEntitlements;
   readonly registry: Registry;
   readonly metering: MeteringService;
@@ -1194,7 +1213,7 @@ export async function runAgentTurn(input: {
    * Called between steps so mid-turn user corrections are injected without
    * interrupting an in-flight API request.
    */
-  readonly drainSteer: () => string | undefined | Promise<string | undefined>;
+  readonly drainSteer: () => SteerInput | undefined | Promise<SteerInput | undefined>;
   /**
    * Whether this session's desktop actually came up and was shown to the user.
    * Starting it is best effort, so the provider having a desktop does not mean

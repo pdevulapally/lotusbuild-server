@@ -1083,7 +1083,7 @@ test('steering survives Redis failure and is consumed once into durable history'
     await assert.rejects(h.sessions.queueSteerMessage('other-user', created.id, 'Intrusion'), { code: 'session/not-found' });
     await h.sessions.queueSteerMessage('user-1', created.id, 'Preserve all records');
     await assert.rejects(h.sessions.drainSteerMessage(created.id, { ...lease, token: 'stale' }));
-    assert.equal(await h.sessions.drainSteerMessage(created.id, lease), 'Preserve all records');
+    assert.deepEqual(await h.sessions.drainSteerMessage(created.id, lease), { prompt: 'Preserve all records', attachments: [] });
     assert.equal(await h.sessions.drainSteerMessage(created.id, lease), undefined);
     const messages = await h.sessions.listMessages('user-1', created.id, 100);
     assert.equal(messages.length, 2);

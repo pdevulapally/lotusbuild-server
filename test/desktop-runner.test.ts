@@ -195,7 +195,7 @@ function runnerFixture(options: {
   const sessions = {
     requireWorkspaceSalvage: async () => {}, claim: async () => session, heartbeat: async () => {}, assertPersistenceLease: async () => {},
     attachSandbox: async () => {}, detachSandbox: async () => {}, drainSteerMessage: async () => undefined,
-    listMessages: async () => [{ role: 'user', content: 'Build', seq: 0 }],
+    listMessages: async () => [{ role: 'user', content: 'Build', seq: 0, attachments: [] }],
     reserveSpecialistTokens: async (_id: string, _runner: string, input: { meterKey: string; quantity: number; operationId: string }) =>
       metering.reserve({ ...input, uid: 'u', entitlements, now: new Date() }),
     forgetSpecialistReservation: async () => {},

@@ -1,4 +1,6 @@
 import cors from '@fastify/cors';
+import { registerAttachmentRoutes } from './attachments/routes.ts';
+import type { AttachmentStore } from './attachments/store.ts';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import type { Redis } from 'ioredis';
@@ -51,6 +53,7 @@ export interface Dependencies {
   readonly users: UserRepository;
   readonly projects: ProjectRepository;
   readonly projectFiles: ProjectFiles;
+  readonly attachments: AttachmentStore;
   readonly sessions: SessionRepository;
   readonly sessionEvents: SessionEvents;
   readonly configuration: ConfigurationStore;
@@ -277,7 +280,9 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     registerProjectContentRoutes(api, projects, dependencies.projectFiles, sessions);
     registerPrivacyRoutes(api, dependencies.privacyRequests);
     registerFamilyRoutes(api, dependencies.family, projects, sessions);
+    registerAttachmentRoutes(api, dependencies.attachments);
     registerSessionRoutes(api, sessions, sessionEvents, {
+      attachments: dependencies.attachments,
       validateModel: async (uid, model, effort) => {
         const resolved = await entitlements.forUser(uid);
         const models = await allowedModelCatalog(redis, resolved);

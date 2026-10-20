@@ -1,4 +1,5 @@
 import { runnerRecoveryProtocol } from './recovery-protocol.ts';
+import { validateAttachmentRefs, type AttachmentRef } from '../attachments/store.ts';
 import {
   type DocumentReference,
   FieldPath,
@@ -110,6 +111,7 @@ export interface BuildSession {
   readonly queuedTurnPending?: boolean | undefined;
   /** Latest accepted steering instruction, consumed under the runner lease. */
   readonly pendingSteer?: string | undefined;
+  readonly pendingSteerAttachments?: readonly AttachmentRef[] | undefined;
   /**
    * Meter holds the claiming runner took out. Recorded on the session so that
    * whoever inherits an expired lease can give them back: a hold nobody returns
@@ -147,13 +149,21 @@ export interface SessionMessage {
   readonly seq: number;
   readonly role: MessageRole;
   readonly content: string;
+  /** Images the user attached; the bytes live in `AttachmentStore` under the owner. */
+  readonly attachments: readonly AttachmentRef[];
   readonly createdAt: Date;
+}
+
+export interface SteerMessage {
+  readonly prompt: string;
+  readonly attachments: readonly AttachmentRef[];
 }
 
 export interface QueuedMessage {
   readonly id: string;
   readonly sessionId: string;
   readonly prompt: string;
+  readonly attachments: readonly AttachmentRef[];
   readonly createdAt: Date;
 }
 
@@ -190,6 +200,7 @@ function parseSession(id: string, fields: Fields, where: string): BuildSession {
     workspaceRecovery: workspaceRecovery(fields, where),
     queuedTurnPending: fields['queuedTurnPending'] === undefined ? undefined : booleanField(fields, 'queuedTurnPending', where),
     pendingSteer: fields['pendingSteer'] === undefined ? undefined : stringField(fields, 'pendingSteer', where),
+    pendingSteerAttachments: fields['pendingSteerAttachments'] === undefined ? undefined : attachmentRefsField(fields, 'pendingSteerAttachments', where),
     reservationIds: stringArrayField(fields, 'reservationIds', where),
     specialistReservationIds: stringArrayField(fields, 'specialistReservationIds', where),
     messageCount: integerField(fields, 'messageCount', where, { min: 1 }),
@@ -202,8 +213,25 @@ function parseMessage(id: string, fields: Fields, where: string): SessionMessage
     seq: Number(id),
     role: enumField(fields, 'role', where, messageRoles),
     content: stringField(fields, 'content', where),
+    attachments: attachmentRefsField(fields, 'attachments', where),
     createdAt: timestampField(fields, 'createdAt', where),
   };
+}
+
+function attachmentRefsField(fields: Fields, name: string, where: string): readonly AttachmentRef[] {
+  const value = fields[name];
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error(`${where}: "${name}" must be an array.`);
+  try {
+    return validateAttachmentRefs(value as readonly AttachmentRef[]);
+  } catch (error) {
+    throw new Error(`${where}: "${name}" holds an invalid attachment reference.`, { cause: error });
+  }
+}
+
+/** Only written when present, so documents without images stay exactly as they were. */
+function attachmentsField(refs: readonly AttachmentRef[]): { attachments?: AttachmentRef[] } {
+  return refs.length === 0 ? {} : { attachments: refs.map((ref) => ({ id: ref.id, mediaType: ref.mediaType })) };
 }
 
 function parseQueuedMessage(id: string, sessionId: string, fields: Fields, where: string): QueuedMessage {
@@ -211,6 +239,7 @@ function parseQueuedMessage(id: string, sessionId: string, fields: Fields, where
     id,
     sessionId,
     prompt: stringField(fields, 'prompt', where),
+    attachments: attachmentRefsField(fields, 'attachments', where),
     createdAt: timestampField(fields, 'createdAt', where),
   };
 }
@@ -218,6 +247,7 @@ function parseQueuedMessage(id: string, sessionId: string, fields: Fields, where
 
 export interface NewSession {
   readonly prompt: string;
+  readonly attachments?: readonly AttachmentRef[];
   readonly model: string;
   readonly effort?: AiEffort;
   readonly mode?: SessionMode;
@@ -303,6 +333,7 @@ export class SessionRepository {
    * not keep building after the subscription lapses.
    */
   async create(uid: string, projectId: string, input: NewSession, idempotencyId?: string, operation?: Mutation<BuildSession>): Promise<BuildSession> {
+    const attachments = validateAttachmentRefs(input.attachments);
     this.#validatePrompt(input.prompt);
     if (idempotencyId !== undefined && !/^[A-Za-z0-9_-]{1,128}$/.test(idempotencyId)) throw new Error('Invalid internal session id.');
     const project = await this.#projects.readOwned(uid, projectId);
@@ -362,6 +393,7 @@ export class SessionRepository {
       transaction.create(firstMessage, {
         role: 'user',
         content: input.prompt,
+        ...attachmentsField(attachments),
         createdAt: FieldValue.serverTimestamp(),
       });
       transaction.update(this.#projects.refFor(project.id), {
@@ -489,8 +521,9 @@ export class SessionRepository {
    * silently dropped or race the agent's own message into the transcript, and
    * neither is something the user can see happening.
    */
-  async appendPrompt(uid: string, sessionId: string, prompt: string, mode?: SessionMode, operation?: Mutation<BuildSession>): Promise<BuildSession> {
+  async appendPrompt(uid: string, sessionId: string, prompt: string, mode?: SessionMode, operation?: Mutation<BuildSession>, attachmentRefs?: readonly AttachmentRef[]): Promise<BuildSession> {
     this.#validatePrompt(prompt);
+    const attachments = validateAttachmentRefs(attachmentRefs);
     const session = await this.readOwned(uid, sessionId);
     const entitlements = await this.#entitlements.forUser(uid);
     const { registry } = await this.#configuration.get();
@@ -542,6 +575,7 @@ export class SessionRepository {
       transaction.create(ref.collection(messagesCollectionName).doc(messageId(seq)), {
         role: 'user',
         content: prompt,
+        ...attachmentsField(attachments),
         createdAt: FieldValue.serverTimestamp(),
       });
       transaction.update(ref, {
@@ -567,13 +601,14 @@ export class SessionRepository {
   /**
    * Staging a prompt in the session queue while a turn is active.
    */
-  async enqueueMessage(uid: string, sessionId: string, prompt: string, operation?: Mutation<QueuedMessage>): Promise<QueuedMessage> {
+  async enqueueMessage(uid: string, sessionId: string, prompt: string, operation?: Mutation<QueuedMessage>, attachmentRefs?: readonly AttachmentRef[]): Promise<QueuedMessage> {
     this.#validatePrompt(prompt);
+    const attachments = validateAttachmentRefs(attachmentRefs);
     const entitlements = await this.#entitlements.forUser(uid);
     const limit = await this.#queueLimit(entitlements);
     const parent = this.#ref(sessionId);
     const ref = parent.collection(queuedMessagesCollectionName).doc();
-    const result = { id: ref.id, sessionId, prompt, createdAt: new Date() };
+    const result: QueuedMessage = { id: ref.id, sessionId, prompt, attachments, createdAt: new Date() };
     await this.#firestore.runTransaction(async (transaction) => {
       const snapshot = await transaction.get(parent);
       if (!snapshot.exists || snapshot.data()?.['ownerUid'] !== uid) {
@@ -592,7 +627,7 @@ export class SessionRepository {
       if (queued.size >= limit) {
         throw new AppError({ code: 'session/queue-full', statusCode: 429, message: 'The session message queue is full.' });
       }
-      transaction.create(ref, { prompt, createdAt: FieldValue.serverTimestamp() });
+      transaction.create(ref, { prompt, ...attachmentsField(attachments), createdAt: FieldValue.serverTimestamp() });
       // Enqueue and deletion/dequeue share this parent conflict boundary.
       transaction.update(parent, { updatedAt: FieldValue.serverTimestamp() });
       writeMutation(transaction, this.#firestore, operation, result);
@@ -678,6 +713,7 @@ export class SessionRepository {
       transaction.create(ref.collection(messagesCollectionName).doc(messageId(seq)), {
         role: 'user',
         content: nextData.prompt,
+        ...attachmentsField(nextData.attachments),
         createdAt: FieldValue.serverTimestamp(),
       });
       transaction.delete(nextDoc.ref);
@@ -706,8 +742,9 @@ export class SessionRepository {
   }
 
   /** Redis is only a notification: acceptance commits before the API acknowledges. */
-  async queueSteerMessage(uid: string, sessionId: string, prompt: string, operation?: Mutation<void>): Promise<void> {
+  async queueSteerMessage(uid: string, sessionId: string, prompt: string, operation?: Mutation<void>, attachmentRefs?: readonly AttachmentRef[]): Promise<void> {
     this.#validatePrompt(prompt);
+    const attachments = validateAttachmentRefs(attachmentRefs);
     const entitlements = await this.#entitlements.forUser(uid);
     const ref = this.#ref(sessionId);
     await this.#firestore.runTransaction(async (transaction) => {
@@ -724,30 +761,33 @@ export class SessionRepository {
       }
       this.#assertProjectGuard(project, session);
       assertBuildAllowed(entitlements, project.platform, session.model);
-      transaction.update(ref, { pendingSteer: prompt, updatedAt: FieldValue.serverTimestamp() });
+      transaction.update(ref, { pendingSteer: prompt, pendingSteerAttachments: attachments.length === 0 ? FieldValue.delete() : attachmentsField(attachments).attachments, updatedAt: FieldValue.serverTimestamp() });
       writeMutation(transaction, this.#firestore, operation, undefined);
     });
   }
 
   /** Consume the latest steering instruction and persist its conversation position atomically. */
-  async drainSteerMessage(sessionId: string, authority: SessionLease): Promise<string | undefined> {
+  async drainSteerMessage(sessionId: string, authority: SessionLease): Promise<SteerMessage | undefined> {
     const ref = this.#ref(sessionId);
     return this.#firestore.runTransaction(async (transaction) => {
       const session = await this.#requireLease(transaction, ref, authority);
       const prompt = session.pendingSteer;
       if (prompt === undefined) return undefined;
+      const attachments = session.pendingSteerAttachments ?? [];
       const seq = session.messageCount;
       transaction.create(ref.collection(messagesCollectionName).doc(messageId(seq)), {
         role: 'user',
         content: prompt,
+        ...attachmentsField(attachments),
         createdAt: FieldValue.serverTimestamp(),
       });
       transaction.update(ref, {
         pendingSteer: FieldValue.delete(),
+        pendingSteerAttachments: FieldValue.delete(),
         messageCount: FieldValue.increment(1),
         updatedAt: FieldValue.serverTimestamp(),
       });
-      return prompt;
+      return { prompt, attachments };
     });
   }
 
@@ -760,7 +800,10 @@ export class SessionRepository {
       if (session.queuedTurnPending !== true) throw new Error('Session has no pending turn to start.');
       const queued = await transaction.get(ref.collection(queuedMessagesCollectionName).orderBy('createdAt', 'asc').limit(1));
       const next = queued.docs[0];
-      const prompt = session.pendingSteer ?? (next === undefined ? undefined : parseQueuedMessage(next.id, sessionId, next.data(), next.ref.path).prompt);
+      const pending: SteerMessage | undefined = session.pendingSteer !== undefined
+        ? { prompt: session.pendingSteer, attachments: session.pendingSteerAttachments ?? [] }
+        : next === undefined ? undefined : parseQueuedMessage(next.id, sessionId, next.data(), next.ref.path);
+      const prompt = pending?.prompt;
       if (prompt === undefined) return false; // The owner removed the last queued message.
       const entitlements = await this.#entitlements.forUser(session.ownerUid);
       const project = await this.#projects.readOwnedInTransaction(transaction, session.ownerUid, session.projectId);
@@ -774,9 +817,9 @@ export class SessionRepository {
       }
       signal?.throwIfAborted();
       transaction.create(ref.collection(messagesCollectionName).doc(messageId(session.messageCount)), {
-        role: 'user', content: prompt, createdAt: FieldValue.serverTimestamp(),
+        role: 'user', content: prompt, ...attachmentsField(pending?.attachments ?? []), createdAt: FieldValue.serverTimestamp(),
       });
-      transaction.update(ref, { queuedTurnPending: FieldValue.delete(), pendingSteer: FieldValue.delete(),
+      transaction.update(ref, { queuedTurnPending: FieldValue.delete(), pendingSteer: FieldValue.delete(), pendingSteerAttachments: FieldValue.delete(),
         messageCount: FieldValue.increment(1), updatedAt: FieldValue.serverTimestamp() });
       return true;
     });

@@ -19,8 +19,7 @@ import {
   type AgentLimits,
   blockerExplanation,
   parseReview,
-  runAgentTurn,
-} from '../src/runner/agent.ts';
+  runAgentTurn, type SteerInput } from '../src/runner/agent.ts';
 import {
   type ToolContext,
   makeRunValidation,
@@ -457,7 +456,7 @@ async function turn(options: {
   readonly problems?: { error: Error; what: string }[];
   readonly failSpecialistInput?: boolean;
   readonly project?: Project;
-  readonly drainSteer?: () => Promise<string | undefined>;
+  readonly drainSteer?: () => Promise<SteerInput | undefined>;
   readonly provider?: SandboxProvider;
   readonly desktopReady?: boolean;
   readonly session?: BuildSession;
@@ -485,7 +484,7 @@ async function turn(options: {
     project: options.project ?? project,
     provider: options.provider ?? provider,
     sandbox,
-    messages: [{ seq: 0, role: 'user', content: 'do the thing', createdAt: new Date(0) }],
+    messages: [{ seq: 0, role: 'user', content: 'do the thing', attachments: [], createdAt: new Date(0) }],
     entitlements,
     registry: registryWith(options.specialists ?? [architecture, security]),
     metering: meteringOf(metering),
@@ -2856,7 +2855,7 @@ test('the agent awaits durable steering before dispatching its next model call',
   const h = await turn({ drainSteer: async () => {
     await Promise.resolve();
     persisted = true;
-    return 'Preserve all customer records';
+    return { text: 'Preserve all customer records' };
   }, script: [(invocation) => {
     assert.equal(persisted, true);
     assert.equal(invocation.messages.at(-1)?.content, 'Preserve all customer records');

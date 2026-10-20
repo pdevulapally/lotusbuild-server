@@ -1,4 +1,5 @@
 import { createCallAdmission } from './call-admission.ts';
+import type { AttachmentReader } from '../attachments/store.ts';
 import type { ModelResolver } from '../models/catalog.ts';
 import { readOnlyTools, workspaceTools } from './tools.ts';
 import { assertBuildAllowed, resolveAiEffort } from '../entitlements/build-admission.ts';
@@ -16,15 +17,13 @@ import type { SessionEvents } from '../sessions/events.ts';
 import type {
   ClaimedSession,
   SessionLease,
-  SessionRepository,
-} from '../sessions/repository.ts';
+  SessionRepository, SessionMessage, BuildSession } from '../sessions/repository.ts';
 import {
   type AgentLimits,
   type AgentRun,
   type ProblemReporter,
   blockerExplanation,
-  runAgentTurn,
-} from './agent.ts';
+  runAgentTurn, imageBlock, type ConversationMessage, type SteerInput } from './agent.ts';
 
 /** Safe primary/secondary categories; never retain raw provider payloads or stderr. */
 export class RunnerWorkError extends AggregateError {
@@ -105,6 +104,8 @@ export interface RunnerDependencies {
   readonly limits: AgentLimits;
   readonly heartbeatSeconds: number;
   readonly messageHistoryLimit: number;
+  /** Loads the images a prompt referenced, so the model sees what the user attached. */
+  readonly attachments: AttachmentReader;
   readonly log: RunnerLogger;
   /**
    * Where a running desktop is announced to the API's relay. Needed only for a
@@ -148,6 +149,28 @@ export class SessionRunner {
 
   constructor(deps: RunnerDependencies) {
     this.#deps = deps;
+  }
+
+  /** A message's images, loaded for the model; a missing upload fails the turn rather than silently dropping a picture. */
+  async #withImages(ownerUid: string, messages: readonly SessionMessage[]): Promise<readonly ConversationMessage[]> {
+    return Promise.all(messages.map(async (message) => {
+      if (message.attachments.length === 0) return message;
+      const images = await Promise.all(message.attachments.map(async (ref) => {
+        const content = await this.#deps.attachments.read(ownerUid, ref.id);
+        return imageBlock(content.mediaType, content.data);
+      }));
+      return { ...message, images };
+    }));
+  }
+
+  async #drainSteer(session: BuildSession, authority: SessionLease): Promise<SteerInput | undefined> {
+    const steer = await this.#deps.sessions.drainSteerMessage(session.id, authority);
+    if (steer === undefined) return undefined;
+    const images = await Promise.all(steer.attachments.map(async (ref) => {
+      const content = await this.#deps.attachments.read(session.ownerUid, ref.id);
+      return imageBlock(content.mediaType, content.data);
+    }));
+    return { text: steer.prompt, images };
   }
 
   /**
@@ -467,7 +490,7 @@ export class SessionRunner {
       desktopStart = this.#startDesktop(session, acquired, publish, signal, desktopAbort.signal);
       void desktopStart.catch(() => {});
 
-      let messages: Awaited<ReturnType<typeof sessions.listMessages>>;
+      let messages: readonly ConversationMessage[];
       try {
         // Only a plan that pays for it gets its work back. For everyone else the
         // sandbox is genuinely disposable, which is the difference being sold.
@@ -480,11 +503,11 @@ export class SessionRunner {
           await publish('project.restored', { outcome: restored });
         }
 
-        messages = await sessions.listMessages(
+        messages = await this.#withImages(session.ownerUid, await sessions.listMessages(
           session.ownerUid,
           session.id,
           this.#deps.messageHistoryLimit,
-        );
+        ));
       } catch (error) {
         desktopAbort.abort(error);
         await desktopStart.catch(() => {});
@@ -545,7 +568,7 @@ export class SessionRunner {
             throw leaseLost;
           }
         },
-        drainSteer: () => sessions.drainSteerMessage(session.id, authority),
+        drainSteer: () => this.#drainSteer(session, authority),
         desktopReady,
         events: {
           // Text arrives as it is generated. Not awaited: the model does not
@@ -603,11 +626,11 @@ export class SessionRunner {
           'hot-chaining queued message in existing sandbox',
         );
 
-        const chainMessages = await sessions.listMessages(
+        const chainMessages = await this.#withImages(session.ownerUid, await sessions.listMessages(
           session.ownerUid,
           session.id,
           this.#deps.messageHistoryLimit,
-        );
+        ));
 
         const chainRun = await runAgentTurn({
           withValidationSandbox,
@@ -627,7 +650,7 @@ export class SessionRunner {
               throw leaseLost;
             }
           },
-          drainSteer: () => sessions.drainSteerMessage(session.id, authority),
+          drainSteer: () => this.#drainSteer(session, authority),
           desktopReady: desktopUp,
           events: {
             text: (delta) => {

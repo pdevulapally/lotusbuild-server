@@ -143,7 +143,7 @@ async function modelFixture(models = fixtureModels) {
   const begin = () => admission.begin({ effort: 'low', params: { model: session.model, messages: [] }, maxOutputTokens: 20, signal: controller.signal });
   const run = async () => runAgentTurn({ admission, anthropic, session, project: await projects.readOwned('u', 'p'),
     provider: registry.sandboxProviders.get('web')!, sandbox: { readFile: async () => 'Fixture file' } as unknown as RunningSandbox, withValidationSandbox: undefined,
-    messages: [{ seq: 0, role: 'user', content: 'Build', createdAt: new Date() }], entitlements, registry, metering,
+    messages: [{ seq: 0, role: 'user', content: 'Build', attachments: [], createdAt: new Date() }], entitlements, registry, metering,
     limits: { maxSteps: 2, maxOutputTokens: 20, toolOutputMaxChars: 4096, maxSpecialistConsultations: 1,
       specialistMaxSteps: 2, commandTimeoutMs: 1000, previewReadyTimeoutSeconds: 1 },
     events: { text: () => {}, step: async () => {}, toolCall: async () => {}, toolResult: async () => {},
