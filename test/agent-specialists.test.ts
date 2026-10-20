@@ -2984,7 +2984,7 @@ test('the computer toolset is withheld unless the desktop is up, the model is li
   };
 
   // The desktop did not come up: the agent is told there is no screen at all.
-  const down = await withoutComputer({ provider: desktopProvider, desktopReady: false, sandbox: new ScreenSandbox() }, /desktop did not start in this session/);
+  const down = await withoutComputer({ provider: desktopProvider, desktopReady: false, sandbox: new ScreenSandbox() }, /no desktop screen available to you/);
   assert.equal(down.includes('You can see and operate'), false);
   // Up, but this model is not one the registry lists: the user can watch, the agent cannot see.
   const other = await withoutComputer(
@@ -2998,7 +2998,7 @@ test('the computer toolset is withheld unless the desktop is up, the model is li
   // No desktop configured: the prompt says nothing about a screen.
   const plain = await turn({ script: [() => say('ok')] });
   assert.equal(hasComputer(plain.scripted.calls[0]!.tools), false);
-  assert.equal(/You can see and operate|You cannot see or operate|desktop did not start/.test(plain.scripted.calls[0]!.system), false);
+  assert.equal(/You can see and operate|You cannot see or operate|no desktop screen available/.test(plain.scripted.calls[0]!.system), false);
 });
 
 test('once one computer action in a turn fails, the rest of that turn are not run', async () => {

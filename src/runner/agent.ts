@@ -256,6 +256,11 @@ const agentWorkingInstructions = [
   '  delete a check, suppress an error, or hard-code an expected result to make something pass.',
   '- Keep commands non-interactive and bounded. Never leave a server running in the foreground: start it',
   '  in the background (or with start_preview when it is available) and confirm it is actually up.',
+  '- Make every change with write_file or edit_file, and run every command with run_command. Never',
+  '  describe a file, a command or a result in prose instead of doing it; the user sees each tool call',
+  '  as it happens, so the work itself is the progress report. Keep the text between tool calls short.',
+  '- Show the app early. As soon as the project can start its dev server, start_preview it (when it is',
+  '  available) and keep it running while you work, rather than waiting until everything is finished.',
   '- Finish what you start. Do not leave placeholders, stubs, TODOs or mock data in place of real',
   '  behaviour unless the user asked for them, and say so plainly when something is left out on purpose.',
   '',
@@ -301,7 +306,7 @@ export function screenInstructions(
   if (access === undefined) return [];
   if (access === 'unavailable') {
     return [
-      'The desktop did not start in this session, so there is no screen: do not try to open a browser on it,',
+      'There is no desktop screen available to you in this turn: do not try to open a browser on it,',
       'and do not tell the user they can watch anything. Build and check the project with commands and tests.',
       '',
     ];
