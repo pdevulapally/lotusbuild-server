@@ -154,6 +154,7 @@ function runnerFixture(options: {
   desktop: boolean;
   startDesktop?: (signal?: AbortSignal) => Promise<DesktopHandoff>;
   desktopStartTimeoutMs?: number;
+  desktopStartGraceMs?: number;
   withoutHandoffPort?: boolean;
   restore?: () => Promise<string>;
   publishHandoff?: () => Promise<void>;
@@ -222,6 +223,7 @@ function runnerFixture(options: {
       commandTimeoutMs: 1000, previewReadyTimeoutSeconds: 1 },
     heartbeatSeconds: 60, messageHistoryLimit: 10, log: { info: capture, warn: capture, error: capture },
     ...(options.desktopStartTimeoutMs === undefined ? {} : { desktopStartTimeoutMs: options.desktopStartTimeoutMs }),
+    ...(options.desktopStartGraceMs === undefined ? {} : { desktopStartGraceMs: options.desktopStartGraceMs }),
     ...(options.withoutHandoffPort === true ? {} : { desktop: handoffPort }),
   } as unknown as RunnerDependencies;
   return { runner: new SessionRunner(deps), order, emitted, handoffCalls, logs, timeoutSeconds: registry.sandboxProviders.get('web')!.timeoutSeconds,
@@ -305,7 +307,29 @@ test('a timed-out desktop start lets the build continue without screen access', 
   assert.equal(startupSignal?.aborted, true);
   assert.equal(h.modelCalls(), 1, h.diagnostics());
   assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data), [{ reason: 'error' }]);
-  assert.ok(h.systemPrompts().some((prompt) => prompt.includes('The desktop did not start in this session')));
+  assert.ok(h.systemPrompts().some((prompt) => prompt.includes('There is no desktop screen available to you in this turn')));
+});
+
+test('a slow desktop does not hold the first turn back, and one that is still starting when the session ends is never announced', async () => {
+  let startupSignal: AbortSignal | undefined;
+  const h = runnerFixture({
+    desktop: true,
+    desktopStartGraceMs: 20,
+    startDesktop: (signal) => {
+      startupSignal = signal;
+      return new Promise<DesktopHandoff>(() => {});
+    },
+  });
+
+  const started = Date.now();
+  await h.runner.runOnce();
+
+  assert.ok(Date.now() - started < 1_000, 'the first turn waited for the desktop deadline');
+  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.ok(h.systemPrompts().some((prompt) => prompt.includes('There is no desktop screen available to you in this turn')));
+  assert.equal(startupSignal?.aborted, true);
+  assert.ok(!h.emitted.some((event) => event.type === 'desktop.ready'));
+  assert.ok(!h.logs.some((entry) => entry.message.includes('continuing without it')));
 });
 
 test('a restore failure aborts pending desktop startup before it can publish a handoff', async () => {

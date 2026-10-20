@@ -113,11 +113,27 @@ export interface RunnerDependencies {
    */
   readonly desktop?: DesktopHandoffPort;
   readonly desktopStartTimeoutMs?: number;
+  /** Longest the first turn is held back waiting for the desktop; see DEFAULT_DESKTOP_START_GRACE_MS. */
+  readonly desktopStartGraceMs?: number;
 }
 
 /** Why a desktop stopped being available. Mirrors what the frontend is told. */
 type DesktopEndReason = 'session-ended' | 'sandbox-stopped' | 'error';
 const DEFAULT_DESKTOP_START_TIMEOUT_MS = 45_000;
+/**
+ * How long the first agent turn waits for the desktop before starting without it.
+ * The desktop keeps starting in the background and is shown to the user when it
+ * is up; later turns in the same sandbox see it. The agent is only told about a
+ * screen that is already there.
+ */
+const DEFAULT_DESKTOP_START_GRACE_MS = 8_000;
+
+function settleWithin<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    promise.then((value) => { clearTimeout(timer); resolve(value); }, () => { clearTimeout(timer); resolve(fallback); });
+  });
+}
 
 /**
  * The runner's whole contract with the rest of the system: take a session, do
@@ -309,6 +325,15 @@ export class SessionRunner {
     // snapshot the user still owns — which is exactly what a failed restore
     // leaves behind, and what a failure before restore never had.
     let restored: RestoreOutcome | undefined;
+    let desktopAbort: AbortController | undefined;
+    let desktopStart: Promise<boolean> | undefined;
+    // A desktop still starting when the session is over is withdrawn, never
+    // announced: the user must not be shown a screen for work that has ended.
+    const settleDesktop = async (): Promise<void> => {
+      if (desktopStart === undefined) return;
+      desktopAbort?.abort(new Error('The session finished before the desktop started.'));
+      await desktopStart.catch(() => {});
+    };
 
     try {
       signal.throwIfAborted();
@@ -438,8 +463,8 @@ export class SessionRunner {
         template: acquired.provider.template,
         platform: acquired.provider.platform,
       });
-      const desktopAbort = new AbortController();
-      const desktopStart = this.#startDesktop(session, acquired, publish, signal, desktopAbort.signal);
+      desktopAbort = new AbortController();
+      desktopStart = this.#startDesktop(session, acquired, publish, signal, desktopAbort.signal);
       void desktopStart.catch(() => {});
 
       let messages: Awaited<ReturnType<typeof sessions.listMessages>>;
@@ -465,7 +490,13 @@ export class SessionRunner {
         await desktopStart.catch(() => {});
         throw error;
       }
-      const desktopReady = await desktopStart;
+      let desktopUp = false;
+      void desktopStart.then((ready) => { desktopUp = ready; }, () => {});
+      const desktopReady = await settleWithin(
+        desktopStart,
+        this.#deps.desktopStartGraceMs ?? DEFAULT_DESKTOP_START_GRACE_MS,
+        false,
+      );
       const toolCall = async (name: string, input: Record<string, unknown>, callId?: string) => {
         if (persists && workspaceTools.has(name) && !readOnlyTools.has(name)) {
           await sessions.requireWorkspaceSalvage(authority, acquired!.running.externalId);
@@ -597,7 +628,7 @@ export class SessionRunner {
             }
           },
           drainSteer: () => sessions.drainSteerMessage(session.id, authority),
-          desktopReady,
+          desktopReady: desktopUp,
           events: {
             text: (delta) => {
               void publish('agent.text', { delta });
@@ -640,6 +671,7 @@ export class SessionRunner {
         nextQueued = await sessions.dequeueNextMessage(session.id, authority, signal);
       }
 
+      await settleDesktop();
       saveAttempted = true;
       await this.#save(
         session,
@@ -669,6 +701,7 @@ export class SessionRunner {
         // Withdrawn first: some of the paths below keep the machine for salvage and
         // throw before it is released, and a failed session should not keep
         // offering a live view of it.
+        await settleDesktop();
         await this.#endDesktop(session.id, 'session-ended');
         if (workspaceMayBeDirty && saveAttempted && !saveCompleted) throw new RunnerWorkError(error, 'workspace/save-failed');
         // Saved before the machine is discarded, even now: a build that failed
