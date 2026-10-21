@@ -124,12 +124,14 @@ function frame(event: SessionEvent): string {
  * - `slow-consumer`: the client was not reading fast enough. Resume from the
  *   last event id.
  * - `stream-error`: the server failed while starting or replaying the stream.
+ * - `server-shutdown`: the API is restarting and the client should reconnect.
  */
 export type StreamClosingReason =
   | 'token-expired'
   | 'authorization-failed'
   | 'slow-consumer'
-  | 'stream-error';
+  | 'stream-error'
+  | 'server-shutdown';
 
 /**
  * The last frame of a stream the server ended. It carries no `id:` line, so it
@@ -489,6 +491,13 @@ export function registerSessionRoutes(
 
   let openStreams = 0;
   const streamsByUser = new Map<string, number>();
+  const activeStreams = new Set<(reason?: StreamClosingReason) => void>();
+  let closing = false;
+
+  app.addHook('preClose', async () => {
+    closing = true;
+    for (const finish of [...activeStreams]) finish('server-shutdown');
+  });
 
 
   /**
@@ -517,6 +526,12 @@ export function registerSessionRoutes(
       const user = authenticatedUser(request);
       const session = await sessions.readOwned(user.uid, request.params.sessionId);
 
+      // A request whose authorization finished after the shutdown sweep must not
+      // become a stream app.close() then waits on; tell the client to reconnect.
+      if (closing) {
+        throw new AppError({ code: 'stream/server-shutdown', statusCode: 503,
+          message: 'This server is restarting. Reconnect shortly.' });
+      }
       if ((streamsByUser.get(user.uid) ?? 0) >= options.maxConnectionsPerUser) {
         throw new AppError({ code: 'stream/account-capacity-reached', statusCode: 429,
           message: 'Close an existing event stream before opening another.' });
@@ -619,6 +634,7 @@ export function registerSessionRoutes(
           return;
         }
         finished = true;
+        activeStreams.delete(finish);
         openStreams -= 1;
         const remaining = (streamsByUser.get(user.uid) ?? 1) - 1;
         if (remaining === 0) streamsByUser.delete(user.uid);
@@ -628,6 +644,8 @@ export function registerSessionRoutes(
         try { release?.(); } catch { request.log.warn({ sessionId: session.id }, 'event listener cleanup failed'); }
         finally { closeSocket(reason); }
       };
+      activeStreams.add(finish);
+      if (closing) { finish('server-shutdown'); return; }
 
       request.raw.on('close', () => finish());
       request.raw.on('error', () => finish());

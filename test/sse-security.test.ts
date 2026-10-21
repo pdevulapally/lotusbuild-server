@@ -99,3 +99,15 @@ test('SSE sends no closing frame when the client is the one that hung up', async
     await until(() => h.count() === 0);
   } finally { abort.abort(); await h.app.close(); }
 });
+
+test('SSE closes cleanly when the server shuts down', async () => {
+  const h = await fixture();
+  const response = await fetch(`${h.address}/sessions/owned/events`, { headers });
+  assert.equal(response.status, 200);
+  await until(() => h.count() === 1);
+  const closing = h.app.close();
+  const text = await response.text();
+  assert.ok(text.endsWith(closingFrame('server-shutdown')));
+  await closing;
+  assert.equal(h.count(), 0);
+});
