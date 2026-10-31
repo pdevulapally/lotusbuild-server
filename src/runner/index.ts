@@ -26,6 +26,7 @@ import { SnapshotMaintenance } from '../storage/maintenance.ts';
 import { UserRepository } from '../users/repository.ts';
 import { SessionRunner, runUntilStopped, withDrainDeadline } from './loop.ts';
 import { ProviderModels } from '../models/catalog.ts';
+import { AnthropicProvider, ModelProviders, OpenRouterProvider } from '../models/provider.ts';
 
 /**
  * The build runner.
@@ -105,15 +106,27 @@ async function main(): Promise<void> {
     apiKey: config.ANTHROPIC_API_KEY,
     baseURL: config.ANTHROPIC_BASE_URL.toString(),
   });
+  const configuredFallbackModels = async (providerKey: 'anthropic' | 'openrouter'): Promise<readonly string[]> => {
+    const { registry } = await configuration.get();
+    return registry.fallback?.provider === providerKey ? [registry.fallback.model] : [];
+  };
+  const openRouter = config.OPENROUTER_API_KEY === undefined || config.OPENROUTER_BASE_URL === undefined ? undefined
+    : new OpenRouterProvider(new Anthropic({
+      logger: safeProviderLogger(log, 'openrouter'),
+      apiKey: config.OPENROUTER_API_KEY,
+      baseURL: config.OPENROUTER_BASE_URL.toString(),
+    }), { baseURL: config.OPENROUTER_BASE_URL, redis, ttlSeconds: config.CONFIG_CACHE_TTL_SECONDS, configuredModels: () => configuredFallbackModels('openrouter') });
   const models = new ProviderModels(anthropic, redis, config.CONFIG_CACHE_TTL_SECONDS, async () => {
     const { plans, registry } = await configuration.get();
     const configured = [...plans.values()].flatMap(plan => {
       const allowed = plan.entitlements.get('ai.model.allowlist');
       return allowed?.kind === 'stringList' ? [...allowed.value] : [];
     });
-    return registry.fallback === undefined ? configured : [...configured, registry.fallback.model];
+    return [...configured, ...(await configuredFallbackModels('anthropic'))];
   });
   await models.refresh();
+  const providers = new ModelProviders([new AnthropicProvider(anthropic, models), ...(openRouter === undefined ? [] : [openRouter])]);
+  if (openRouter !== undefined) await openRouter.refresh();
   const events = new SessionEvents(redis, subscriber, {
     firestore: firebase.firestore,
     maxEventBytes: config.SESSION_EVENT_MAX_BYTES,
@@ -131,6 +144,7 @@ async function main(): Promise<void> {
   const runner = new SessionRunner({
     runnerId,
     anthropic,
+    providers,
     models,
     sessions,
     projects,

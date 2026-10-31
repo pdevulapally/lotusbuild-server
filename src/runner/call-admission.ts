@@ -5,6 +5,7 @@ import type { MessageCountTokensParams } from '@anthropic-ai/sdk/resources/messa
 import type { MeteringService } from '../metering/service.ts';
 import type { AuthoritativeUsage, SpecialistReservations, ProblemReporter } from './agent.ts';
 import { modelOutputConfig, type ModelResolver } from '../models/catalog.ts';
+import type { TokenCount } from '../models/provider.ts';
 import type { AiEffort } from '../entitlements/build-admission.ts';
 
 export interface CallAdmission {
@@ -20,6 +21,8 @@ export interface CallAdmission {
 /** Admission is shared by primary and specialist calls, including every tool loop. */
 export function createCallAdmission(deps: {
   readonly anthropic: Anthropic;
+  /** Provider-specific input count; defaults to Anthropic's count_tokens. An estimate is still reserved in full and settled from authoritative usage. */
+  readonly countInputTokens?: (params: MessageCountTokensParams, signal: AbortSignal) => Promise<TokenCount>;
   readonly models: ModelResolver;
   readonly uid: string;
   readonly sessionId: string;
@@ -42,13 +45,15 @@ export function createCallAdmission(deps: {
       const { output_config: _ignored, ...base } = input.params;
       const params = { ...base, ...(outputConfig === undefined ? {} : { output_config: outputConfig }) };
       const maxOutputTokens = Math.min(input.maxOutputTokens, model.maxOutputTokens);
-      const count = await timed('model.count_tokens', () => deps.anthropic.messages.countTokens(params, { signal: input.signal }));
+      const count = await timed('model.count_tokens', async (): Promise<TokenCount> => deps.countInputTokens === undefined
+        ? { inputTokens: (await deps.anthropic.messages.countTokens(params, { signal: input.signal })).input_tokens, estimated: false }
+        : deps.countInputTokens(params, input.signal));
 
       input.signal.throwIfAborted();
-      if (!Number.isSafeInteger(count.input_tokens) || count.input_tokens <= 0) {
-        throw new Error('Anthropic returned no usable input-token estimate.');
+      if (!Number.isSafeInteger(count.inputTokens) || count.inputTokens <= 0) {
+        throw new Error('The model provider returned no usable input-token estimate.');
       }
-      if (deps.maxInputTokens !== undefined && count.input_tokens > deps.maxInputTokens) throw new AppError({ code: 'fallback/context-exceeded', statusCode: 409, message: 'The task now exceeds the verified fallback context window.' });
+      if (deps.maxInputTokens !== undefined && count.inputTokens > deps.maxInputTokens) throw new AppError({ code: 'fallback/context-exceeded', statusCode: 409, message: 'The task now exceeds the verified fallback context window.' });
       const holds: { id: string; kind: 'input' | 'output' }[] = [];
       const settle = async (usage: AuthoritativeUsage): Promise<void> => {
         const failures: unknown[] = [];
@@ -69,7 +74,7 @@ export function createCallAdmission(deps: {
       };
       try {
         holds.push({ ...await deps.reservations.take({ meterKey: deps.inputMeterKey,
-          quantity: count.input_tokens, operationId: `model-input:${deps.sessionId}` }), kind: 'input' });
+          quantity: count.inputTokens, operationId: `model-input:${deps.sessionId}` }), kind: 'input' });
         if (input.outputReservationId === undefined) {
           holds.push({ ...await deps.reservations.take({ meterKey: deps.outputMeterKey,
             quantity: maxOutputTokens, operationId: `model-output:${deps.sessionId}` }), kind: 'output' });

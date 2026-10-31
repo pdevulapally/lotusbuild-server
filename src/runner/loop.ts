@@ -7,6 +7,7 @@ import type { AttachmentReader } from '../attachments/store.ts';
 import { mentionedSkills } from '../skills/prompt.ts';
 import type { SkillSource } from '../skills/repository.ts';
 import type { ModelResolver } from '../models/catalog.ts';
+import { AnthropicProvider, ModelProviders, type ModelProvider } from '../models/provider.ts';
 import { readOnlyTools, workspaceTools } from './tools.ts';
 import { assertBuildAllowed, resolveAiEffort } from '../entitlements/build-admission.ts';
 import type Anthropic from '@anthropic-ai/sdk';
@@ -108,6 +109,8 @@ export interface RunnerDependencies {
   readonly models: ModelResolver;
   readonly runnerId: string;
   readonly anthropic: Anthropic;
+  /** Chat providers the fallback lane may use; defaults to Anthropic alone, built from `anthropic` and `models`. */
+  readonly providers?: ModelProviders;
   readonly sessions: SessionRepository;
   readonly projects: ProjectRepository;
   readonly entitlements: EntitlementService;
@@ -161,6 +164,11 @@ function settleWithin<T>(promise: Promise<T>, ms: number, fallback: T): Promise<
  */
 export class SessionRunner {
   readonly #deps: RunnerDependencies;
+  #providerSet: ModelProviders | undefined;
+  #providers(): ModelProviders {
+    this.#providerSet ??= this.#deps.providers ?? new ModelProviders([new AnthropicProvider(this.#deps.anthropic, this.#deps.models)]);
+    return this.#providerSet;
+  }
   /** Sessions whose desktop this process announced and has not yet ended. */
   readonly #desktops = new Set<string>();
 
@@ -410,6 +418,7 @@ export class SessionRunner {
     let sourceRegistry: Registry | undefined;
     let resumed: ContinuationCheckpoint | undefined;
     let selectedOffer: FallbackOffer | undefined;
+    let fallbackProvider: ModelProvider | undefined;
     let activeSession: ClaimedSession = session;
     let activeLimits = this.#deps.limits;
     let acquired: AcquiredSandbox | undefined;
@@ -543,7 +552,8 @@ export class SessionRunner {
           maxOutputTokens: Math.min(resumed.maxOutputTokens, this.#deps.limits.maxOutputTokens) };
         if (inFallback && policy !== undefined) {
           if (session.fallback?.consent !== true) throw new Error('Fallback has not been approved.');
-          selectedOffer = await verifyFallbackModel(this.#deps.anthropic, policy, resumed, await sandboxes.providerFor(project.platform), session.effort, activeLimits.maxOutputTokens, signal);
+          fallbackProvider = this.#providers().get(policy.provider);
+          selectedOffer = await verifyFallbackModel(fallbackProvider, policy, resumed, await sandboxes.providerFor(project.platform), session.effort, activeLimits.maxOutputTokens, signal);
           activeSession = { ...session, model: selectedOffer.model, effort: selectedOffer.effort };
           activeLimits = { ...activeLimits, maxOutputTokens: selectedOffer.maxOutputTokens };
           executionRegistry = { ...registry, inputTokenMeterKey: policy.inputTokenMeterKey, outputTokenMeterKey: policy.outputTokenMeterKey };
@@ -557,9 +567,12 @@ export class SessionRunner {
         const reason = error instanceof AppError ? error : new AppError({ code: 'fallback/provider-capacity', statusCode: 503, message: 'The model provider is temporarily unavailable.' });
         throw new ContinuationPause(checkpoint, reason);
       };
+      const activeClient = fallbackProvider?.client ?? this.#deps.anthropic;
+      const activeProvider = fallbackProvider;
       const admission = createCallAdmission({
-        models: this.#deps.models,
+        models: activeProvider?.models ?? this.#deps.models,
         anthropic: this.#deps.anthropic, uid: session.ownerUid, sessionId: session.id,
+        ...(activeProvider === undefined ? {} : { countInputTokens: activeProvider.countInputTokens.bind(activeProvider) }),
         inputMeterKey: executionRegistry.inputTokenMeterKey, outputMeterKey: executionRegistry.outputTokenMeterKey,
         ...(selectedOffer === undefined ? {} : { maxInputTokens: selectedOffer.maxInputTokens }),
         metering: this.#deps.metering, reservations: tokenReservations,
@@ -686,7 +699,7 @@ export class SessionRunner {
         ...(resumed === undefined ? {} : { resume: resumed }),
           withValidationSandbox,
           admission,
-        anthropic: this.#deps.anthropic,
+        anthropic: activeClient,
         session: activeSession,
         project,
         provider: acquired.provider,
@@ -772,7 +785,7 @@ export class SessionRunner {
           saveTaskContext: (context) => sessions.saveTaskContext(authority, context),
           withValidationSandbox,
           admission,
-          anthropic: this.#deps.anthropic,
+          anthropic: activeClient,
           session,
           project,
           provider: acquired.provider,
@@ -867,7 +880,7 @@ export class SessionRunner {
         } else {
           try {
             requireFallbackPolicy(sourceRegistry, entitlements);
-            const offer = await verifyFallbackModel(this.#deps.anthropic, policy, error.checkpoint, acquired.provider, session.effort, this.#deps.limits.maxOutputTokens, signal);
+            const offer = await verifyFallbackModel(this.#providers().get(policy.provider), policy, error.checkpoint, acquired.provider, session.effort, this.#deps.limits.maxOutputTokens, signal);
             const inputLimit = entitlements.meterLimits.get(policy.inputTokenMeterKey);
             const outputLimit = entitlements.meterLimits.get(policy.outputTokenMeterKey);
             if (inputLimit === undefined || outputLimit === undefined || offer.inputTokens > inputLimit.hardLimit || offer.maxOutputTokens > outputLimit.hardLimit) throw new AppError({ code: 'fallback/allowance-too-small', statusCode: 409, message: 'The configured fallback allowance cannot accommodate this task.' });
@@ -880,7 +893,8 @@ export class SessionRunner {
               state = { status: 'EXHAUSTED', reason: 'The separate fallback allowance is exhausted. Wait for reset or upgrade.', offer, ...quotaDescription(allowanceError) };
             }
           } catch (verificationError) {
-            state = { status: 'UNAVAILABLE', reason: capacityFailure(verificationError) ? 'Fallback verification is temporarily unavailable at the provider. Your checkpoint is preserved; no fallback was started.' : 'A compatible fallback model could not be verified. Your safe checkpoint is preserved; wait for premium allowance to reset or upgrade.', ...quotaDescription(error.reason) };
+            state = { status: 'UNAVAILABLE', reason: verificationError instanceof AppError && verificationError.code === 'fallback/provider-unavailable' ? 'The configured fallback provider is not set up on this service. Your safe checkpoint is preserved; no fallback was started.'
+              : capacityFailure(verificationError) ? 'Fallback verification is temporarily unavailable at the provider. Your checkpoint is preserved; no fallback was started.' : 'A compatible fallback model could not be verified. Your safe checkpoint is preserved; wait for premium allowance to reset or upgrade.', ...quotaDescription(error.reason) };
           }
         }
         await this.#save(session, authority, project, entitlements, acquired, persists, restored, publish, true);

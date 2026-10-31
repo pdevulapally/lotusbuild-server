@@ -9,6 +9,7 @@ import {
   asString,
   asUrl,
   loadEnv,
+  asOptional,
 } from './env.ts';
 
 export { EnvironmentError } from './env.ts';
@@ -129,6 +130,8 @@ const runnerSpec = {
   ),
   ANTHROPIC_API_KEY: asString('key the agent calls the Anthropic API with'),
   ANTHROPIC_BASE_URL: asUrl('Anthropic API base URL', { protocols: ['https:'] }),
+  OPENROUTER_API_KEY: asOptional(asString('key the fallback lane calls OpenRouter with; leave unset to keep OpenRouter fallback unavailable')),
+  OPENROUTER_BASE_URL: asOptional(asUrl('OpenRouter API base URL (Anthropic-Messages-compatible), e.g. https://openrouter.ai/api/v1', { protocols: ['https:'] })),
   ANTHROPIC_MAX_OUTPUT_TOKENS: asInteger(
     'output token ceiling for one model call, which is also the most a single call can overspend',
     { min: 256, max: 200000 },
@@ -214,6 +217,11 @@ export function loadRunnerConfig(
       `RUNNER_HEARTBEAT_SECONDS (${config.RUNNER_HEARTBEAT_SECONDS}) must be below ` +
         `SESSION_LEASE_SECONDS (${config.SESSION_LEASE_SECONDS}), or a lease expires while its ` +
         'runner is still working.',
+    ]);
+  }
+  if ((config.OPENROUTER_API_KEY === undefined) !== (config.OPENROUTER_BASE_URL === undefined)) {
+    throw new EnvironmentError([
+      'OPENROUTER_API_KEY and OPENROUTER_BASE_URL must be set together, or both left unset to keep OpenRouter fallback unavailable.',
     ]);
   }
   return config;
