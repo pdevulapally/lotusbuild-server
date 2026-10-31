@@ -128,7 +128,7 @@ test('quiescing a preview removes its abort listener before sandbox disposal', a
 test('shutdown before polling or during maintenance prevents a new claim', async () => {
   const controller = new AbortController();
   let claims = 0;
-  const runner = { runOnce: async () => { claims++; return false; } } as SessionRunner;
+  const runner = { start: async () => { claims++; return undefined; } } as unknown as SessionRunner;
   await runUntilStopped(runner, { signal: controller.signal, shouldContinue: () => true, idlePollSeconds: 60, log,
     maintenance: async () => { controller.abort(); } });
   await runUntilStopped(runner, { signal: controller.signal, shouldContinue: () => true, idlePollSeconds: 60, log });
@@ -139,7 +139,7 @@ test('idle shutdown interrupts the polling wait without another claim', async ()
   const controller = new AbortController();
   const claimed = deferred<void>();
   let claims = 0;
-  const runner = { runOnce: async () => { claims++; claimed.resolve(); return false; } } as SessionRunner;
+  const runner = { start: async () => { claims++; claimed.resolve(); return undefined; } } as unknown as SessionRunner;
   const work = runUntilStopped(runner, { signal: controller.signal, shouldContinue: () => true, idlePollSeconds: 300, log });
   await claimed.promise; controller.abort(); await work;
   assert.equal(claims, 1);
@@ -348,4 +348,71 @@ test('a restarted worker preserves an unanswered request without calling the mod
   h.sessions.claim = async () => ({ ...original, pendingInput: { id: 'request', kind: 'approval', prompt: 'Publish?' } });
   await h.runner.runOnce();
   assert.equal(h.calls(), 0); assert.equal(h.events.includes('finish'), true);
+});
+
+test('concurrency works several claims at once and never exceeds the slot count', async () => {
+  const controller = new AbortController();
+  const work = [deferred<void>(), deferred<void>(), deferred<void>()];
+  const settled = new Set<number>();
+  let started = 0; let claimsWhileFull = 0;
+  const runner = { start: async () => {
+    if (started - settled.size >= 2) claimsWhileFull++;
+    const next = work[started];
+    if (next === undefined) return undefined;
+    started++;
+    return { done: next.promise };
+  } } as unknown as SessionRunner;
+  const loop = runUntilStopped(runner, { signal: controller.signal, shouldContinue: () => true, idlePollSeconds: 300, log, concurrency: 2 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(started, 2, 'two sessions are claimed before either finishes');
+  settled.add(0); work[0]!.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(started, 3, 'a freed slot is refilled without waiting for the other session');
+  assert.equal(claimsWhileFull, 0);
+  controller.abort();
+  work[1]!.resolve(); work[2]!.resolve();
+  await loop;
+});
+
+test('a failed slot is logged and reused while the other slot keeps running', async () => {
+  const controller = new AbortController();
+  const records: string[] = [];
+  const first = deferred<void>(); const third = deferred<void>();
+  let started = 0;
+  const runner = { start: async () => {
+    started++;
+    if (started === 1) return { done: first.promise };
+    if (started === 2) return { done: Promise.reject(new RunnerWorkError(new Error('boom'), 'sandbox/cleanup-failed')) };
+    if (started === 3) return { done: third.promise };
+    return undefined;
+  } } as unknown as SessionRunner;
+  const loop = runUntilStopped(runner, { signal: controller.signal, shouldContinue: () => true, idlePollSeconds: 300, concurrency: 2,
+    log: { info: () => {}, warn: () => {}, error: (_details, message) => records.push(message) } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(started, 3, 'the slot freed by the failure was reused');
+  assert.deepEqual(records, ['runner work or recovery failed']);
+  controller.abort(); first.resolve(); third.resolve();
+  await loop;
+});
+
+test('shutdown drains every active slot and reports a failure that happened while draining', async () => {
+  const controller = new AbortController();
+  const slow = deferred<void>(); const failing = deferred<void>();
+  let started = 0;
+  const runner = { start: async () => {
+    started++;
+    if (started === 1) return { done: slow.promise };
+    if (started === 2) return { done: failing.promise };
+    return undefined;
+  } } as unknown as SessionRunner;
+  const loop = runUntilStopped(runner, { signal: controller.signal, shouldContinue: () => !controller.signal.aborted, idlePollSeconds: 300, log, concurrency: 2 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  controller.abort();
+  let drained = false; void loop.then(() => { drained = true; }, () => { drained = true; });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(drained, false, 'the loop waits for active sessions');
+  failing.reject(new RunnerWorkError(new Error('late'), 'workspace/save-failed'));
+  slow.resolve();
+  await assert.rejects(loop, (error) => error instanceof RunnerWorkError && error.secondaryStage === 'workspace/save-failed');
+  assert.equal(started, 2);
 });

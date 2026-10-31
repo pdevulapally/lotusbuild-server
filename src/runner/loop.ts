@@ -32,6 +32,9 @@ import {
   runAgentTurn, imageBlock, type ConversationMessage, type SteerInput, type SkillsForTurn } from './agent.ts';
 
 /** Safe primary/secondary categories; never retain raw provider payloads or stderr. */
+/** A claimed session whose work is in flight. */
+export interface ClaimedWork { readonly done: Promise<void>; }
+
 export class RunnerWorkError extends AggregateError {
   readonly primaryCategory: string;
   readonly secondaryStage: string;
@@ -293,22 +296,39 @@ export class SessionRunner {
 
   /** Takes one session if there is one. Returns whether there was. */
   async runOnce(shutdown?: AbortSignal): Promise<boolean> {
-    const debug = this.#deps.log.debug;
-    if (debug === undefined) return this.#runOnce(shutdown);
-    return timingContext((timing) => debug.call(this.#deps.log, { timing }, 'phase timing'), () => timed('runner.total', () => this.#runOnce(shutdown)));
+    const claimed = await this.start(shutdown);
+    if (claimed === undefined) return false;
+    await claimed.done;
+    return true;
   }
 
-  async #runOnce(shutdown?: AbortSignal): Promise<boolean> {
-    if (shutdown?.aborted) return false;
+  /**
+   * Claims one session and hands back the work on it, so a caller can hold
+   * several claims at once. Resolves to undefined when nothing is claimable.
+   * `done` rejects with a RunnerWorkError. (A handle rather than a bare
+   * promise: a promise returned through async code would be awaited flat.)
+   */
+  async start(shutdown?: AbortSignal): Promise<ClaimedWork | undefined> {
+    const debug = this.#deps.log.debug;
+    if (debug === undefined) return this.#start(shutdown);
+    return timingContext((timing) => debug.call(this.#deps.log, { timing }, 'phase timing'), async () => {
+      const claimed = await this.#start(shutdown);
+      return claimed === undefined ? undefined : { done: timed('runner.total', () => claimed.done) };
+    });
+  }
+
+  async #start(shutdown?: AbortSignal): Promise<ClaimedWork | undefined> {
+    if (shutdown?.aborted) return undefined;
     const session = await this.#deps.sessions.claim(this.#deps.runnerId, new Date(), shutdown);
     if (session === undefined) {
-      return false;
+      return undefined;
     }
 
     this.#deps.log.info({ sessionId: session.id, uid: session.ownerUid, timingTraceId: timingTraceId() }, 'claimed a session');
-    try { await this.#work(session, shutdown); }
-    catch (error) { throw error instanceof RunnerWorkError ? error : new RunnerWorkError(error, 'runner/work-failed'); }
-    return true;
+    const done = this.#work(session, shutdown).catch((error: unknown) => {
+      throw error instanceof RunnerWorkError ? error : new RunnerWorkError(error, 'runner/work-failed');
+    });
+    return { done };
   }
 
   async #work(session: ClaimedSession, shutdown?: AbortSignal): Promise<void> {
@@ -1120,37 +1140,66 @@ export async function runUntilStopped(
     readonly log: RunnerLogger;
     readonly maintenance?: () => Promise<void>;
     readonly signal?: AbortSignal;
+    /** Sessions worked at the same time by this process; each keeps its own lease and heartbeat. */
+    readonly concurrency?: number;
   },
 ): Promise<void> {
-  while (options.shouldContinue() && !options.signal?.aborted) {
-    let didWork = false;
-    const maintenance = options.maintenance;
-    if (maintenance !== undefined) {
-      try { await timingContext((timing) => options.log.debug?.({ timing }, 'phase timing'), () => timed('runner.maintenance', maintenance)); }
-      catch (error) { options.log.error({ diagnostic: safeErrorDiagnostic(error) }, 'background maintenance remains pending'); }
-    }
-    if (!options.shouldContinue() || options.signal?.aborted) break;
-    try {
-      didWork = await runner.runOnce(options.signal);
-    } catch (error) {
-      if (error instanceof AppError && error.code === 'session/recovery-protocol-incompatible') {
-        options.log.error({ diagnostic: safeErrorDiagnostic(error) }, 'runner recovery protocol is incompatible; claims stopped');
-        throw error;
+  const concurrency = options.concurrency ?? 1;
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new Error('Runner concurrency must be a positive integer.');
+  const stopping = () => !options.shouldContinue() || options.signal?.aborted === true;
+  const active = new Set<Promise<void>>();
+  // The first failure seen while shutting down ends the drain with an error,
+  // exactly as a single-slot runner did; failures during normal service are
+  // logged and the slot is reused.
+  let shutdownFailure: unknown;
+  let failedDuringShutdown = false;
+  const logWorkFailure = (error: unknown): void => {
+    if (error instanceof RunnerWorkError) {
+      options.log.error({ diagnostic: safeErrorDiagnostic(error) }, 'runner work or recovery failed');
+      if (stopping() && !failedDuringShutdown) { failedDuringShutdown = true; shutdownFailure = error; }
+    } else options.log.error({}, 'could not claim a session');
+  };
+  const idle = () => new Promise<void>((resolve) => {
+    const done = () => { clearTimeout(timer); options.signal?.removeEventListener('abort', done); resolve(); };
+    const timer = setTimeout(done, options.idlePollSeconds * 1000);
+    options.signal?.addEventListener('abort', done, { once: true });
+    if (options.signal?.aborted) done();
+  });
+  try {
+    while (!stopping()) {
+      const maintenance = options.maintenance;
+      if (maintenance !== undefined) {
+        try { await timingContext((timing) => options.log.debug?.({ timing }, 'phase timing'), () => timed('runner.maintenance', maintenance)); }
+        catch (error) { options.log.error({ diagnostic: safeErrorDiagnostic(error) }, 'background maintenance remains pending'); }
       }
-      if (error instanceof RunnerWorkError) {
-        options.log.error({ diagnostic: safeErrorDiagnostic(error) }, 'runner work or recovery failed');
-        if (options.signal?.aborted || !options.shouldContinue()) throw error;
-      } else options.log.error({}, 'could not claim a session');
+      if (stopping()) break;
+      let nothingClaimable = false;
+      while (active.size < concurrency && !stopping()) {
+        let claimed: ClaimedWork | undefined;
+        try {
+          claimed = await runner.start(options.signal);
+        } catch (error) {
+          if (error instanceof AppError && error.code === 'session/recovery-protocol-incompatible') {
+            options.log.error({ diagnostic: safeErrorDiagnostic(error) }, 'runner recovery protocol is incompatible; claims stopped');
+            throw error;
+          }
+          logWorkFailure(error);
+          if (error instanceof RunnerWorkError && stopping()) throw error;
+          nothingClaimable = true;
+          break;
+        }
+        if (claimed === undefined) { nothingClaimable = true; break; }
+        const tracked: Promise<void> = claimed.done.catch(logWorkFailure).finally(() => { active.delete(tracked); });
+        active.add(tracked);
+      }
+      if (stopping()) break;
+      if (nothingClaimable) await idle();
+      else if (active.size >= concurrency) await Promise.race(active);
     }
-    if (!didWork && options.shouldContinue()) {
-      await new Promise<void>((resolve) => {
-        const done = () => { clearTimeout(timer); options.signal?.removeEventListener('abort', done); resolve(); };
-        const timer = setTimeout(done, options.idlePollSeconds * 1000);
-        options.signal?.addEventListener('abort', done, { once: true });
-        if (options.signal?.aborted) done();
-      });
-    }
+  } finally {
+    await Promise.all(active);
   }
+  if (failedDuringShutdown) throw shutdownFailure;
 }
 
 /** The deadline includes active work, resource cleanup and connection closure. */

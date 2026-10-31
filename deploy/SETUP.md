@@ -7,6 +7,13 @@ default, and must be between 1 and 90 seconds. The repository runner unit sets
 at least the required 30-second margin. Verify the deployed unit and any systemd
 overrides separately; these files do not prove the live settings.
 
+Runner concurrency: set `RUNNER_CONCURRENCY` in the runner environment before
+rolling out this version. It is required, with no default, between 1 and 16.
+`1` keeps the previous behaviour (one session per process). Each slot holds its
+own lease, heartbeat, sandbox and model stream, so raise it only within the
+E2B concurrency limit and the host's memory; shutdown drains every active slot
+within `RUNNER_DRAIN_TIMEOUT_SECONDS`.
+
 SIGTERM cancels active execution immediately. The application deadline covers
 commands, partial saves, resource/accounting cleanup and connection closure; it
 does not change model, command, lease or sandbox lifetime timeouts. If draining

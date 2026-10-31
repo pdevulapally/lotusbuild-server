@@ -29,7 +29,7 @@ test('I04: nested maintenance failures cannot reach structured operational logs'
   let active = true;
   const error = new AggregateError([new Error(`Bearer ${marker}`), { stderr: `DATABASE_URL=${marker}` }], marker,
     { cause: new Error(marker) });
-  await runUntilStopped({ runOnce: async () => { active = false; return true; } } as unknown as SessionRunner, {
+  await runUntilStopped({ start: async () => { active = false; return { done: Promise.resolve() }; } } as unknown as SessionRunner, {
     idlePollSeconds: 1, shouldContinue: () => active, maintenance: async () => { throw error; },
     log: { info: () => {}, warn: () => {}, error: (details, message) => records.push({ details, message }) },
   });
@@ -96,7 +96,7 @@ test('runner failure logging preserves propagation and safe primary/cleanup cate
   const records: unknown[] = [];
   let active = true;
   const failure = new RunnerWorkError(new AppError({ code: 'session/cancelled', statusCode: 409, message: marker }), 'sandbox/cleanup-failed');
-  await assert.rejects(runUntilStopped({ runOnce: async () => { active = false; throw failure; } } as unknown as SessionRunner, {
+  await assert.rejects(runUntilStopped({ start: async () => { active = false; throw failure; } } as unknown as SessionRunner, {
     shouldContinue: () => active, idlePollSeconds: 1,
     log: { info: () => {}, warn: () => {}, error: (details, message) => records.push({ details, message }) },
   }), (error) => error === failure);
