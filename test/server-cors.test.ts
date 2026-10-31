@@ -27,6 +27,7 @@ test('server permits authenticated SSE resume preflight only for configured orig
         const headers = String(response.headers['access-control-allow-headers']).toLowerCase().split(',').map((h) => h.trim());
         assert.ok(headers.includes('authorization'));
         assert.ok(headers.includes('last-event-id'));
+        assert.ok(headers.includes('idempotency-key'));
       } else {
         assert.equal(response.headers['access-control-allow-origin'], undefined);
       }

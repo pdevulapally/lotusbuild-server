@@ -2,8 +2,9 @@ import { parseTaskContext, type TaskContext } from '../runner/task-context.ts';
 import { parseFallbackState, requireFallbackPolicy, quotaMetadata, type FallbackState } from './fallback.ts';
 import { policyFingerprint } from '../entitlements/fallback.ts';
 import { parseCheckpoint, serializeCheckpoint, continuationProtocolMaxBytes, type ContinuationCheckpoint } from '../runner/continuation.ts';
-import { commandTransaction } from './commands.ts';
+import { commandTransaction, reconciledCommand } from './commands.ts';
 import { runnerRecoveryProtocol } from './recovery-protocol.ts';
+import { validateAttachmentRefs, type AttachmentRef } from '../attachments/store.ts';
 import {
   type DocumentReference,
   FieldPath,
@@ -22,6 +23,7 @@ import {
 } from '../entitlements/build-admission.ts';
 import type { ConfigurationStore } from '../entitlements/store.ts';
 import { AppError } from '../http/errors.ts';
+import { mapMutation, type Mutation } from '../http/idempotency.ts';
 import type { MeteringService, Reservation } from '../metering/service.ts';
 import { createHash, randomUUID } from 'node:crypto';
 
@@ -126,6 +128,7 @@ export interface BuildSession {
   readonly queuedTurnPending?: boolean | undefined;
   /** Latest accepted steering instruction, consumed under the runner lease. */
   readonly pendingSteer?: string | undefined;
+  readonly pendingSteerAttachments?: readonly AttachmentRef[] | undefined;
   /**
    * Meter holds the claiming runner took out. Recorded on the session so that
    * whoever inherits an expired lease can give them back: a hold nobody returns
@@ -165,13 +168,21 @@ export interface SessionMessage {
   readonly seq: number;
   readonly role: MessageRole;
   readonly content: string;
+  /** Images the user attached; the bytes live in `AttachmentStore` under the owner. */
+  readonly attachments: readonly AttachmentRef[];
   readonly createdAt: Date;
+}
+
+export interface SteerMessage {
+  readonly prompt: string;
+  readonly attachments: readonly AttachmentRef[];
 }
 
 export interface QueuedMessage {
   readonly id: string;
   readonly sessionId: string;
   readonly prompt: string;
+  readonly attachments: readonly AttachmentRef[];
   readonly createdAt: Date;
 }
 
@@ -232,6 +243,7 @@ function parseSession(id: string, fields: Fields, where: string): BuildSession {
     workspaceRecovery: workspaceRecovery(fields, where),
     queuedTurnPending: fields['queuedTurnPending'] === undefined ? undefined : booleanField(fields, 'queuedTurnPending', where),
     pendingSteer: fields['pendingSteer'] === undefined ? undefined : stringField(fields, 'pendingSteer', where),
+    pendingSteerAttachments: fields['pendingSteerAttachments'] === undefined ? undefined : attachmentRefsField(fields, 'pendingSteerAttachments', where),
     reservationIds: stringArrayField(fields, 'reservationIds', where),
     specialistReservationIds: stringArrayField(fields, 'specialistReservationIds', where),
     messageCount: integerField(fields, 'messageCount', where, { min: 1 }),
@@ -244,8 +256,25 @@ function parseMessage(id: string, fields: Fields, where: string): SessionMessage
     seq: Number(id),
     role: enumField(fields, 'role', where, messageRoles),
     content: stringField(fields, 'content', where),
+    attachments: attachmentRefsField(fields, 'attachments', where),
     createdAt: timestampField(fields, 'createdAt', where),
   };
+}
+
+function attachmentRefsField(fields: Fields, name: string, where: string): readonly AttachmentRef[] {
+  const value = fields[name];
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error(`${where}: "${name}" must be an array.`);
+  try {
+    return validateAttachmentRefs(value as readonly AttachmentRef[]);
+  } catch (error) {
+    throw new Error(`${where}: "${name}" holds an invalid attachment reference.`, { cause: error });
+  }
+}
+
+/** Only written when present, so documents without images stay exactly as they were. */
+function attachmentsField(refs: readonly AttachmentRef[]): { attachments?: AttachmentRef[] } {
+  return refs.length === 0 ? {} : { attachments: refs.map((ref) => ({ id: ref.id, mediaType: ref.mediaType })) };
 }
 
 function parseQueuedMessage(id: string, sessionId: string, fields: Fields, where: string): QueuedMessage {
@@ -253,6 +282,7 @@ function parseQueuedMessage(id: string, sessionId: string, fields: Fields, where
     id,
     sessionId,
     prompt: stringField(fields, 'prompt', where),
+    attachments: attachmentRefsField(fields, 'attachments', where),
     createdAt: timestampField(fields, 'createdAt', where),
   };
 }
@@ -292,6 +322,7 @@ function receiptMessage(value: unknown): MessageAcceptance {
 
 export interface NewSession {
   readonly prompt: string;
+  readonly attachments?: readonly AttachmentRef[];
   readonly model: string;
   readonly effort?: AiEffort;
   readonly mode?: SessionMode;
@@ -376,7 +407,9 @@ export class SessionRepository {
    * creation: a plan can be downgraded, and a mobile project created on pro must
    * not keep building after the subscription lapses.
    */
-  async create(uid: string, projectId: string, input: NewSession, idempotencyId?: string, commandId?: string): Promise<BuildSession> {
+  async create(uid: string, projectId: string, input: NewSession, idempotencyId?: string, commandId?: string | Mutation<BuildSession>): Promise<BuildSession> {
+    const attachments = validateAttachmentRefs(input.attachments);
+
     this.#validatePrompt(input.prompt);
     if (idempotencyId !== undefined && !/^[A-Za-z0-9_-]{1,128}$/.test(idempotencyId)) throw new Error('Invalid internal session id.');
     const project = await this.#projects.readOwned(uid, projectId);
@@ -389,9 +422,8 @@ export class SessionRepository {
     const collection = this.#firestore.collection(sessionsCollectionPath);
     const ref = idempotencyId === undefined ? collection.doc() : collection.doc(idempotencyId);
     const firstMessage = ref.collection(messagesCollectionName).doc(messageId(0));
-
     const existing = await commandTransaction<BuildSession>({ db: this.#firestore, parent: this.#projects.refFor(projectId), uid, key: commandId,
-      input: ['create-session', input.prompt, input.model, input.effort ?? null, input.mode ?? null],
+      input: ['create-session', input.prompt, input.model, input.effort ?? null, input.mode ?? null, attachments],
       encode: (session) => ({ id: session.id }),
       decode: async (value, transaction) => {
         const id = stringField(receiptFields(value), 'id', 'command');
@@ -439,6 +471,7 @@ export class SessionRepository {
       transaction.create(firstMessage, {
         role: 'user',
         content: input.prompt,
+        ...attachmentsField(attachments),
         createdAt: FieldValue.serverTimestamp(),
       });
       transaction.update(this.#projects.refFor(project.id), {
@@ -465,7 +498,8 @@ export class SessionRepository {
     };
     } });
 
-    return this.readOwned(uid, existing.id);
+    return reconciledCommand(existing, await this.readOwned(uid, existing.id));
+
   }
 
   /** A session owned by someone else is reported as missing, as projects are. */
@@ -514,6 +548,24 @@ export class SessionRepository {
   }
 
   /**
+   * The owner's newest sessions across all projects, for the activity inbox.
+   * Equality-only on `ownerUid` so no composite index is needed; ordering is
+   * done in memory over a bounded read.
+   */
+  async listRecentForOwner(ownerUid: string, limit: number): Promise<readonly BuildSession[]> {
+    const snapshot = await this.#firestore
+      .collection(sessionsCollectionPath)
+      .where('ownerUid', '==', ownerUid)
+      .limit(500)
+      .get();
+    return snapshot.docs
+      .map((doc) => parseSession(doc.id, doc.data(), doc.ref.path))
+      .filter((session) => session.ownerUid === ownerUid)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+      .slice(0, limit);
+  }
+
+  /**
    * The most recent `limit` messages, in chronological order.
    *
    * Every caller — the primary agent's context and the message-history route
@@ -539,27 +591,56 @@ export class SessionRepository {
   }
 
   /**
+   * The latest session's transcript for a project the caller has already been
+   * authorised to read through `ProjectRepository.readShared`. Never call it
+   * without that check: it does not prove ownership itself.
+   */
+  async sharedTranscript(projectId: string, limit: number): Promise<readonly SessionMessage[]> {
+    const latest = await this.#firestore
+      .collection(sessionsCollectionPath)
+      .where('projectId', '==', projectId)
+      .orderBy('createdAt', 'desc')
+      .limit(1)
+      .get();
+    const session = latest.docs[0];
+    if (session === undefined) return [];
+    const messages = await this.#ref(session.id)
+      .collection(messagesCollectionName)
+      .orderBy(FieldPath.documentId(), 'desc')
+      .limit(limit)
+      .get();
+    return messages.docs.map((doc) => parseMessage(doc.id, doc.data(), doc.ref.path)).reverse();
+  }
+
+  /**
    * Adds the user's next turn and puts the session back in the queue.
    *
    * Refused while a runner holds it: a prompt arriving mid-build would either be
    * silently dropped or race the agent's own message into the transcript, and
    * neither is something the user can see happening.
    */
-  async appendPrompt(uid: string, sessionId: string, prompt: string): Promise<BuildSession> {
-    const result = await this.submitMessage(uid, sessionId, prompt, false, undefined, 'append');
+  async appendPrompt(uid: string, sessionId: string, prompt: string, mode?: SessionMode, operation?: Mutation<BuildSession>, attachmentRefs?: readonly AttachmentRef[]): Promise<BuildSession> {
+    const accepted = mapMutation<BuildSession, MessageAcceptance>(operation, value => {
+      if (value.kind !== 'prompt') throw new Error('Unexpected prompt result.'); return value.session;
+    });
+    const result = await this.submitMessage(uid, sessionId, prompt, false, accepted, 'append', undefined, mode, attachmentRefs);
     if (result.kind !== 'prompt') throw new Error('Unexpected prompt result.');
     return result.session;
   }
 
-  async enqueueMessage(uid: string, sessionId: string, prompt: string): Promise<QueuedMessage> {
-    const result = await this.submitMessage(uid, sessionId, prompt, false, undefined, 'enqueue');
+  async enqueueMessage(uid: string, sessionId: string, prompt: string, operation?: Mutation<QueuedMessage>, attachmentRefs?: readonly AttachmentRef[]): Promise<QueuedMessage> {
+    const accepted = mapMutation<QueuedMessage, MessageAcceptance>(operation, value => {
+      if (value.kind !== 'queued') throw new Error('Unexpected queue result.'); return value.message;
+    });
+    const result = await this.submitMessage(uid, sessionId, prompt, false, accepted, 'enqueue', undefined, undefined, attachmentRefs);
     if (result.kind !== 'queued') throw new Error('Unexpected queue result.');
     return result.message;
   }
 
   /** Choose the submission path inside the same transaction as its receipt, not from a stale HTTP read. */
-  async submitMessage(uid: string, sessionId: string, prompt: string, steer = false, commandId?: string,
-    strategy?: 'append' | 'enqueue' | 'steer', inputResponse?: InputResponse, mode?: SessionMode): Promise<MessageAcceptance> {
+  async submitMessage(uid: string, sessionId: string, prompt: string, steer = false, commandId?: string | Mutation<MessageAcceptance>,
+    strategy?: 'append' | 'enqueue' | 'steer', inputResponse?: InputResponse, mode?: SessionMode, attachmentRefs?: readonly AttachmentRef[]): Promise<MessageAcceptance> {
+    const attachments = validateAttachmentRefs(attachmentRefs);
     this.#validatePrompt(prompt);
     await this.readOwned(uid, sessionId);
     const entitlements = await this.#entitlements.forUser(uid);
@@ -569,13 +650,17 @@ export class SessionRepository {
     const queuedRef = ref.collection(queuedMessagesCollectionName).doc();
     const now = new Date();
     const accepted = await commandTransaction<MessageAcceptance>({ db: this.#firestore, parent: ref, uid, key: commandId,
-      input: ['message', prompt, steer, inputResponse ?? null, mode ?? null],
+      input: ['message', prompt, steer, inputResponse ?? null, mode ?? null, attachments],
       decode: async (value, transaction) => {
-        const result = receiptMessage(value);
         const snapshot = await transaction.get(ref);
         const current = parseSession(sessionId, snapshot.data() ?? {}, ref.path);
         await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId);
-        return result;
+        const fields = receiptFields(value);
+        if (fields['kind'] !== undefined) return receiptMessage(value);
+        if (fields['steered'] === true) return { kind: 'steered', sessionId: stringField(fields, 'sessionId', 'receipt') };
+        if (fields['queued'] === true) return receiptMessage({ kind: 'queued', message: fields['queuedMessage'] });
+        if (fields['queued'] === false) return { kind: 'prompt', session: current };
+        throw new Error('Invalid message acceptance receipt.');
       }, work: async (transaction): Promise<MessageAcceptance> => {
       const snapshot = await transaction.get(ref);
       if (!snapshot.exists || snapshot.data()?.['ownerUid'] !== uid) {
@@ -594,7 +679,7 @@ export class SessionRepository {
       const active = isActiveSessionStatus(current.status);
       if (strategy === 'append' && active) throw new AppError({ code: 'session/busy', statusCode: 409,
         message: 'This session is still working. Wait for it to finish before sending more.', details: { status: current.status } });
-      if (active && mode !== undefined && mode !== current.mode) throw new AppError({ code: 'session/busy', statusCode: 409, message: 'Wait for the current turn before changing mode.' });
+      if (active && mode !== undefined) throw new AppError({ code: 'session/mode-change-busy', statusCode: 409, message: 'Wait for the current turn before changing mode.' });
       if ((active && current.cancelRequested === true) || (strategy === 'enqueue' && !active)) {
         throw new AppError({ code: 'session/not-active', statusCode: 409, message: 'This session is no longer accepting queued messages.' });
       }
@@ -607,15 +692,15 @@ export class SessionRepository {
       else this.#assertProjectCanActivate(project, current.id);
       assertBuildAllowed(entitlements, project.platform, current.model);
       if ((steer || strategy === 'steer') && current.status === 'RUNNING') {
-        transaction.update(ref, { pendingSteer: prompt, updatedAt: FieldValue.serverTimestamp() });
+        transaction.update(ref, { pendingSteer: prompt, pendingSteerAttachments: attachments, updatedAt: FieldValue.serverTimestamp() });
         return { kind: 'steered', sessionId };
       }
       if (active) {
         const queued = await transaction.get(this.#queuedMessages(ref, current).limit(limit + 1));
         if (queued.size >= limit) throw new AppError({ code: 'session/queue-full', statusCode: 429, message: 'The session message queue is full.' });
-        transaction.create(queuedRef, { prompt, createdAt: FieldValue.serverTimestamp() });
+        transaction.create(queuedRef, { prompt, ...attachmentsField(attachments), createdAt: FieldValue.serverTimestamp() });
         transaction.update(ref, { updatedAt: FieldValue.serverTimestamp() });
-        return { kind: 'queued', message: { id: queuedRef.id, sessionId, prompt, createdAt: now } };
+        return { kind: 'queued', message: { id: queuedRef.id, sessionId, prompt, attachments, createdAt: now } };
       }
       await this.#metering.consumeIn(transaction, { uid, entitlements, meterKey: registry.buildMeterKey, quantity: 1, now });
       if (current.fallback?.checkpointId !== undefined) transaction.delete(ref.collection('continuations').doc('active'));
@@ -626,14 +711,15 @@ export class SessionRepository {
         content = `Response to ${pendingInput.kind} ${pendingInput.id}: ${inputResponse.answer}\nRequest: ${pendingInput.prompt}`;
       }
       transaction.create(ref.collection(messagesCollectionName).doc(messageId(current.messageCount)), {
-        role: 'user', content, createdAt: FieldValue.serverTimestamp(),
+        role: 'user', content, ...attachmentsField(attachments), createdAt: FieldValue.serverTimestamp(),
       });
       transaction.update(ref, { status: 'QUEUED', ...(mode === undefined ? {} : { mode }), pendingInput: FieldValue.delete(), inputContext: FieldValue.delete(), fallback: FieldValue.delete(), executionStarted: FieldValue.delete(), messageCount: FieldValue.increment(1), claimableAt: Timestamp.fromDate(now),
         cancelRequested: FieldValue.delete(), error: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() });
       transaction.update(this.#projects.refFor(current.projectId), { activeSessionId: current.id, updatedAt: FieldValue.serverTimestamp() });
       return { kind: 'prompt', session: { ...current, status: 'QUEUED', ...(mode === undefined ? {} : { mode }), pendingInput: undefined, inputContext: undefined, fallback: undefined, executionStarted: undefined, error: undefined, cancelRequested: undefined, messageCount: current.messageCount + 1 } };
     } });
-    return accepted.kind === 'prompt' ? { ...accepted, session: await this.readOwned(uid, sessionId) } : accepted;
+    return accepted.kind === 'prompt' ? reconciledCommand(accepted, { ...accepted, session: await this.readOwned(uid, sessionId) }) : accepted;
+
   }
 
   // There is no reason to stage more builds than the plan permits in a whole
@@ -721,6 +807,7 @@ export class SessionRepository {
       transaction.create(ref.collection(messagesCollectionName).doc(messageId(seq)), {
         role: 'user',
         content: nextData.prompt,
+        ...attachmentsField(nextData.attachments),
         createdAt: FieldValue.serverTimestamp(),
       });
       transaction.delete(nextDoc.ref);
@@ -750,29 +837,32 @@ export class SessionRepository {
   }
 
   /** Redis is only a notification: acceptance commits before the API acknowledges. */
-  async queueSteerMessage(uid: string, sessionId: string, prompt: string): Promise<void> {
-    await this.submitMessage(uid, sessionId, prompt, true, undefined, 'steer');
+  async queueSteerMessage(uid: string, sessionId: string, prompt: string, operation?: Mutation<void>, attachmentRefs?: readonly AttachmentRef[]): Promise<void> {
+    await this.submitMessage(uid, sessionId, prompt, true, mapMutation<void, MessageAcceptance>(operation, () => undefined), 'steer', undefined, undefined, attachmentRefs);
   }
 
   /** Consume the latest steering instruction and persist its conversation position atomically. */
-  async drainSteerMessage(sessionId: string, authority: SessionLease): Promise<string | undefined> {
+  async drainSteerMessage(sessionId: string, authority: SessionLease): Promise<SteerMessage | undefined> {
     const ref = this.#ref(sessionId);
     return this.#firestore.runTransaction(async (transaction) => {
       const session = await this.#requireLease(transaction, ref, authority);
       const prompt = session.pendingSteer;
       if (prompt === undefined) return undefined;
+      const attachments = session.pendingSteerAttachments ?? [];
       const seq = session.messageCount;
       transaction.create(ref.collection(messagesCollectionName).doc(messageId(seq)), {
         role: 'user',
         content: prompt,
+        ...attachmentsField(attachments),
         createdAt: FieldValue.serverTimestamp(),
       });
       transaction.update(ref, {
         pendingSteer: FieldValue.delete(),
+        pendingSteerAttachments: FieldValue.delete(),
         messageCount: FieldValue.increment(1),
         updatedAt: FieldValue.serverTimestamp(),
       });
-      return prompt;
+      return { prompt, attachments };
     });
   }
 
@@ -785,7 +875,10 @@ export class SessionRepository {
       if (session.queuedTurnPending !== true) throw new Error('Session has no pending turn to start.');
       const queued = await transaction.get(this.#queuedMessages(ref, session).orderBy('createdAt', 'asc').limit(1));
       const next = queued.docs[0];
-      const prompt = session.pendingSteer ?? (next === undefined ? undefined : parseQueuedMessage(next.id, sessionId, next.data(), next.ref.path).prompt);
+      const pending: SteerMessage | undefined = session.pendingSteer !== undefined
+        ? { prompt: session.pendingSteer, attachments: session.pendingSteerAttachments ?? [] }
+        : next === undefined ? undefined : parseQueuedMessage(next.id, sessionId, next.data(), next.ref.path);
+      const prompt = pending?.prompt;
       if (prompt === undefined) return false; // The owner removed the last queued message.
       const entitlements = await this.#entitlements.forUser(session.ownerUid);
       const project = await this.#projects.readOwnedInTransaction(transaction, session.ownerUid, session.projectId);
@@ -799,9 +892,10 @@ export class SessionRepository {
       }
       signal?.throwIfAborted();
       transaction.create(ref.collection(messagesCollectionName).doc(messageId(session.messageCount)), {
-        role: 'user', content: prompt, createdAt: FieldValue.serverTimestamp(),
+        role: 'user', content: prompt, ...attachmentsField(pending?.attachments ?? []), createdAt: FieldValue.serverTimestamp(),
       });
       transaction.update(ref, { queuedTurnPending: FieldValue.delete(), fallback: FieldValue.delete(), pendingSteer: FieldValue.delete(),
+
         messageCount: FieldValue.increment(1), updatedAt: FieldValue.serverTimestamp() });
       return true;
     });
@@ -817,14 +911,18 @@ export class SessionRepository {
    * If the session is RUNNING, cancelRequested is set to true so the active runner halts on its
    * next step, tears down resources, and transitions the session to FAILED.
    */
-  async cancel(uid: string, sessionId: string, commandId?: string): Promise<BuildSession> {
+  async cancel(uid: string, sessionId: string, commandId?: string | Mutation<BuildSession>): Promise<BuildSession> {
+
     const session = await this.readOwned(uid, sessionId);
     const entitlements = await this.#entitlements.forUser(uid);
     const { registry } = await this.#configuration.get();
     const ref = this.#ref(sessionId);
     const now = new Date();
 
-    await commandTransaction({ db: this.#firestore, parent: ref, uid, key: commandId, input: ['cancel'], decode: receiptSession, work: async (transaction) => {
+    const accepted = await commandTransaction({ db: this.#firestore, parent: ref, uid, key: commandId, input: ['cancel'], decode: async (_value, transaction) => {
+      const snapshot = await transaction.get(ref); const current = parseSession(sessionId, snapshot.data() ?? {}, ref.path);
+      await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId, true); return current;
+    }, work: async (transaction) => {
       const snapshot = await transaction.get(ref);
       if (!snapshot.exists) {
         throw new AppError({
@@ -842,6 +940,7 @@ export class SessionRepository {
         });
       }
 
+      const project = await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId, true);
       if (current.status === 'IDLE' && (current.pendingInput !== undefined || (current.fallback !== undefined && current.fallback.status !== 'COMPLETED'))) {
         await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId);
         transaction.delete(ref.collection('continuations').doc('active'));
@@ -849,6 +948,7 @@ export class SessionRepository {
         transaction.update(ref, { status: 'FAILED', error: 'Cancelled by user', discardQueuedBefore: FieldValue.serverTimestamp(), pendingInput: FieldValue.delete(), fallback: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() });
         return { ...current, status: 'FAILED' as const, error: 'Cancelled by user', pendingInput: undefined };
       }
+
       if (current.status === 'IDLE' || current.status === 'FAILED') {
         throw new AppError({
           code: 'session/not-cancellable',
@@ -859,12 +959,6 @@ export class SessionRepository {
       }
 
 
-      const project = await this.#projects.readOwnedInTransaction(
-        transaction,
-        uid,
-        current.projectId,
-        true,
-      );
       this.#assertProjectGuard(project, current);
 
       if (current.status === 'QUEUED') {
@@ -895,12 +989,13 @@ export class SessionRepository {
           updatedAt: FieldValue.serverTimestamp(),
         });
 
-        return {
+        const result = {
           ...current,
           status: 'FAILED' as const,
           error: 'Cancelled by user',
           cancelRequested: undefined,
         };
+        return result;
       }
 
       transaction.delete(ref.collection('continuations').doc('active'));
@@ -910,12 +1005,10 @@ export class SessionRepository {
         updatedAt: FieldValue.serverTimestamp(),
       });
 
-      return {
-        ...current,
-        cancelRequested: true,
-      };
+      return { ...current, cancelRequested: true };
     } });
-    return this.readOwned(uid, sessionId);
+    return reconciledCommand(accepted, await this.readOwned(uid, sessionId));
+
   }
 
   /**
@@ -1099,7 +1192,7 @@ export class SessionRepository {
     const entitlements = await this.#entitlements.forUser(uid, new Date(), true);
     const { registry } = await this.#configuration.get();
     const ref = this.#ref(sessionId);
-    await commandTransaction({ db: this.#firestore, parent: ref, uid, key: commandId, input: ['accept-continuation', input.checkpointId, input.model, input.effort, input.lane ?? 'fallback'],
+    const accepted = await commandTransaction({ db: this.#firestore, parent: ref, uid, key: commandId, input: ['accept-continuation', input.checkpointId, input.model, input.effort, input.lane ?? 'fallback'],
       decode: receiptSession, work: async (transaction) => {
       const snapshot = await transaction.get(ref); const current = parseSession(sessionId, snapshot.data() ?? {}, ref.path);
       const state = current.fallback; const offer = state?.offer;
@@ -1156,7 +1249,7 @@ export class SessionRepository {
       transaction.update(this.#projects.refFor(project.id), { activeSessionId: queued ? current.id : null, updatedAt: FieldValue.serverTimestamp() });
       return { ...current, status: queued ? 'QUEUED' as const : 'IDLE' as const, fallback };
     } });
-    return this.readOwned(uid, sessionId);
+    return reconciledCommand(accepted, await this.readOwned(uid, sessionId));
   }
 
   async deferContinuation(authority: SessionLease, state: FallbackState, retryAt?: Date): Promise<void> {

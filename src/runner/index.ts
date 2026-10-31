@@ -5,6 +5,8 @@ import Anthropic from '@anthropic-ai/sdk';
 import pino from 'pino';
 
 import { EnvironmentError, loadRunnerConfig } from '../config/index.ts';
+import { AttachmentStore } from '../attachments/store.ts';
+import { SkillRepository } from '../skills/repository.ts';
 import { DesktopHandoffStore } from '../desktop/handoff.ts';
 import { EntitlementService } from '../entitlements/service.ts';
 import { ConfigurationStore } from '../entitlements/store.ts';
@@ -23,6 +25,7 @@ import { SnapshotStore } from '../storage/snapshots.ts';
 import { SnapshotMaintenance } from '../storage/maintenance.ts';
 import { UserRepository } from '../users/repository.ts';
 import { SessionRunner, runUntilStopped, withDrainDeadline } from './loop.ts';
+import { ProviderModels } from '../models/catalog.ts';
 
 /**
  * The build runner.
@@ -97,6 +100,20 @@ async function main(): Promise<void> {
   // time means a build that ran, cost money and threw its result away.
   await snapshots.assertReachable();
 
+  const anthropic = new Anthropic({
+    logger: safeProviderLogger(log, 'anthropic'),
+    apiKey: config.ANTHROPIC_API_KEY,
+    baseURL: config.ANTHROPIC_BASE_URL.toString(),
+  });
+  const models = new ProviderModels(anthropic, redis, config.CONFIG_CACHE_TTL_SECONDS, async () => {
+    const { plans, registry } = await configuration.get();
+    const configured = [...plans.values()].flatMap(plan => {
+      const allowed = plan.entitlements.get('ai.model.allowlist');
+      return allowed?.kind === 'stringList' ? [...allowed.value] : [];
+    });
+    return registry.fallback === undefined ? configured : [...configured, registry.fallback.model];
+  });
+  await models.refresh();
   const events = new SessionEvents(redis, subscriber, {
     firestore: firebase.firestore,
     maxEventBytes: config.SESSION_EVENT_MAX_BYTES,
@@ -110,13 +127,11 @@ async function main(): Promise<void> {
   await sessions.assertContinuationRetentionReady();
   await events.assertReady(); // Verify journal cleanup index/access before claiming paid work.
 
+
   const runner = new SessionRunner({
     runnerId,
-    anthropic: new Anthropic({
-      logger: safeProviderLogger(log, 'anthropic'),
-      apiKey: config.ANTHROPIC_API_KEY,
-      baseURL: config.ANTHROPIC_BASE_URL.toString(),
-    }),
+    anthropic,
+    models,
     sessions,
     projects,
     entitlements,
@@ -145,6 +160,8 @@ async function main(): Promise<void> {
     // that bounds a message listing, so one enormous session cannot be loaded
     // into memory in full.
     messageHistoryLimit: config.AGENT_MESSAGE_HISTORY_LIMIT,
+    attachments: new AttachmentStore(firebase.app, config.FIREBASE_STORAGE_BUCKET),
+    skills: new SkillRepository(firebase.firestore, entitlements),
     log,
   });
 
@@ -171,9 +188,12 @@ async function main(): Promise<void> {
   await withDrainDeadline(shutdown.signal, config.RUNNER_DRAIN_TIMEOUT_SECONDS * 1000, async () => {
     await runUntilStopped(runner, {
       maintenance: async () => {
+        try { await models.refresh(); }
+        catch (error) { log.warn({ diagnostic: safeErrorDiagnostic(error) }, 'model catalog refresh failed'); }
         await new SnapshotMaintenance(firebase.firestore, metering, snapshots).sweep();
         await sweepRetention();
         await events.collectExpired();
+
       },
       idlePollSeconds: config.RUNNER_IDLE_POLL_SECONDS,
       shouldContinue: () => !shutdown.signal.aborted,

@@ -1,3 +1,4 @@
+import { ProjectFiles } from './projects/files.ts';
 import { safeErrorDiagnostic } from './http/errors.ts';
 import { BillingRepository } from './billing/repository.ts';
 import { createStripe } from './billing/stripe.ts';
@@ -12,11 +13,15 @@ import { ProjectRepository } from './projects/repository.ts';
 import { SessionEvents } from './sessions/events.ts';
 import { SessionRepository } from './sessions/repository.ts';
 import { UserRepository } from './users/repository.ts';
+import { AttachmentStore } from './attachments/store.ts';
+import { SkillRepository } from './skills/repository.ts';
 import { SnapshotStore } from './storage/snapshots.ts';
 import { buildServer } from './server.ts';
 import { PrivacyRequests } from './privacy/requests.ts';
 import { FamilyService } from './family/service.ts';
 import { releaseRevision } from './release.ts';
+import { BrevoEmailSender } from './email/brevo.ts';
+import { EmailVerificationService } from './auth/email-verification.ts';
 
 
 async function main(): Promise<void> {
@@ -86,9 +91,25 @@ async function main(): Promise<void> {
   catch { throw new EnvironmentError(['REDIS_URL subscriber connection failed.']); }
 
   const app = buildServer(config, {
+    projectFiles: new ProjectFiles(snapshots),
+    attachments: new AttachmentStore(firebase.app, config.FIREBASE_STORAGE_BUCKET),
+    skills: new SkillRepository(firebase.firestore, entitlements),
     privacyRequests: new PrivacyRequests(firebase.firestore),
     family: new FamilyService(firebase.firestore, config.FAMILY_INVITATION_TTL_SECONDS),
     firebaseAuth: firebase.auth,
+    emailVerification: new EmailVerificationService(
+      redis,
+      firebase.auth,
+      new BrevoEmailSender(config.BREVO_API_KEY, config.EMAIL_VERIFICATION_FROM),
+      {
+        codeSecret: config.EMAIL_VERIFICATION_CODE_SECRET,
+        ttlSeconds: config.EMAIL_VERIFICATION_CODE_TTL_SECONDS,
+        resendSeconds: config.EMAIL_VERIFICATION_RESEND_SECONDS,
+        maxAttempts: config.EMAIL_VERIFICATION_MAX_ATTEMPTS,
+        perAccountDailyLimit: config.EMAIL_VERIFICATION_MAX_CODES_PER_DAY,
+        dailyLimit: config.EMAIL_DAILY_SEND_LIMIT,
+      },
+    ),
     ...(revision === undefined ? {} : { revision }),
     redis,
     entitlements,

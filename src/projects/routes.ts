@@ -2,6 +2,7 @@ import { commandKey } from '../sessions/commands.ts';
 import type { FastifyInstance } from 'fastify';
 
 import { authenticatedUser } from '../auth/plugin.ts';
+import { mutation } from '../http/idempotency.ts';
 import type { Platform } from '../entitlements/schema.ts';
 import {
   type Project,
@@ -48,6 +49,7 @@ function toResponse(project: Project) {
     platform: project.platform,
     status: project.status,
     publicPreviewEnabled: project.publicPreviewEnabled === true,
+    visibility: project.visibility,
     createdAt: project.createdAt.toISOString(),
   };
 }
@@ -90,11 +92,15 @@ export function registerProjectRoutes(app: FastifyInstance, projects: ProjectRep
     },
     async (request, reply) => {
       const user = authenticatedUser(request);
-      const project = await projects.create(user.uid, {
+      const input = {
         name: request.body.name.trim(),
         description: request.body.description?.trim(),
         platform: newProjectPlatform,
-      }, commandKey(request.headers['idempotency-key'], true));
+      };
+      const project = await projects.create(user.uid, input,
+        mutation<Project>(user.uid, 'POST /projects', commandKey(request.headers['idempotency-key'], true), input,
+          (value) => ({ statusCode: 201, body: toResponse(value) })));
+
       return reply.code(201).send(toResponse(project));
     },
   );

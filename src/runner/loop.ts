@@ -3,13 +3,17 @@ import { ContinuationPause, serializeCheckpoint, type ContinuationCheckpoint } f
 import { requireFallbackPolicy, tokenLimit, verifyFallbackModel, quotaMetadata as quotaDescription, type FallbackState, type FallbackOffer } from '../sessions/fallback.ts';
 import type { Registry } from '../entitlements/schema.ts';
 import { createCallAdmission } from './call-admission.ts';
+import type { AttachmentReader } from '../attachments/store.ts';
+import { mentionedSkills } from '../skills/prompt.ts';
+import type { SkillSource } from '../skills/repository.ts';
+import type { ModelResolver } from '../models/catalog.ts';
 import { readOnlyTools, workspaceTools } from './tools.ts';
-import { assertBuildAllowed } from '../entitlements/build-admission.ts';
+import { assertBuildAllowed, resolveAiEffort } from '../entitlements/build-admission.ts';
 import type Anthropic from '@anthropic-ai/sdk';
 
 import type { EntitlementService, UserEntitlements } from '../entitlements/service.ts';
 import type { ConfigurationStore } from '../entitlements/store.ts';
-import type { DesktopHandoffPort } from '../desktop/handoff.ts';
+import type { DesktopHandoff, DesktopHandoffPort } from '../desktop/handoff.ts';
 import { AppError, safeErrorDiagnostic } from '../http/errors.ts';
 import type { MeteringService } from '../metering/service.ts';
 import type { ProjectPersistence, RestoreOutcome } from '../projects/persistence.ts';
@@ -19,15 +23,13 @@ import type { SessionEvents } from '../sessions/events.ts';
 import type {
   ClaimedSession,
   SessionLease,
-  SessionRepository,
-} from '../sessions/repository.ts';
+  SessionRepository, SessionMessage, BuildSession } from '../sessions/repository.ts';
 import {
   type AgentLimits,
   type AgentRun,
   type ProblemReporter,
   blockerExplanation,
-  runAgentTurn,
-} from './agent.ts';
+  runAgentTurn, imageBlock, type ConversationMessage, type SteerInput, type SkillsForTurn } from './agent.ts';
 
 /** Safe primary/secondary categories; never retain raw provider payloads or stderr. */
 export class RunnerWorkError extends AggregateError {
@@ -100,6 +102,7 @@ export interface RunnerLogger {
 }
 
 export interface RunnerDependencies {
+  readonly models: ModelResolver;
   readonly runnerId: string;
   readonly anthropic: Anthropic;
   readonly sessions: SessionRepository;
@@ -113,6 +116,10 @@ export interface RunnerDependencies {
   readonly limits: AgentLimits;
   readonly heartbeatSeconds: number;
   readonly messageHistoryLimit: number;
+  /** Loads the images a prompt referenced, so the model sees what the user attached. */
+  readonly attachments: AttachmentReader;
+  /** The owner's enabled skills, offered to the agent each turn. */
+  readonly skills: SkillSource;
   readonly log: RunnerLogger;
   /**
    * Where a running desktop is announced to the API's relay. Needed only for a
@@ -120,10 +127,28 @@ export interface RunnerDependencies {
    * fails to show its desktop, loudly, rather than silently skipping it.
    */
   readonly desktop?: DesktopHandoffPort;
+  readonly desktopStartTimeoutMs?: number;
+  /** Longest the first turn is held back waiting for the desktop; see DEFAULT_DESKTOP_START_GRACE_MS. */
+  readonly desktopStartGraceMs?: number;
 }
 
 /** Why a desktop stopped being available. Mirrors what the frontend is told. */
 type DesktopEndReason = 'session-ended' | 'sandbox-stopped' | 'error';
+const DEFAULT_DESKTOP_START_TIMEOUT_MS = 45_000;
+/**
+ * How long the first agent turn waits for the desktop before starting without it.
+ * The desktop keeps starting in the background and is shown to the user when it
+ * is up; later turns in the same sandbox see it. The agent is only told about a
+ * screen that is already there.
+ */
+const DEFAULT_DESKTOP_START_GRACE_MS = 8_000;
+
+function settleWithin<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    promise.then((value) => { clearTimeout(timer); resolve(value); }, () => { clearTimeout(timer); resolve(fallback); });
+  });
+}
 
 /**
  * The runner's whole contract with the rest of the system: take a session, do
@@ -146,6 +171,42 @@ export class SessionRunner {
     };
   }
 
+  /** A message's images, loaded for the model; a missing upload fails the turn rather than silently dropping a picture. */
+  async #withImages(ownerUid: string, messages: readonly SessionMessage[]): Promise<readonly ConversationMessage[]> {
+    return Promise.all(messages.map(async (message) => {
+      if (message.attachments.length === 0) return message;
+      const images = await Promise.all(message.attachments.map(async (ref) => {
+        const content = await this.#deps.attachments.read(ownerUid, ref.id);
+        return imageBlock(content.mediaType, content.data);
+      }));
+      return { ...message, images };
+    }));
+  }
+
+  /** Enabled skills plus the ones the latest user message named with @name or /name. Never fails a turn. */
+  async #skillsFor(ownerUid: string, messages: readonly ConversationMessage[]): Promise<SkillsForTurn | undefined> {
+    let available;
+    try {
+      available = await this.#deps.skills.enabledFor(ownerUid);
+    } catch (error) {
+      this.#deps.log.warn({ diagnostic: safeErrorDiagnostic(error) }, 'skills could not be loaded for this turn');
+      return undefined;
+    }
+    if (available.length === 0) return undefined;
+    const latest = [...messages].reverse().find((message) => message.role === 'user');
+    return { available, mentioned: latest === undefined ? [] : mentionedSkills(latest.content, available) };
+  }
+
+  async #drainSteer(session: BuildSession, authority: SessionLease): Promise<SteerInput | undefined> {
+    const steer = await this.#deps.sessions.drainSteerMessage(session.id, authority);
+    if (steer === undefined) return undefined;
+    const images = await Promise.all(steer.attachments.map(async (ref) => {
+      const content = await this.#deps.attachments.read(session.ownerUid, ref.id);
+      return imageBlock(content.mediaType, content.data);
+    }));
+    return { text: steer.prompt, images };
+  }
+
   /**
    * Shows the user this build's desktop, when its provider has one.
    *
@@ -161,6 +222,7 @@ export class SessionRunner {
     acquired: AcquiredSandbox,
     publish: (type: string, data: Record<string, unknown>) => Promise<void>,
     signal: AbortSignal,
+    desktopAbort: AbortSignal,
   ): Promise<boolean> {
     const settings = acquired.provider.desktop;
     if (settings === undefined) return false;
@@ -168,15 +230,39 @@ export class SessionRunner {
       const handoff = this.#deps.desktop;
       if (handoff === undefined) throw new Error('The runner has no desktop handoff configured.');
       if (acquired.running.startDesktop === undefined) throw new Error('This sandbox provider cannot show a desktop.');
-      const endpoint = await acquired.running.startDesktop(settings, signal);
-      // Written only once the stream is reachable, and expiring with the sandbox,
-      // so a deletion that never happens cannot leave a stale entry behind.
-      await handoff.publish(session.id, endpoint, acquired.provider.timeoutSeconds + 60);
-      this.#desktops.add(session.id);
-      await publish('desktop.ready', { width: settings.width, height: settings.height });
-      return true;
+      const startupSignal = AbortSignal.any([
+        signal,
+        desktopAbort,
+        AbortSignal.timeout(this.#deps.desktopStartTimeoutMs ?? DEFAULT_DESKTOP_START_TIMEOUT_MS),
+      ]);
+      const startAndPublish = async (): Promise<DesktopHandoff> => {
+        const endpoint = await acquired.running.startDesktop!(settings, startupSignal);
+        startupSignal.throwIfAborted();
+        await handoff.publish(session.id, endpoint, acquired.provider.timeoutSeconds + 60);
+        if (startupSignal.aborted) {
+          try { await handoff.clear(session.id); }
+          catch { /* The handoff expires with the sandbox. */ }
+          startupSignal.throwIfAborted();
+        }
+        return endpoint;
+      };
+      let onAbort: (() => void) | undefined;
+      const aborted = new Promise<never>((_, reject) => {
+        onAbort = () => reject(startupSignal.reason ?? new Error('Desktop startup was aborted.'));
+        if (startupSignal.aborted) onAbort();
+        else startupSignal.addEventListener('abort', onAbort, { once: true });
+      });
+      try {
+        await Promise.race([startAndPublish(), aborted]);
+        this.#desktops.add(session.id);
+        await publish('desktop.ready', { width: settings.width, height: settings.height });
+        return true;
+      } finally {
+        if (onAbort !== undefined) startupSignal.removeEventListener('abort', onAbort);
+      }
     } catch (error) {
       signal.throwIfAborted();
+      desktopAbort.throwIfAborted();
       this.#deps.log.error(
         { sessionId: session.id, diagnostic: safeErrorDiagnostic(error) },
         'could not start the desktop; continuing without it',
@@ -322,6 +408,15 @@ export class SessionRunner {
     // snapshot the user still owns — which is exactly what a failed restore
     // leaves behind, and what a failure before restore never had.
     let restored: RestoreOutcome | undefined;
+    let desktopAbort: AbortController | undefined;
+    let desktopStart: Promise<boolean> | undefined;
+    // A desktop still starting when the session is over is withdrawn, never
+    // announced: the user must not be shown a screen for work that has ended.
+    const settleDesktop = async (): Promise<void> => {
+      if (desktopStart === undefined) return;
+      desktopAbort?.abort(new Error('The session finished before the desktop started.'));
+      await desktopStart.catch(() => {});
+    };
 
     try {
       signal.throwIfAborted();
@@ -435,6 +530,7 @@ export class SessionRunner {
         throw new ContinuationPause(checkpoint, reason);
       };
       const admission = createCallAdmission({
+        models: this.#deps.models,
         anthropic: this.#deps.anthropic, uid: session.ownerUid, sessionId: session.id,
         inputMeterKey: executionRegistry.inputTokenMeterKey, outputMeterKey: executionRegistry.outputTokenMeterKey,
         ...(selectedOffer === undefined ? {} : { maxInputTokens: selectedOffer.maxInputTokens }),
@@ -444,6 +540,8 @@ export class SessionRunner {
           const latest = await this.#deps.entitlements.forUser(session.ownerUid, new Date(), true);
           assertBuildAllowed(latest, project!.platform, session.model);
           if (inFallback) requireFallbackPolicy((await this.#deps.configuration.get()).registry, latest, session.fallback?.offer?.policyFingerprint);
+          if ((await this.#deps.models.get(session.model)).efforts.length > 0) resolveAiEffort(latest, session.effort);
+
         },
         onProblem: (error) => log.error({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'model admission reconciliation failed'),
       });
@@ -485,32 +583,49 @@ export class SessionRunner {
         template: acquired.provider.template,
         platform: acquired.provider.platform,
       });
-      const desktopReady = await this.#startDesktop(session, acquired, publish, signal);
+      desktopAbort = new AbortController();
+      desktopStart = this.#startDesktop(session, acquired, publish, signal, desktopAbort.signal);
+      void desktopStart.catch(() => {});
 
-      // Only a plan that pays for it gets its work back. For everyone else the
-      // sandbox is genuinely disposable, which is the difference being sold.
-      if (persists) {
-        restored = await this.#deps.persistence.restore(
-          acquired.running,
-          acquired.provider,
-          project,
-        );
-        await publish('project.restored', { outcome: restored });
+      let messages: readonly ConversationMessage[];
+      try {
+        // Only a plan that pays for it gets its work back. For everyone else the
+        // sandbox is genuinely disposable, which is the difference being sold.
+        if (persists) {
+          restored = await this.#deps.persistence.restore(
+            acquired.running,
+            acquired.provider,
+            project,
+          );
+          await publish('project.restored', { outcome: restored });
+        }
+
+        messages = await this.#withImages(session.ownerUid, await sessions.listMessages(
+          session.ownerUid,
+          session.id,
+          this.#deps.messageHistoryLimit,
+        ));
+      } catch (error) {
+        desktopAbort.abort(error);
+        await desktopStart.catch(() => {});
+        throw error;
       }
-
-      const messages = await sessions.listMessages(
-        session.ownerUid,
-        session.id,
-        this.#deps.messageHistoryLimit,
+      let desktopUp = false;
+      void desktopStart.then((ready) => { desktopUp = ready; }, () => {});
+      const desktopReady = await settleWithin(
+        desktopStart,
+        this.#deps.desktopStartGraceMs ?? DEFAULT_DESKTOP_START_GRACE_MS,
+        false,
       );
-      const toolCall = async (name: string, input: Record<string, unknown>) => {
+      const toolCall = async (name: string, input: Record<string, unknown>, callId?: string) => {
         await sessions.assertPersistenceLease(authority);
         signal.throwIfAborted();
+
         if (persists && workspaceTools.has(name) && !readOnlyTools.has(name)) {
           await sessions.requireWorkspaceSalvage(authority, acquired!.running.externalId);
           workspaceMayBeDirty = true;
         }
-        await publish('agent.tool_call', { name, input });
+        await publish('agent.tool_call', { name, input, ...(callId === undefined ? {} : {callId}) });
       };
 
       const withValidationSandbox: NonNullable<import('./tools.ts').ToolContext['withValidationSandbox']> = async (run) => {
@@ -558,7 +673,8 @@ export class SessionRunner {
             throw leaseLost;
           }
         },
-        drainSteer: () => sessions.drainSteerMessage(session.id, authority),
+        drainSteer: () => this.#drainSteer(session, authority),
+        skills: await this.#skillsFor(session.ownerUid, messages),
         desktopReady,
         events: {
           // Text arrives as it is generated. Not awaited: the model does not
@@ -568,8 +684,9 @@ export class SessionRunner {
           },
           step: (step) => publish('agent.step', step),
           toolCall,
-          toolResult: (name, result) =>
+          toolResult: (name, result, callId) =>
             publish('agent.tool_result', {
+              ...(callId === undefined ? {} : {callId}),
               name,
               isError: result.isError,
               // Bounded for the same reason the model's copy is: an event log
@@ -577,6 +694,7 @@ export class SessionRunner {
               text: result.text.slice(0, this.#deps.limits.toolOutputMaxChars),
             }),
           preview: (preview) => publish('preview.ready', preview),
+          skillUsed: (detail) => publish('agent.skill_used', { name: detail.name, title: detail.title, source: detail.source }),
           specialistStarted: (detail) =>
             publish('agent.specialist_started', { role: detail.role, label: detail.label }),
           // Verdict, count and the one-line conclusion. Never the instructions,
@@ -615,11 +733,11 @@ export class SessionRunner {
           'hot-chaining queued message in existing sandbox',
         );
 
-        const chainMessages = await sessions.listMessages(
+        const chainMessages = await this.#withImages(session.ownerUid, await sessions.listMessages(
           session.ownerUid,
           session.id,
           this.#deps.messageHistoryLimit,
-        );
+        ));
 
         const chainRun = await runAgentTurn({
           requestInput,
@@ -641,21 +759,24 @@ export class SessionRunner {
               throw leaseLost;
             }
           },
-          drainSteer: () => sessions.drainSteerMessage(session.id, authority),
-          desktopReady,
+          drainSteer: () => this.#drainSteer(session, authority),
+          skills: await this.#skillsFor(session.ownerUid, chainMessages),
+          desktopReady: desktopUp,
           events: {
             text: (delta) => {
               queueText(delta);
             },
             step: (step) => publish('agent.step', step),
             toolCall,
-            toolResult: (name, result) =>
+            toolResult: (name, result, callId) =>
               publish('agent.tool_result', {
+                ...(callId === undefined ? {} : {callId}),
                 name,
                 isError: result.isError,
                 text: result.text.slice(0, this.#deps.limits.toolOutputMaxChars),
               }),
             preview: (preview) => publish('preview.ready', preview),
+            skillUsed: (detail) => publish('agent.skill_used', { name: detail.name, title: detail.title, source: detail.source }),
             specialistStarted: (detail) =>
               publish('agent.specialist_started', { role: detail.role, label: detail.label }),
             // Verdict, count and the one-line conclusion. Never the instructions,
@@ -684,6 +805,7 @@ export class SessionRunner {
         nextQueued = await sessions.dequeueNextMessage(session.id, authority, signal);
       }
 
+      await settleDesktop();
       saveAttempted = true;
       await this.#save(
         session,
@@ -752,12 +874,13 @@ export class SessionRunner {
       const reason = this.#reason(error);
       const shuttingDown = shutdown?.aborted === true && !cancellation.signal.aborted;
       if (shuttingDown) log.info({ sessionId: session.id }, 'runner shutdown: draining active session');
-      else log.error({ sessionId: session.id }, 'session failed');
+      else log.error({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'session failed');
 
       if (acquired !== undefined) {
         // Withdrawn first: some of the paths below keep the machine for salvage and
         // throw before it is released, and a failed session should not keep
         // offering a live view of it.
+        await settleDesktop();
         await this.#endDesktop(session.id, 'session-ended');
         if (workspaceMayBeDirty && saveAttempted && !saveCompleted) throw new RunnerWorkError(error, 'workspace/save-failed');
         // Saved before the machine is discarded, even now: a build that failed

@@ -19,9 +19,9 @@ test('a lost project response can be reconciled without duplicating projects or 
   const first = results[0]!;
   assert.ok(results.every((project) => project.id === first.id));
   assert.equal(data.get('users/alice')?.['projectCount'], 1);
-  const receipt = [...data].find(([key]) => key.startsWith('users/alice/commands/'))?.[1];
-  assert.deepEqual(JSON.parse(String(receipt?.['result'])), { id: first.id });
-  await assert.rejects(projects.create('alice', { ...input, name: 'Changed' }, 'stable-project-command'), { code: 'command/conflict' });
+  const receipt = [...data].find(([key]) => key.startsWith('mutationReceipts/'))?.[1];
+  assert.deepEqual(JSON.parse(String(receipt?.['acceptance'])), { id: first.id });
+  await assert.rejects(projects.create('alice', { ...input, name: 'Changed' }, 'stable-project-command'), { code: 'request/idempotency-conflict' });
   data.delete(`projects/${first.id}`);
   await assert.rejects(projects.create('alice', input, 'stable-project-command'), { code: 'project/not-found' });
   assert.equal([...data.keys()].filter((key) => /^projects\/[a-z0-9-]+$/.test(key)).length, 0);

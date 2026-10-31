@@ -1,5 +1,6 @@
 import type { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { configurationKeys } from '../config/index.ts';
+import { MutationReplay } from './mutation-response.ts';
 
 /**
  * The single error shape the API ever returns:
@@ -35,6 +36,7 @@ export class AppError extends Error {
 // Logging allowlists, not a domain-code registry: unknown codes remain explicit
 // generic categories. Never copy message, stack, details or arbitrary properties.
 const diagnosticCodes = new Set([
+  'session/model-unavailable', 'session/effort-unsupported', 'session/effort-not-permitted',
   'release/recovery-protocol-incompatible', 'session/recovery-protocol-incompatible',
   'usage/limit-reached', 'usage/reconciliation-required', 'entitlement/misconfigured',
   'session/cancelled', 'session/lease-lost', 'session/project-guard-lost',
@@ -43,6 +45,9 @@ const diagnosticCodes = new Set([
   'account/erasure-pending', 'account/reconciliation-required', 'project/deleting', 'project/not-found',
   'project/persistence-failed', 'sandbox/platform-unconfigured', 'billing/provider-unavailable',
   'billing/bad-signature', 'session/no-desktop', 'desktop/capacity-reached', 'auth/token-invalid', 'auth/token-expired', 'auth/token-revoked', 'auth/email-not-verified',
+  'auth/email-unavailable', 'auth/verification-code-cooldown', 'auth/verification-code-invalid',
+  'auth/verification-code-daily-limit',
+  'email/delivery-unavailable', 'email/daily-limit-reached',
   'runner/shutdown', 'runner/execution-failed',
 ]);
 const diagnosticStages = new Set([
@@ -155,6 +160,9 @@ function body(
 
 export function registerErrorHandler(app: FastifyInstance): void {
   app.setErrorHandler((error: FastifyError | AppError, request: FastifyRequest, reply: FastifyReply) => {
+    if (error instanceof MutationReplay) {
+      return reply.code(error.response.statusCode).send(error.response.body);
+    }
     if (error instanceof AppError) {
       if (error.statusCode >= 500) {
         // Internal configuration values and provider diagnostics are not public

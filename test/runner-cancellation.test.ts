@@ -1,5 +1,6 @@
 import { AppError } from '../src/http/errors.ts';
 import assert from 'node:assert/strict';
+import { fixtureModels } from './support/models.ts';
 import { inspect } from 'node:util';
 import test from 'node:test';
 import { Sandbox, SandboxNotFoundError } from 'e2b';
@@ -204,12 +205,12 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
     },
   } } as unknown as Anthropic;
   const session = { id: 's', projectId: 'p', ownerUid: 'u', model: entitlements.capabilities.stringList('ai.model.allowlist')[0],
-    leaseToken: 'lease', reservationIds: [], specialistReservationIds: [] };
+    effort: 'low', mode: 'build', leaseToken: 'lease', reservationIds: [], specialistReservationIds: [] };
   const sessions = {
     requireWorkspaceSalvage: async () => { events.push('salvage-required'); },
     claim: async () => session, heartbeat: async () => { if (!leaseValid) throw new Error('Lease authority lost'); }, assertPersistenceLease: async () => { if (cancelled) throw new AppError({ code: 'session/cancelled', statusCode: 409, message: 'Cancelled by user' }); }, markExecutionStarted: async () => {}, attachSandbox: async () => {},
     detachSandbox: async () => { events.push('detach'); }, drainSteerMessage: async () => undefined,
-    listMessages: async () => [{ role: 'user', content: 'Build', seq: 0 }],
+    listMessages: async () => [{ role: 'user', content: 'Build', seq: 0, attachments: [] }],
     reserveSpecialistTokens: async (_id: string, _runner: string, input: { meterKey: string; quantity: number; operationId: string }) =>
       metering.reserve({ ...input, uid: 'u', entitlements, now: new Date() }),
     forgetSpecialistReservation: async () => {},
@@ -219,7 +220,7 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
   };
   const logs: { details: object; message: string }[] = [];
   const capture = (details: object, message: string) => { logs.push({ details, message }); };
-  const deps = { runnerId: 'runner', anthropic, sessions, metering, configuration,
+  const deps = { models: fixtureModels, runnerId: 'runner', anthropic, sessions, metering, configuration,
     entitlements: { forUser: async () => entitlements },
     projects: { readOwned: async () => ({ id: 'p', platform: 'web', ownerUid: 'u', name: 'Fixture', snapshot: { kind: 'none' } }) },
     sandboxes: new SandboxService(configuration, metering, new Map([['e2b', adapter]])),

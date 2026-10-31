@@ -331,6 +331,7 @@ class E2BSandbox implements RunningSandbox {
     }
     const sandbox = this.#sandbox;
     const inBackground = async (command: string, envs?: Record<string, string>): Promise<void> => {
+      signal?.throwIfAborted();
       const handle = await sandbox.commands.run(command, { background: true, timeoutMs: 0, ...(envs === undefined ? {} : { envs }) });
       await handle.disconnect();
     };
@@ -340,7 +341,7 @@ class E2BSandbox implements RunningSandbox {
       for (let attempt = 0; attempt < attempts; attempt++) {
         signal?.throwIfAborted();
         try {
-          await sandbox.commands.run(check, { timeoutMs: 10_000 });
+          await sandbox.commands.run(check, { timeoutMs: 10_000, ...(signal === undefined ? {} : { signal }) });
           return;
         } catch (error) {
           if (!(error instanceof CommandExitError)) throw error;

@@ -26,8 +26,7 @@ import {
   type AgentLimits,
   blockerExplanation,
   parseReview,
-  runAgentTurn,
-} from '../src/runner/agent.ts';
+  runAgentTurn, type SteerInput } from '../src/runner/agent.ts';
 import {
   type ToolContext,
   makeRunValidation,
@@ -112,7 +111,7 @@ const project: Project = {
   name: 'Project',
   description: undefined,
   platform: 'web',
-  status: 'draft',
+  status: 'draft', visibility: 'private',
   snapshotBytes: 0,
   snapshot: { kind: 'none' },
   activeSessionId: 'session-1',
@@ -431,6 +430,7 @@ function eventsOf(published: Published[]): AgentEvents {
     toolResult: async () => {},
     preview: async () => {},
     step: async () => {},
+    skillUsed: async (detail) => { published.push({ type: 'agent.skill_used', data: { ...detail } }); },
     specialistStarted: async (detail) => {
       published.push({ type: 'agent.specialist_started', data: { ...detail } });
     },
@@ -466,7 +466,7 @@ async function turn(options: {
   readonly problems?: { error: Error; what: string }[];
   readonly failSpecialistInput?: boolean;
   readonly project?: Project;
-  readonly drainSteer?: () => Promise<string | undefined>;
+  readonly drainSteer?: () => Promise<SteerInput | undefined>;
   readonly provider?: SandboxProvider;
   readonly desktopReady?: boolean;
   readonly requestInput?: Parameters<typeof runAgentTurn>[0]['requestInput'];
@@ -510,7 +510,9 @@ async function turn(options: {
     withValidationSandbox: sandbox instanceof ValidationSandbox ? sandbox.withCopy.bind(sandbox) : undefined,
     // Agent orchestration tests inject the billing boundary. The real admission
     // service's reserve-before-dispatch protocol is covered independently.
-    admission: options.admission ?? { begin: async ({ outputReservationId }) => ({ settle: async (usage) => {
+    admission: options.admission ?? { begin: async ({ outputReservationId, params, maxOutputTokens, effort }) => ({
+      params: { ...params, output_config: { effort: effort === 'standard' ? 'medium' : effort } }, maxOutputTokens, settle: async (usage) => {
+
       if (options.failSpecialistInput === true && outputReservationId !== undefined) throw new Error('Input settlement failed');
       if (usage.input !== undefined && usage.input > 0) await metering.consume({ meterKey: 'ai.tokens.input', quantity: usage.input });
       if (outputReservationId === undefined && usage.output !== undefined && usage.output > 0) {
@@ -522,7 +524,8 @@ async function turn(options: {
     project: options.project ?? project,
     provider: options.provider ?? provider,
     sandbox,
-    messages: [{ seq: 0, role: 'user', content: options.goal ?? 'do the thing', createdAt: new Date(0) }],
+    messages: [{ seq: 0, role: 'user', content: options.goal ?? 'do the thing', attachments: [], createdAt: new Date(0) }],
+
     entitlements,
     registry: options.registry ?? registryWith(options.specialists ?? [architecture, security]),
     metering: meteringOf(metering),
@@ -2898,7 +2901,7 @@ test('the agent awaits durable steering before dispatching its next model call',
   const h = await turn({ drainSteer: async () => {
     await Promise.resolve();
     persisted = true;
-    return 'Preserve all customer records';
+    return { text: 'Preserve all customer records' };
   }, script: [(invocation) => {
     assert.equal(persisted, true);
     assert.equal(invocation.messages.at(-1)?.content, 'Preserve all customer records');
@@ -3028,7 +3031,7 @@ test('the computer toolset is withheld unless the desktop is up, the model is li
   };
 
   // The desktop did not come up: the agent is told there is no screen at all.
-  const down = await withoutComputer({ provider: desktopProvider, desktopReady: false, sandbox: new ScreenSandbox() }, /desktop did not start in this session/);
+  const down = await withoutComputer({ provider: desktopProvider, desktopReady: false, sandbox: new ScreenSandbox() }, /no desktop screen available to you/);
   assert.equal(down.includes('You can see and operate'), false);
   // Up, but this model is not one the registry lists: the user can watch, the agent cannot see.
   const other = await withoutComputer(
@@ -3042,7 +3045,7 @@ test('the computer toolset is withheld unless the desktop is up, the model is li
   // No desktop configured: the prompt says nothing about a screen.
   const plain = await turn({ script: [() => say('ok')] });
   assert.equal(hasComputer(plain.scripted.calls[0]!.tools), false);
-  assert.equal(/You can see and operate|You cannot see or operate|desktop did not start/.test(plain.scripted.calls[0]!.system), false);
+  assert.equal(/You can see and operate|You cannot see or operate|no desktop screen available/.test(plain.scripted.calls[0]!.system), false);
 });
 
 test('once one computer action in a turn fails, the rest of that turn are not run', async () => {
@@ -3157,7 +3160,7 @@ test('request_user_input persists the request and blocks subsequent tool calls i
 test('a portable admission checkpoint resumes after completed tool results without replay or step-budget reset', async () => {
   const sandbox = new FakeSandbox(); let attempts = 0; let saved: ContinuationCheckpoint | undefined;
   await assert.rejects(turn({ sandbox, script: [() => call('run_command', { command: 'write-once' })],
-    admission: { begin: async () => { if (++attempts === 2) throw new AppError({ code: 'usage/limit-reached', statusCode: 402, message: 'Quota' }); return { settle: async () => {} }; } },
+    admission: { begin: async ({ params, maxOutputTokens }) => { if (++attempts === 2) throw new AppError({ code: 'usage/limit-reached', statusCode: 402, message: 'Quota' }); return { params, maxOutputTokens, settle: async () => {} }; } },
     onAdmissionFailure: async (error, checkpoint) => { saved = checkpoint; throw new ContinuationPause(checkpoint, error as AppError); },
   }), ContinuationPause);
   assert.ok(saved); assert.equal(saved.completedSteps, 1); assert.equal(sandbox.commands.length, 1);
@@ -3195,7 +3198,7 @@ test('a resumed desktop refuses historical coordinates until it has observed a f
   let attempts = 0; let saved: ContinuationCheckpoint | undefined;
   await assert.rejects(turn({ sandbox: new ScreenSandbox(), provider: desktopProvider, desktopReady: true,
     script: [() => ({ content: [computerCall('old-shot', 'screenshot', {})], stop_reason: 'tool_use' })],
-    admission: { begin: async () => { if (++attempts === 2) throw new AppError({ code: 'usage/limit-reached', statusCode: 402, message: 'Quota' }); return { settle: async () => {} }; } },
+    admission: { begin: async ({ params, maxOutputTokens }) => { if (++attempts === 2) throw new AppError({ code: 'usage/limit-reached', statusCode: 402, message: 'Quota' }); return { params, maxOutputTokens, settle: async () => {} }; } },
     onAdmissionFailure: async (error, checkpoint) => { saved = checkpoint; throw new ContinuationPause(checkpoint, error as AppError); },
   }), ContinuationPause);
   assert.ok(saved); const sandbox = new ScreenSandbox();

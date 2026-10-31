@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { fixtureModels } from './support/models.ts';
 import test from 'node:test';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { ContentBlock } from '@anthropic-ai/sdk/resources/messages';
@@ -16,10 +17,11 @@ import type { UserRepository } from '../src/users/repository.ts';
 import type { RunningSandbox } from '../src/sandboxes/provider.ts';
 import { ledger } from './support/ledger.ts';
 
-function harness(failSecond = false, rejectRecheck = false) {
+function harness(failSecond = false, rejectRecheck = false, models = fixtureModels) {
   const events: string[] = [];
   let checks = 0;
   const admission = createCallAdmission({
+    models,
     uid: 'user', sessionId: 'session', inputMeterKey: 'input', outputMeterKey: 'output',
     anthropic: { messages: { countTokens: async () => ({ input_tokens: 10 }) } } as unknown as Anthropic,
     authorize: async () => { checks++; if (rejectRecheck && checks === 2) throw new Error('lease lost'); },
@@ -41,12 +43,25 @@ function harness(failSecond = false, rejectRecheck = false) {
       },
     } as unknown as MeteringService,
   });
-  return { events, begin: () => admission.begin({ params: { model: 'test', messages: [{ role: 'user', content: 'hi' }] }, maxOutputTokens: 20, signal: new AbortController().signal }) };
+  return { events, begin: () => admission.begin({ effort: 'low', params: { model: 'test', messages: [{ role: 'user', content: 'hi' }] }, maxOutputTokens: 20, signal: new AbortController().signal }) };
 }
 test('a refused output hold releases the input hold without dispatching', async () => {
   const h = harness(true);
   await assert.rejects(h.begin(), /quota/);
   assert.deepEqual(h.events, ['hold:input:10', 'journal:input:0', 'settle:input:0:true', 'forget:input']);
+});
+
+test('native reasoning omits effort from counted and generated params and bounds output tokens', async () => {
+  const h = harness(false, false, {get: async id => ({id, name: id, efforts: [], maxOutputTokens: 12})});
+  const admitted = await h.begin();
+  assert.equal(Object.hasOwn(admitted.params, 'output_config'), false);
+  assert.equal(admitted.maxOutputTokens, 12);
+  assert.ok(h.events.includes('hold:output:12'));
+});
+test('unsupported provider effort fails before any token holds are created', async () => {
+  const h = harness(false, false, {get: async id => ({id, name: id, efforts: ['standard'], maxOutputTokens: 12})});
+  await assert.rejects(h.begin(), /does not support/);
+  assert.deepEqual(h.events, []);
 });
 test('lease loss during admission releases both undispatched holds', async () => {
   const h = harness(false, true);
@@ -71,19 +86,19 @@ test('missing authoritative usage preserves dispatched holds', async () => {
 test('token counting receives cancellation and creates no holds after its aborted response', async () => {
   const controller = new AbortController();
   let holds = 0;
-  const admission = createCallAdmission({ uid: 'u', sessionId: 's', inputMeterKey: 'input', outputMeterKey: 'output',
+  const admission = createCallAdmission({ models: fixtureModels, uid: 'u', sessionId: 's', inputMeterKey: 'input', outputMeterKey: 'output',
     anthropic: { messages: { countTokens: async (_params: unknown, options: { signal: AbortSignal }) => {
       assert.equal(options.signal, controller.signal); controller.abort(); return { input_tokens: 10 };
     } } } as unknown as Anthropic,
     authorize: async () => {}, onProblem: () => {}, metering: {} as MeteringService,
     reservations: { take: async () => { holds++; throw new Error('Must not reserve after cancellation'); }, forget: async () => {} },
   });
-  await assert.rejects(admission.begin({ params: { model: 'test', messages: [] }, maxOutputTokens: 10, signal: controller.signal }));
+  await assert.rejects(admission.begin({ effort: 'low', params: { model: 'test', messages: [] }, maxOutputTokens: 10, signal: controller.signal }));
   assert.equal(holds, 0);
 });
 
 /** Real admission, agent, fenced session reservations and metering; fake only the store and SDK. */
-async function modelFixture() {
+async function modelFixture(models = fixtureModels) {
   const { db, data } = ledger();
   const registry = parseRegistry(registryDocument, 'registry');
   const plans = new Map(planDocuments.map((row) => [row.key, parsePlan(row, row.key, registry)]));
@@ -104,9 +119,12 @@ async function modelFixture() {
   const problems: { error: Error; what: string }[] = [];
   const onProblem = (error: Error, what: string) => { problems.push({ error, what }); };
   let calls = 0;
+  const requests: unknown[] = [];
   const sdk = {
-    countTokens: async () => ({ input_tokens: 10 }),
+    countTokens: async (params: unknown) => {requests.push(params); return {input_tokens: 10};},
     stream: (params?: { tools?: readonly { name?: string }[] }) => {
+      requests.push(params);
+
       calls++;
       return { on: () => {}, finalMessage: async (): Promise<{ content: ContentBlock[]; usage: { input_tokens: number; output_tokens: number }; stop_reason: string }> => ({
         content: [{ type: 'text', text: 'Done', citations: null }, ...(params?.tools?.some(tool => tool.name === 'finish_task') ? [{ type: 'tool_use' as const, id: 'finish', name: 'finish_task', input: { outcome: 'answered', summary: 'Done', evidence: [] }, caller: { type: 'direct' as const } }] : [])], usage: { input_tokens: 7, output_tokens: 3 }, stop_reason: params?.tools?.some(tool => tool.name === 'finish_task') ? 'tool_use' : 'end_turn',
@@ -120,23 +138,32 @@ async function modelFixture() {
     }),
     forget: (id: string) => sessions.forgetSpecialistReservation('s', authority, id),
   };
-  const admission = createCallAdmission({ anthropic, uid: 'u', sessionId: 's',
+  const admission = createCallAdmission({ models, anthropic, uid: 'u', sessionId: 's',
     inputMeterKey: registry.inputTokenMeterKey, outputMeterKey: registry.outputTokenMeterKey, metering, reservations,
     authorize: () => sessions.assertPersistenceLease(authority), onProblem });
-  const begin = () => admission.begin({ params: { model: session.model, messages: [] }, maxOutputTokens: 20, signal: controller.signal });
+  const begin = () => admission.begin({ effort: 'low', params: { model: session.model, messages: [] }, maxOutputTokens: 20, signal: controller.signal });
   const run = async () => runAgentTurn({ admission, anthropic, session, project: await projects.readOwned('u', 'p'),
     provider: registry.sandboxProviders.get('web')!, sandbox: { readFile: async () => 'Fixture file' } as unknown as RunningSandbox, withValidationSandbox: undefined,
-    messages: [{ seq: 0, role: 'user', content: 'Build', createdAt: new Date() }], entitlements, registry, metering,
+    messages: [{ seq: 0, role: 'user', content: 'Build', attachments: [], createdAt: new Date() }], entitlements, registry, metering,
     limits: { maxSteps: 2, maxOutputTokens: 20, toolOutputMaxChars: 4096, maxSpecialistConsultations: 1,
       specialistMaxSteps: 2, commandTimeoutMs: 1000, previewReadyTimeoutSeconds: 1 },
     events: { text: () => {}, step: async () => {}, toolCall: async () => {}, toolResult: async () => {},
-      preview: async () => {}, specialistStarted: async () => {}, specialistCompleted: async () => {} },
+      preview: async () => {}, specialistStarted: async () => {}, specialistCompleted: async () => {}, skillUsed: async () => {} },
     signal: controller.signal, assertStillOurs: () => {}, drainSteer: () => undefined, desktopReady: false, reservations, onProblem });
   const records = () => [...data].filter(([path]) => path.startsWith('users/u/reservations/')).map(([path, fields]) => ({ id: path.split('/').at(-1)!, fields }));
   const usage = (key: string) => data.get(`users/u/usage/${key}`)!;
   return { db, data, metering, registry, entitlements, sessions, authority, sdk, controller, problems, reservations,
-    admission, begin, run, records, usage, calls: () => calls };
+    admission, begin, run, records, usage, requests, calls: () => calls };
 }
+
+test('native-effort agent generation and token counting both omit the unsupported parameter', async () => {
+  const h = await modelFixture({get: async id => ({id, name: id, efforts: [], maxOutputTokens: 8})});
+  await h.run();
+  assert.equal(h.calls(), 1);
+  assert.equal(h.requests.length, 2);
+  for (const params of h.requests) assert.equal(Object.hasOwn(params as object, 'output_config'), false);
+  assert.equal((h.requests[1] as {max_tokens: number}).max_tokens, 8);
+});
 
 test('I05: committed mark with lost acknowledgement never invokes generation and restores quota', async () => {
   const h = await modelFixture();

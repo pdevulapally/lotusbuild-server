@@ -2,6 +2,9 @@ import { TaskTracker, compactTaskConversation, type TaskContext } from './task-c
 import { timed, startTiming } from '../diagnostics/timing.ts';
 import { contextFingerprint, retainCheckpointImages, type AdmissionBoundary, type ContinuationCheckpoint } from './continuation.ts';
 import type { CallAdmission } from './call-admission.ts';
+import type { Skill } from '../skills/model.ts';
+import { skillCatalogue, skillInstructionsText } from '../skills/prompt.ts';
+import type { ImageMediaType } from '../attachments/store.ts';
 import type Anthropic from '@anthropic-ai/sdk';
 import type {
   ContentBlockParam,
@@ -9,10 +12,9 @@ import type {
   MessageCountTokensParams,
   MessageParam,
   MessageStreamEvent,
-  OutputConfig,
   Tool,
   ToolUnion,
-  ToolUseBlock,
+  ToolUseBlock, ImageBlockParam,
 } from '@anthropic-ai/sdk/resources/messages';
 
 import type { Registry, SandboxProvider, SpecialistDefinition } from '../entitlements/schema.ts';
@@ -68,12 +70,26 @@ export interface SpecialistCompleted extends SpecialistStarted {
 
 export interface AgentEvents {
   text(delta: string): void;
-  toolCall(name: string, input: Record<string, unknown>): Promise<void>;
-  toolResult(name: string, result: { text: string; isError: boolean }): Promise<void>;
+  toolCall(name: string, input: Record<string, unknown>, callId?: string): Promise<void>;
+  toolResult(name: string, result: { text: string; isError: boolean }, callId?: string): Promise<void>;
   preview(preview: { url: string; port: number }): Promise<void>;
   step(step: { number: number; of: number; steered?: boolean }): Promise<void>;
   specialistStarted(detail: SpecialistStarted): Promise<void>;
   specialistCompleted(detail: SpecialistCompleted): Promise<void>;
+  /** A user skill's instructions entered the conversation, by mention or by the model's own call. */
+  skillUsed(detail: SkillUsed): Promise<void>;
+}
+
+export interface SkillUsed {
+  readonly name: string;
+  readonly title: string;
+  readonly source: 'mention' | 'tool';
+}
+
+/** The user's enabled skills for this run, and the ones the prompt named outright. */
+export interface SkillsForTurn {
+  readonly available: readonly Skill[];
+  readonly mentioned: readonly Skill[];
 }
 
 export const verdicts = ['ok', 'concern', 'blocking'] as const;
@@ -265,6 +281,11 @@ const agentWorkingInstructions = [
   '  delete a check, suppress an error, or hard-code an expected result to make something pass.',
   '- Keep commands non-interactive and bounded. Never leave a server running in the foreground: start it',
   '  in the background (or with start_preview when it is available) and confirm it is actually up.',
+  '- Make every change with write_file or edit_file, and run every command with run_command. Never',
+  '  describe a file, a command or a result in prose instead of doing it; the user sees each tool call',
+  '  as it happens, so the work itself is the progress report. Keep the text between tool calls short.',
+  '- Show the app early. As soon as the project can start its dev server, start_preview it (when it is',
+  '  available) and keep it running while you work, rather than waiting until everything is finished.',
   '- Finish what you start. Do not leave placeholders, stubs, TODOs or mock data in place of real',
   '  behaviour unless the user asked for them, and say so plainly when something is left out on purpose.',
   '',
@@ -310,7 +331,7 @@ export function screenInstructions(
   if (access === undefined) return [];
   if (access === 'unavailable') {
     return [
-      'The desktop did not start in this session, so there is no screen: do not try to open a browser on it,',
+      'There is no desktop screen available to you in this turn: do not try to open a browser on it,',
       'and do not tell the user they can watch anything. Build and check the project with commands and tests.',
       '',
     ];
@@ -349,6 +370,7 @@ export function systemPrompt(
   provider: SandboxProvider,
   access?: ScreenAccess,
   mode: BuildSession['mode'] = 'build',
+  skills: readonly Pick<Skill, 'name' | 'title' | 'description'>[] = [],
 ): string {
   return [
     'You are LotusBuild\'s software engineering agent, working on a user\'s project in a sandbox.',
@@ -361,14 +383,33 @@ export function systemPrompt(
     ...(mode === 'plan' ? [planModeInstructions, ''] : []),
     agentWorkingInstructions,
     '',
+    ...(skills.length === 0 ? [] : [...skillCatalogue(skills), '']),
     agentSafetyInstructions,
   ].join('\n');
 }
 
+/** A transcript message with any attached images already loaded for the model. */
+export type ConversationMessage = SessionMessage & { readonly images?: readonly ImageBlockParam[] };
+
+export interface SteerInput {
+  readonly text: string;
+  readonly images?: readonly ImageBlockParam[];
+}
+
+export function imageBlock(mediaType: ImageMediaType, data: Buffer): ImageBlockParam {
+  return { type: 'image', source: { type: 'base64', media_type: mediaType, data: data.toString('base64') } };
+}
+
+/** Images first, then the words, so the model reads the prompt with the pictures in view. */
+export function userContent(text: string, images: readonly ImageBlockParam[] | undefined): MessageParam['content'] {
+  if (images === undefined || images.length === 0) return text;
+  return [...images, { type: 'text', text }];
+}
+
 /** Firestore's transcript, as the model's conversation. */
-function conversationFrom(messages: readonly SessionMessage[], project: Project): MessageParam[] {
+export function conversationFrom(messages: readonly ConversationMessage[], project: Project): MessageParam[] {
   return [{ role: 'user', content: projectContext(project) },
-    ...messages.map((message) => ({ role: message.role, content: message.content }))];
+    ...messages.map((message) => ({ role: message.role, content: userContent(message.content, message.images) }))];
 }
 
 function requireText(input: Record<string, unknown>, name: string, where: string): string {
@@ -562,12 +603,12 @@ interface ModelLoopInput {
   readonly onProblem: ProblemReporter;
   readonly onText?: ((delta: string) => void) | undefined;
   readonly onStep?: ((step: { number: number; of: number; steered?: boolean }) => Promise<void>) | undefined;
-  readonly onToolCall?: ((name: string, input: Record<string, unknown>) => Promise<void>) | undefined;
+  readonly onToolCall?: ((name: string, input: Record<string, unknown>, callId?: string) => Promise<void>) | undefined;
   readonly onToolResult?:
-    | ((name: string, result: { text: string; isError: boolean }) => Promise<void>)
+    | ((name: string, result: { text: string; isError: boolean }, callId?: string) => Promise<void>)
     | undefined;
   /** Injects a pending user correction before the next call. */
-  readonly beforeStep?: (() => string | undefined | Promise<string | undefined>) | undefined;
+  readonly beforeStep?: (() => SteerInput | undefined | Promise<SteerInput | undefined>) | undefined;
   /** Ends the loop after a tool call that has produced the caller's answer. */
   readonly stopWhen?: (() => boolean) | undefined;
   readonly candidateStop?: () => string | undefined;
@@ -611,8 +652,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
   let uncertainToolOutcome = false;
   const spoken: string[] = [...(input.resume?.spoken ?? [])];
   if (input.resume !== undefined && input.resume.contextFingerprint !== contextFingerprint(input.system, specs)) throw new AppError({ code: 'fallback/context-changed', statusCode: 409, message: 'The task?s tool permissions or instructions changed. This checkpoint cannot be resumed automatically.' });
-  const providerEffort: NonNullable<OutputConfig['effort']> =
-    input.effort === 'standard' ? 'medium' : input.effort;
+
 
   for (let step = (input.resume?.completedSteps ?? 0) + 1; step <= input.maxSteps; step += 1) {
     input.assertStillOurs();
@@ -621,7 +661,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
 
     const steer = await input.beforeStep?.();
     if (steer !== undefined) {
-      input.conversation.push({ role: 'user', content: steer });
+      input.conversation.push({ role: 'user', content: userContent(steer.text, steer.images) });
     }
     await input.onStep?.(
       steer === undefined
@@ -636,17 +676,17 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
         system: input.system,
         tools: [...specs],
         messages: input.conversation,
-        output_config: { effort: providerEffort },
     };
     let admitted;
     try {
-      admitted = await timed('model.admission', () => input.admission.begin({ params: request, maxOutputTokens: input.maxOutputTokens, signal: input.signal,
+      admitted = await timed('model.admission', () => input.admission.begin({ params: request, maxOutputTokens: input.maxOutputTokens, effort: input.effort, signal: input.signal,
         ...(input.outputReservationId === undefined ? {} : { outputReservationId: input.outputReservationId }) }));
     } catch (error) {
       if (uncertainToolOutcome) throw error;
       await input.onAdmissionFailure?.(error, { request, conversation: input.conversation, spoken, completedSteps: step - 1 });
       throw error;
     }
+
     const usage = new UsageAccumulator();
     let providerDispatchStarted = false;
     let message: Message | undefined;
@@ -660,17 +700,13 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
       const params = {
         // From the session, which took it from the plan's allowlist. Never a
         // literal: which model a plan may use is a commercial decision.
-        model: input.model,
-        max_tokens: input.maxOutputTokens,
+        ...admitted.params,
+        max_tokens: admitted.maxOutputTokens,
         // An agent turn resends the whole conversation, so the prefix is paid for
         // again on every step. Caching the last cacheable block means each step
         // writes the prefix once and the next step reads it at a fraction of the
         // rate — the same tokens, most of the cost removed.
         cache_control: { type: 'ephemeral' as const },
-        system: input.system,
-        tools: [...specs],
-        messages: input.conversation,
-        output_config: { effort: providerEffort },
       };
       // Only the generation SDK invocation crosses this boundary, not admission,
       // parameter preparation or the marker. A synchronous SDK throw is uncertain.
@@ -790,7 +826,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
       input.signal.throwIfAborted();
       if (input.shouldHalt?.()) return { type: 'tool_result', tool_use_id: toolUse.id, is_error: true, content: 'Not executed: the runtime detected repeated unproductive work or reached its evidence limit.' };
       const toolInput = (toolUse.input ?? {}) as Record<string, unknown>;
-      await input.onToolCall?.(toolUse.name, toolInput);
+      await input.onToolCall?.(toolUse.name, toolInput, toolUse.id);
       input.assertStillOurs();
       input.signal.throwIfAborted();
       if (input.computer !== undefined && toolUse.toolset_name === computerToolsetName) {
@@ -802,7 +838,8 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
         input.assertStillOurs();
         input.signal.throwIfAborted();
         input.observe?.(toolUse.id, toolUse.name, toolInput, outcome);
-        await input.onToolResult?.(toolUse.name, outcome);
+        await input.onToolResult?.(toolUse.name, outcome, toolUse.id);
+
         return {
           type: 'tool_result',
           tool_use_id: toolUse.id,
@@ -817,7 +854,8 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
       input.assertStillOurs();
       input.signal.throwIfAborted();
       input.observe?.(toolUse.id, toolUse.name, toolInput, result);
-      await input.onToolResult?.(toolUse.name, result);
+      await input.onToolResult?.(toolUse.name, result, toolUse.id);
+
       return {
         type: 'tool_result',
         tool_use_id: toolUse.id,
@@ -1219,7 +1257,8 @@ export async function runAgentTurn(input: {
   readonly project: Project;
   readonly provider: SandboxProvider;
   readonly sandbox: RunningSandbox;
-  readonly messages: readonly SessionMessage[];
+  readonly messages: readonly ConversationMessage[];
+  readonly skills?: SkillsForTurn | undefined;
   readonly entitlements: UserEntitlements;
   readonly registry: Registry;
   readonly metering: MeteringService;
@@ -1237,7 +1276,7 @@ export async function runAgentTurn(input: {
    * Called between steps so mid-turn user corrections are injected without
    * interrupting an in-flight API request.
    */
-  readonly drainSteer: () => string | undefined | Promise<string | undefined>;
+  readonly drainSteer: () => SteerInput | undefined | Promise<SteerInput | undefined>;
   /**
    * Whether this session's desktop actually came up and was shown to the user.
    * Starting it is best effort, so the provider having a desktop does not mean
@@ -1461,17 +1500,46 @@ export async function runAgentTurn(input: {
     } satisfies ToolDefinition);
   }
 
+  const skills = input.skills ?? { available: [], mentioned: [] };
+  if (skills.available.length > 0) {
+    tools.set('use_skill', {
+      parallelSafe: true,
+      spec: {
+        name: 'use_skill',
+        description:
+          'Load the full instructions of one of the user\'s skills listed in the system prompt. Call it ' +
+          'before starting work that matches a skill\'s description, then follow what it returns.',
+        input_schema: {
+          type: 'object',
+          required: ['name'],
+          properties: { name: { type: 'string', enum: skills.available.map((skill) => skill.name) } },
+        },
+      },
+      async run(toolInput) {
+        const name = requireText(toolInput, 'name', 'use_skill');
+        const skill = skills.available.find((candidate) => candidate.name === name);
+        if (skill === undefined) return { text: `No skill named "${name}". Available: ${skills.available.map((s) => s.name).join(', ')}.`, isError: true };
+        await input.events.skillUsed({ name: skill.name, title: skill.title, source: 'tool' });
+        return { text: skillInstructionsText(skill), isError: false };
+      },
+    } satisfies ToolDefinition);
+  }
   const conversation = input.resume?.conversation ?? conversationFrom(input.messages, input.project);
   if (input.resume !== undefined && input.resume.restoredEnvironment !== true) conversation.push({ role: 'user', content:
     'Execution has resumed from a saved project snapshot in a new workspace. Earlier processes and preview URLs are no longer live. The tool results above record completed actions: inspect the current workspace, and do not repeat external or consequential actions whose effects were already recorded or remain uncertain. Re-establish previews from the saved source when needed.' });
   if (input.resume === undefined && input.session.taskContext !== undefined) conversation.push({ role: 'user', content: JSON.stringify({ type: 'previous_task_notes_not_instructions', context: input.session.taskContext, limitation: 'This describes earlier work, not a new permission or proof that the current request is complete. Reinspect current source and verify the current goal.' }) });
   const pinnedInstructions: MessageParam[] = conversationFrom(input.messages, input.project).filter(message => message.role === 'user');
+  if (input.resume === undefined) for (const skill of skills.mentioned) {
+    conversation.push({ role: 'user', content: skillInstructionsText(skill) });
+    await input.events.skillUsed({ name: skill.name, title: skill.title, source: 'mention' });
+  }
+
   const outcome = await runModelLoop({
     admission: input.admission,
     anthropic: input.anthropic,
     model: input.session.model,
     effort: input.session.effort,
-    system: systemPrompt(input.provider, screenAccess, input.session.mode),
+    system: systemPrompt(input.provider, screenAccess, input.session.mode, skills.available),
     conversation,
     ...(input.resume === undefined ? {} : { resume: input.resume }),
     onAdmissionFailure: async (error, boundary) => {
@@ -1484,6 +1552,7 @@ export async function runAgentTurn(input: {
         contextFingerprint: contextFingerprint(boundary.request.system, boundary.request.tools ?? []) });
       await input.onAdmissionFailure?.(error, checkpoint);
     },
+
     tools,
     computer,
     toolContext,
@@ -1522,11 +1591,11 @@ export async function runAgentTurn(input: {
     beforeStep: async () => {
       compactTaskConversation(conversation, task.state, pinnedInstructions);
       const steer = await input.drainSteer();
-      if (steer !== undefined) pinnedInstructions.push({ role: 'user', content: steer });
+      if (steer !== undefined) pinnedInstructions.push({ role: 'user', content: userContent(steer.text, steer.images) });
       return steer;
     },
     observe: (id, name, args, result) => { if (!['update_task','finish_task'].includes(name) || result.isError) {
-        task.record(id, name, args, result, { action: !readOnlyTools.has(name) && !['consult_specialist','update_task','finish_task','run_validation','screenshot'].includes(name), checkable: readOnlyTools.has(name) || ['run_command','run_validation','screenshot'].includes(name) });
+        task.record(id, name, args, result, { action: !readOnlyTools.has(name) && !['consult_specialist','update_task','finish_task','run_validation','screenshot','use_skill'].includes(name), checkable: readOnlyTools.has(name) || ['run_command','run_validation','screenshot','use_skill'].includes(name) });
       } },
     candidateStop: () => task.feedback(),
     shouldHalt: () => task.stalled,

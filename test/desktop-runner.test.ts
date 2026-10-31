@@ -1,5 +1,6 @@
 import { AppError } from '../src/http/errors.ts';
 import assert from 'node:assert/strict';
+import { fixtureModels } from './support/models.ts';
 import test from 'node:test';
 import { Sandbox } from 'e2b';
 import type Anthropic from '@anthropic-ai/sdk';
@@ -39,7 +40,10 @@ test('a provider row names its desktop size, and a malformed one is refused rath
 });
 
 /** A stand-in for the E2B sandbox object, recording every command in order. */
-function fakeE2BSandbox(options: { token?: string | undefined } = { token: 'traffic-token-fixture' }) {
+function fakeE2BSandbox(options: {
+  token?: string | undefined;
+  onRun?: (command: string) => void;
+} = { token: 'traffic-token-fixture' }) {
   const commands: { command: string; opts: Record<string, unknown> }[] = [];
   const sandbox = {
     sandboxId: 'sandbox-fixture',
@@ -47,6 +51,7 @@ function fakeE2BSandbox(options: { token?: string | undefined } = { token: 'traf
     getHost: (port: number) => `${port}-abcdefghij1234567890x.e2b.test`,
     commands: { run: async (command: string, opts: Record<string, unknown>) => {
       commands.push({ command, opts });
+      options.onRun?.(command);
       return { disconnect: async () => {} };
     } },
   };
@@ -145,7 +150,15 @@ test('a desktop provider is never handed public preview, and a plain one still i
 
 // ---- the runner: announces the desktop, withdraws it, and never lets it break a build ----
 
-function runnerFixture(options: { desktop: boolean; startDesktop?: (signal?: AbortSignal) => Promise<DesktopHandoff>; withoutHandoffPort?: boolean }) {
+function runnerFixture(options: {
+  desktop: boolean;
+  startDesktop?: (signal?: AbortSignal) => Promise<DesktopHandoff>;
+  desktopStartTimeoutMs?: number;
+  desktopStartGraceMs?: number;
+  withoutHandoffPort?: boolean;
+  restore?: () => Promise<string>;
+  publishHandoff?: () => Promise<void>;
+}) {
   const { db } = ledger();
   const registry = registryWith(options.desktop ? desktopSize : undefined);
   const plans = new Map(planDocuments.map((doc) => [doc.key, parsePlan(doc, doc.key, registry)]));
@@ -157,6 +170,7 @@ function runnerFixture(options: { desktop: boolean; startDesktop?: (signal?: Abo
   const order: string[] = [];
   const emitted: { type: string; data: Record<string, unknown> }[] = [];
   const handoffCalls: { call: string; sessionId: string; handoff?: DesktopHandoff; ttl?: number }[] = [];
+  const systemPrompts: string[] = [];
   let cancelListener: ((event: { type: string }) => void) | undefined;
   let modelCalls = 0; let cancelled = false;
   const startDesktop = options.startDesktop ?? (async () => ({ host: '6080-abcdefghij1234567890x.e2b.test', token: 'traffic-token-fixture' }));
@@ -169,15 +183,19 @@ function runnerFixture(options: { desktop: boolean; startDesktop?: (signal?: Abo
     start: async (_provider, context) => { await context.lifecycle!.beforeCreate(); await context.lifecycle!.created(running); return running; } };
   const anthropic = { messages: {
     countTokens: async () => ({ input_tokens: 2 }),
-    stream: () => { modelCalls++; order.push('model'); return { on: () => {}, finalMessage: async () => ({ content: [{ type: 'text', text: 'Complete' }],
+    stream: (params: Record<string, unknown>) => {
+      modelCalls++;
+      order.push('model');
+      systemPrompts.push(typeof params.system === 'string' ? params.system : JSON.stringify(params.system ?? ''));
+      return { on: () => {}, finalMessage: async () => ({ content: [{ type: 'text', text: 'Complete' }],
       usage: { input_tokens: 2, output_tokens: 1 }, stop_reason: 'end_turn' }) }; },
   } } as unknown as Anthropic;
   const session = { id: 's', projectId: 'p', ownerUid: 'u', model: entitlements.capabilities.stringList('ai.model.allowlist')[0],
-    leaseToken: 'lease', reservationIds: [], specialistReservationIds: [] };
+    effort: 'low', mode: 'build', leaseToken: 'lease', reservationIds: [], specialistReservationIds: [] };
   const sessions = {
     requireWorkspaceSalvage: async () => {}, claim: async () => session, heartbeat: async () => {}, assertPersistenceLease: async () => { if (cancelled) throw new AppError({ code: 'session/cancelled', statusCode: 409, message: 'Cancelled by user' }); }, markExecutionStarted: async () => {},
     attachSandbox: async () => {}, detachSandbox: async () => {}, drainSteerMessage: async () => undefined,
-    listMessages: async () => [{ role: 'user', content: 'Build', seq: 0 }],
+    listMessages: async () => [{ role: 'user', content: 'Build', seq: 0, attachments: [] }],
     reserveSpecialistTokens: async (_id: string, _runner: string, input: { meterKey: string; quantity: number; operationId: string }) =>
       metering.reserve({ ...input, uid: 'u', entitlements, now: new Date() }),
     forgetSpecialistReservation: async () => {},
@@ -185,25 +203,33 @@ function runnerFixture(options: { desktop: boolean; startDesktop?: (signal?: Abo
     yieldForRecovery: async () => {}, finish: async () => { order.push('finish'); return 'IDLE'; },
   };
   const handoffPort: DesktopHandoffPort = {
-    publish: async (sessionId, handoff, ttl) => { handoffCalls.push({ call: 'publish', sessionId, handoff, ttl }); order.push('publish'); },
+    publish: async (sessionId, handoff, ttl) => {
+      handoffCalls.push({ call: 'publish', sessionId, handoff, ttl });
+      order.push('publish');
+      await options.publishHandoff?.();
+    },
     clear: async (sessionId) => { handoffCalls.push({ call: 'clear', sessionId }); order.push('clear'); return true; },
   };
   const logs: { message: string }[] = [];
   const capture = (_details: object, message: string) => { logs.push({ message }); };
-  const deps = { runnerId: 'runner', anthropic, sessions, metering, configuration,
+  const deps = { models: fixtureModels, runnerId: 'runner', anthropic, sessions, metering, configuration,
     entitlements: { forUser: async () => entitlements },
     projects: { readOwned: async () => ({ id: 'p', platform: 'web', ownerUid: 'u', name: 'Fixture', snapshot: { kind: 'none' } }) },
     sandboxes: new SandboxService(configuration, metering, new Map([['e2b', adapter]])),
-    persistence: { restore: async () => 'fresh', save: async () => ({ bytes: 1, committed: true }) },
+    persistence: { restore: async () => { order.push('restore'); return options.restore === undefined ? 'fresh' : options.restore(); }, save: async () => ({ bytes: 1, committed: true }) },
     events: { subscribe: async (_id: string, listener: typeof cancelListener) => { cancelListener = listener; return () => {}; },
       append: async (_id: string, type: string, data: Record<string, unknown>) => { emitted.push({ type, data }); order.push(type); } },
     limits: { maxSteps: 3, maxOutputTokens: 10, toolOutputMaxChars: 4096, maxSpecialistConsultations: 0, specialistMaxSteps: 1,
       commandTimeoutMs: 1000, previewReadyTimeoutSeconds: 1 },
     heartbeatSeconds: 60, messageHistoryLimit: 10, log: { info: capture, warn: capture, error: capture },
+    ...(options.desktopStartTimeoutMs === undefined ? {} : { desktopStartTimeoutMs: options.desktopStartTimeoutMs }),
+    ...(options.desktopStartGraceMs === undefined ? {} : { desktopStartGraceMs: options.desktopStartGraceMs }),
     ...(options.withoutHandoffPort === true ? {} : { desktop: handoffPort }),
   } as unknown as RunnerDependencies;
   return { runner: new SessionRunner(deps), order, emitted, handoffCalls, logs, timeoutSeconds: registry.sandboxProviders.get('web')!.timeoutSeconds,
     cancel: () => { cancelled = true; cancelListener?.({ type: 'session.cancel_requested' }); }, modelCalls: () => modelCalls,
+    systemPrompts: () => systemPrompts,
+
     types: () => emitted.map((event) => event.type),
     diagnostics: () => JSON.stringify({ events: emitted, logs: logs.map((entry) => entry.message), order }) };
 }
@@ -264,6 +290,158 @@ test('a provider with a desktop but a runner with no handoff is a loud failure t
   assert.ok(!h.order.includes('startDesktop'));
   assert.ok(h.logs.some((entry) => entry.message.includes('continuing without it')));
   assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data), [{ reason: 'error' }]);
+});
+
+test('a timed-out desktop start lets the build continue without screen access', async () => {
+  let startupSignal: AbortSignal | undefined;
+  const h = runnerFixture({
+    desktop: true,
+    desktopStartTimeoutMs: 50,
+    startDesktop: (signal) => {
+      startupSignal = signal;
+      return new Promise<DesktopHandoff>(() => {});
+    },
+  });
+
+  await h.runner.runOnce();
+
+  assert.equal(startupSignal?.aborted, true);
+  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data), [{ reason: 'error' }]);
+  assert.ok(h.systemPrompts().some((prompt) => prompt.includes('There is no desktop screen available to you in this turn')));
+});
+
+test('a slow desktop does not hold the first turn back, and one that is still starting when the session ends is never announced', async () => {
+  let startupSignal: AbortSignal | undefined;
+  const h = runnerFixture({
+    desktop: true,
+    desktopStartGraceMs: 20,
+    startDesktop: (signal) => {
+      startupSignal = signal;
+      return new Promise<DesktopHandoff>(() => {});
+    },
+  });
+
+  const started = Date.now();
+  await h.runner.runOnce();
+
+  assert.ok(Date.now() - started < 1_000, 'the first turn waited for the desktop deadline');
+  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.ok(h.systemPrompts().some((prompt) => prompt.includes('There is no desktop screen available to you in this turn')));
+  assert.equal(startupSignal?.aborted, true);
+  assert.ok(!h.emitted.some((event) => event.type === 'desktop.ready'));
+  assert.ok(!h.logs.some((entry) => entry.message.includes('continuing without it')));
+});
+
+test('a restore failure aborts pending desktop startup before it can publish a handoff', async () => {
+  let startupSignal: AbortSignal | undefined;
+  const restoreError = new AppError({
+    code: 'workspace/unrecoverable',
+    statusCode: 409,
+    message: 'Workspace restoration failed.',
+  });
+  const h = runnerFixture({
+    desktop: true,
+    startDesktop: (signal) => {
+      startupSignal = signal;
+      return new Promise<DesktopHandoff>(() => {});
+    },
+    restore: async () => { throw restoreError; },
+  });
+
+  await h.runner.runOnce();
+
+  assert.equal(startupSignal?.aborted, true);
+  assert.equal(h.modelCalls(), 0, h.diagnostics());
+  assert.equal(h.handoffCalls.some((call) => call.call === 'publish'), false);
+  assert.ok(!h.types().includes('desktop.ready'));
+  assert.deepEqual(
+    h.emitted.filter((event) => event.type === 'session.failed').map((event) => event.data.error),
+    [restoreError.message],
+  );
+});
+
+test('a handoff that does not settle is covered by the desktop startup deadline', async () => {
+  const h = runnerFixture({
+    desktop: true,
+    desktopStartTimeoutMs: 50,
+    publishHandoff: () => new Promise<void>(() => {}),
+  });
+
+  await h.runner.runOnce();
+
+  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.equal(h.handoffCalls[0]?.call, 'publish');
+  assert.deepEqual(
+    h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data),
+    [{ reason: 'error' }],
+  );
+});
+
+test('a handoff that completes after the startup deadline is withdrawn without announcing ready', async () => {
+  let releasePublish!: () => void;
+  const publish = new Promise<void>((resolve) => { releasePublish = resolve; });
+  const h = runnerFixture({
+    desktop: true,
+    desktopStartTimeoutMs: 50,
+    publishHandoff: () => publish,
+  });
+
+  await h.runner.runOnce();
+
+  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.deepEqual(
+    h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data),
+    [{ reason: 'error' }],
+  );
+  assert.ok(!h.types().includes('desktop.ready'));
+  assert.deepEqual(h.handoffCalls.map((call) => call.call), ['publish']);
+
+  releasePublish();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(h.handoffCalls.map((call) => call.call), ['publish', 'clear']);
+  assert.ok(h.order.indexOf('clear') > h.order.indexOf('publish'));
+});
+
+test('desktop startup overlaps project restoration', async () => {
+  let resolveDesktop!: (handoff: DesktopHandoff) => void;
+  const start = new Promise<DesktopHandoff>((resolve) => { resolveDesktop = resolve; });
+  const h = runnerFixture({ desktop: true, startDesktop: () => start });
+  const run = h.runner.runOnce();
+
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.ok(h.order.indexOf('startDesktop') >= 0);
+  assert.ok(h.order.indexOf('restore') > h.order.indexOf('startDesktop'), h.diagnostics());
+  assert.ok(!h.types().includes('desktop.ready'));
+
+  resolveDesktop({ host: '6080-abcdefghij1234567890x.e2b.test', token: 'traffic-token-fixture' });
+  await run;
+
+  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.ok(h.order.indexOf('desktop.ready') > h.order.indexOf('restore'));
+});
+
+test('startDesktop does not launch another background step after cancellation', async (t) => {
+  const controller = new AbortController();
+  const fake = fakeE2BSandbox({
+    token: 'traffic-token-fixture',
+    onRun: (command) => {
+      if (command.startsWith('xdpyinfo')) controller.abort(new Error('desktop setup cancelled'));
+    },
+  });
+  t.mock.method(Sandbox, 'create', async () => fake.sandbox);
+  const adapter = new E2BAdapter('fixture', 'example.test', false, 4096);
+  const running = await adapter.start(
+    registryWith(desktopSize).sandboxProviders.get('web')!,
+    { metadata: {}, networkPolicy: { mode: 'unrestricted' } },
+  );
+  fake.commands.length = 0;
+
+  await assert.rejects(running.startDesktop!(desktopSize, controller.signal), /desktop setup cancelled/);
+
+  assert.ok(fake.commands.some((entry) => entry.command.includes('Xvfb :0')));
+  assert.ok(!fake.commands.some((entry) => entry.command.includes('startxfce4')));
 });
 
 test('cancelling while the desktop starts stops the build instead of being swallowed as a desktop failure', async () => {

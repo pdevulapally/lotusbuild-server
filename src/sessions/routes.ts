@@ -1,12 +1,14 @@
 import { startTiming } from '../diagnostics/timing.ts';
-import { commandKey } from './commands.ts';
+import { commandKey, commandWasReplayed } from './commands.ts';
 import type { OutgoingHttpHeaders } from 'node:http';
 
 import type { FastifyBaseLogger, FastifyInstance, FastifyReply } from 'fastify';
 
+import { attachmentIdPattern, imageMediaTypes, maxAttachmentsPerMessage, type AttachmentRef } from '../attachments/store.ts';
 import { authenticatedUser, bearerToken } from '../auth/plugin.ts';
 import { aiEfforts, type AiEffort } from '../entitlements/build-admission.ts';
 import { AppError, safeErrorDiagnostic } from '../http/errors.ts';
+import { mutation } from '../http/idempotency.ts';
 import {
   type SessionEvent,
   type SessionEvents,
@@ -18,6 +20,7 @@ import {
   type QueuedMessage,
   type SessionMessage,
   type SessionRepository,
+  type MessageAcceptance,
   promptMaxLength,
   sessionModes,
 } from './repository.ts';
@@ -35,8 +38,25 @@ const promptText = '^[^\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F]+$';
 
 /** Model identifiers are compared against the plan allowlist, never interpolated. */
 const modelIdentifier = '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$';
+/** References to uploads made through `POST /attachments`; existence is checked against the caller's own uploads. */
+const attachmentsSchema = {
+  type: 'array',
+  maxItems: maxAttachmentsPerMessage,
+  items: {
+    type: 'object',
+    required: ['id', 'mediaType'],
+    additionalProperties: false,
+    properties: {
+      id: { type: 'string', pattern: attachmentIdPattern },
+      mediaType: { type: 'string', enum: [...imageMediaTypes] },
+    },
+  },
+} as const;
 
 export interface SessionRouteOptions {
+  /** Confirms every referenced image is one of the caller's own uploads. Absent only in tests. */
+  readonly attachments?: { assertOwned(ownerUid: string, refs: readonly AttachmentRef[]): Promise<void> };
+  readonly validateModel?: (uid: string, model: string, effort?: AiEffort) => Promise<AiEffort | undefined>;
   /**
    * How often a comment is written down an idle stream. Proxies and load
    * balancers close a connection that has said nothing, and the client cannot
@@ -79,11 +99,12 @@ function toResponse(session: BuildSession) {
   };
 }
 
-function toMessageResponse(message: SessionMessage) {
+export function toMessageResponse(message: SessionMessage) {
   return {
     seq: message.seq,
     role: message.role,
     content: message.content,
+    attachments: message.attachments,
     createdAt: message.createdAt.toISOString(),
   };
 }
@@ -93,6 +114,7 @@ function toQueuedMessageResponse(msg: QueuedMessage) {
     id: msg.id,
     sessionId: msg.sessionId,
     prompt: msg.prompt,
+    attachments: msg.attachments,
     createdAt: msg.createdAt.toISOString(),
   };
 }
@@ -156,7 +178,7 @@ export function registerSessionRoutes(
   };
 
   app.post<{ Params: { projectId: string }; Body: {
-    prompt: string;
+    attachments?: AttachmentRef[]; prompt: string;
     model: string;
     effort?: AiEffort;
     mode?: (typeof sessionModes)[number];
@@ -185,20 +207,28 @@ export function registerSessionRoutes(
             model: { type: 'string', pattern: modelIdentifier },
             effort: { type: 'string', enum: [...aiEfforts] },
             mode: { type: 'string', enum: [...sessionModes] },
+            attachments: attachmentsSchema,
           },
         },
       },
     },
     async (request, reply) => {
       const user = authenticatedUser(request);
-      const session = await sessions.create(user.uid, request.params.projectId, {
+      const defaultEffort = await options.validateModel?.(user.uid, request.body.model, request.body.effort);
+      const effort = request.body.effort ?? defaultEffort;
+      const input = {
         prompt: request.body.prompt.trim(),
         model: request.body.model,
-        ...(request.body.effort === undefined ? {} : { effort: request.body.effort }),
+        ...(effort === undefined ? {} : { effort }),
         ...(request.body.mode === undefined ? {} : { mode: request.body.mode }),
-      }, undefined, commandKey(request.headers['idempotency-key'], true));
-      request.log.debug({ sessionId: session.id }, 'session admission accepted');
-      if (session.status === 'QUEUED') publish(request.log, session.id, 'session.queued', {
+        ...(request.body.attachments === undefined ? {} : { attachments: request.body.attachments }),
+      };
+      await options.attachments?.assertOwned(user.uid, input.attachments ?? []);
+      const session = await sessions.create(user.uid, request.params.projectId, input, undefined,
+        mutation<BuildSession>(user.uid, `POST /projects/${request.params.projectId}/sessions`,
+          commandKey(request.headers['idempotency-key'], true), { ...input, effort: request.body.effort }, (value) => ({ statusCode: 201, body: toResponse(value) })));
+      if (!commandWasReplayed(session)) publish(request.log, session.id, 'session.queued', {
+
         status: session.status,
         model: session.model,
         effort: session.effort,
@@ -285,7 +315,8 @@ export function registerSessionRoutes(
     },
   );
 
-  app.post<{ Params: { sessionId: string }; Body: { prompt: string; steer?: boolean; mode?: (typeof sessionModes)[number]; inputResponse?: { id: string; answer: string } } }>(
+  app.post<{ Params: { sessionId: string }; Body: { prompt: string; steer?: boolean; mode?: (typeof sessionModes)[number]; inputResponse?: { id: string; answer: string }; attachments?: AttachmentRef[] } }>(
+
     '/sessions/:sessionId/messages',
     {
       preHandler: [app.requireAuth, app.requireVerifiedEmail, app.enforceRateLimit('build')],
@@ -315,25 +346,36 @@ export function registerSessionRoutes(
               id: { type: 'string', pattern: documentId },
               answer: { type: 'string', minLength: 1, maxLength: promptMaxLength, pattern: promptText },
             } },
+            attachments: attachmentsSchema,
+
           },
         },
       },
     },
     async (request, reply) => {
       const user = authenticatedUser(request);
+      const prompt = request.body.prompt.trim();
+      const attachments = request.body.attachments ?? [];
+      await options.attachments?.assertOwned(user.uid, attachments);
+      const key = commandKey(request.headers['idempotency-key'], true);
+      const operation = mutation<MessageAcceptance>(user.uid, `POST /sessions/${request.params.sessionId}/messages`, key,
+        { prompt, steer: request.body.steer === true, mode: request.body.mode, attachments, ...(request.body.inputResponse === undefined ? {} : { inputResponse: request.body.inputResponse }) },
+        value => value.kind === 'steered' ? { statusCode: 200, body: { steered: true, sessionId: value.sessionId } }
+          : value.kind === 'queued' ? { statusCode: 202, body: { queued: true, queuedMessage: toQueuedMessageResponse(value.message) } }
+          : { statusCode: 202, body: { queued: false, session: toResponse(value.session) } });
       const result = await sessions.submitMessage(user.uid, request.params.sessionId,
-        request.body.prompt.trim(), request.body.steer === true, commandKey(request.headers['idempotency-key'], true), undefined,
-        request.body.inputResponse, request.body.mode);
+        prompt, request.body.steer === true, operation, undefined, request.body.inputResponse, request.body.mode, attachments);
       if (result.kind === 'steered') {
-        publish(request.log, result.sessionId, 'session.steer', {});
+        if (!commandWasReplayed(result)) publish(request.log, result.sessionId, 'session.steer', {});
         return reply.code(200).send({ steered: true, sessionId: result.sessionId });
       }
       if (result.kind === 'queued') {
-        publish(request.log, result.message.sessionId, 'session.message_queued', { queuedMessageId: result.message.id });
+        if (!commandWasReplayed(result)) publish(request.log, result.message.sessionId, 'session.message_queued', { queuedMessageId: result.message.id });
         return reply.code(202).send({ queued: true, queuedMessage: toQueuedMessageResponse(result.message) });
       }
-      if (result.session.status === 'QUEUED') publish(request.log, result.session.id, 'session.queued', { status: result.session.status, messageCount: result.session.messageCount });
+      if (result.session.status === 'QUEUED' && !commandWasReplayed(result)) publish(request.log, result.session.id, 'session.queued', { status: result.session.status, messageCount: result.session.messageCount });
       return reply.code(202).send({ queued: false, session: toResponse(result.session) });
+
     },
   );
 
@@ -410,7 +452,10 @@ export function registerSessionRoutes(
     },
     async (request, reply) => {
       const user = authenticatedUser(request);
-      const session = await sessions.cancel(user.uid, request.params.sessionId, commandKey(request.headers['idempotency-key'], true));
+      const session = await sessions.cancel(user.uid, request.params.sessionId,
+        mutation<BuildSession>(user.uid, `POST /sessions/${request.params.sessionId}/cancel`,
+          commandKey(request.headers['idempotency-key'], true), {}, (value) => ({ statusCode: 200, body: toResponse(value) })));
+
       if (session.status === 'FAILED') {
         publish(request.log, session.id, 'session.failed', {
           error: session.error ?? 'Cancelled by user',

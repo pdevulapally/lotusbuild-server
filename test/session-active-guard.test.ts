@@ -835,6 +835,76 @@ async function routeApp(h: ReturnType<typeof harness>, append: SessionEvents['ap
 }
 const authHeaders = { authorization: 'Bearer fixture-token', 'idempotency-key': 'stable-test-command-1' };
 
+test('concurrent HTTP session retries commit one session and return the same original response', async (t) => {
+  const h = harness(); let published = 0;
+  const app = await routeApp(h, async (_id, type, data) => { published++; return { id: '1-0', type, data }; });
+  t.after(() => app.close());
+  const request = { method: 'POST' as const, url: '/projects/project-1/sessions',
+    headers: { ...authHeaders, 'idempotency-key': 'create-session-operation-1' }, payload: { prompt: 'Build', model: 'model-1' } };
+  const responses = await Promise.all([app.inject(request), app.inject(request)]);
+  assert.deepEqual(responses.map((response) => response.statusCode), [201, 201]);
+  assert.deepEqual(responses[0]!.json(), responses[1]!.json());
+  assert.equal(h.charges(), 1); assert.equal(h.activeSessions().length, 1); assert.equal(published, 1);
+  const restarted = await routeApp(h); t.after(() => restarted.close());
+  assert.deepEqual((await restarted.inject(request)).json(), responses[0]!.json());
+  const conflict = await app.inject({ ...request, payload: { prompt: 'Different build', model: 'model-1' } });
+  assert.equal(conflict.statusCode, 409); assert.equal(conflict.json().error.code, 'request/idempotency-conflict');
+  assert.equal(h.charges(), 1);
+});
+
+test('a prompt retry after the session changes state replays its first response without queuing another message', async (t) => {
+  const h = harness(); h.seedSession('retry', 'project-1', 'IDLE');
+  const app = await routeApp(h); t.after(() => app.close());
+  const request = { method: 'POST' as const, url: '/sessions/retry/messages',
+    headers: { ...authHeaders, 'idempotency-key': 'prompt-operation-1' }, payload: { prompt: 'Continue' } };
+  const first = await app.inject(request);
+  assert.equal(first.statusCode, 202); assert.equal(first.json().queued, false);
+  // The next route invocation selects enqueue instead of append; the shared receipt still wins.
+  const repeated = await app.inject(request);
+  assert.equal(repeated.statusCode, 202); assert.deepEqual(repeated.json(), first.json());
+  assert.equal(h.charges(), 1); assert.equal(h.session('retry')?.['messageCount'], 2);
+  assert.equal([...h.firestore.documents.keys()].filter((path) => path.includes('/queued_messages/')).length, 0);
+  h.firestore.seed('projects/project-1', { ...h.project(), ownerUid: 'another-user' });
+  assert.equal((await app.inject(request)).statusCode, 404, 'replay must reauthorize current ownership');
+});
+
+test('queued and steering prompt retries do not repeat writes, even after completion', async (t) => {
+  for (const steer of [false, true]) {
+    const h = harness(); h.seedSession('retry', 'project-1', 'RUNNING');
+    h.firestore.seed('projects/project-1', { ...h.project(), activeSessionId: 'retry' });
+    const app = await routeApp(h); t.after(() => app.close());
+    const request = { method: 'POST' as const, url: '/sessions/retry/messages',
+      headers: { ...authHeaders, 'idempotency-key': 'queue-operation-1' }, payload: { prompt: 'Continue', steer } };
+    const [first, concurrent] = await Promise.all([app.inject(request), app.inject(request)]);
+    assert.ok([200, 202].includes(first.statusCode)); assert.deepEqual(concurrent.json(), first.json());
+    const before = JSON.stringify([...h.firestore.documents]);
+    assert.deepEqual((await app.inject(request)).json(), first.json());
+    assert.equal(JSON.stringify([...h.firestore.documents]), before);
+    h.firestore.seed('sessions/retry', { ...h.session('retry'), status: 'IDLE' });
+    const afterCompletion = await app.inject(request);
+    assert.equal(afterCompletion.statusCode, first.statusCode); assert.deepEqual(afterCompletion.json(), first.json());
+    assert.equal(h.charges(), 0);
+  }
+});
+
+test('invalid idempotency keys and unauthorized retries cannot mutate a session', async (t) => {
+  const h = harness(); const app = await routeApp(h); t.after(() => app.close());
+  const url = '/projects/project-1/sessions'; const payload = { prompt: 'Build', model: 'model-1' };
+  assert.equal((await app.inject({ method: 'POST', url, payload, headers: { ...authHeaders, 'idempotency-key': '../bad' } })).statusCode, 400);
+  assert.equal((await app.inject({ method: 'POST', url, payload, headers: { 'idempotency-key': 'valid-operation-1' } })).statusCode, 401);
+  assert.equal(h.charges(), 0); assert.equal(h.activeSessions().length, 0);
+});
+
+test('cancel retries replay their committed result without refunding the build twice', async (t) => {
+  const h = harness(); const app = await routeApp(h); t.after(() => app.close());
+  const session = await h.sessions.create('user-1', 'project-1', { prompt: 'Build', model: 'model-1' });
+  const request = { method: 'POST' as const, url: `/sessions/${session.id}/cancel`,
+    headers: { ...authHeaders, 'idempotency-key': 'cancel-operation-1' } };
+  const [first, repeated] = await Promise.all([app.inject(request), app.inject(request)]);
+  assert.equal(first.statusCode, 200); assert.deepEqual(repeated.json(), first.json());
+  assert.equal(h.charges(), 0); assert.equal(h.project()?.['activeSessionId'], null);
+});
+
 for (const status of ['FAILED', 'IDLE', 'QUEUED', 'RUNNING'] as const) {
   for (const steer of [false, true]) {
     test(`unrecoverable ${status} prompt route rejects steer=${steer} without writes or events`, async (t) => {
@@ -1014,7 +1084,7 @@ test('steering survives Redis failure and is consumed once into durable history'
     await assert.rejects(h.sessions.queueSteerMessage('other-user', created.id, 'Intrusion'), { code: 'session/not-found' });
     await h.sessions.queueSteerMessage('user-1', created.id, 'Preserve all records');
     await assert.rejects(h.sessions.drainSteerMessage(created.id, { ...lease, token: 'stale' }));
-    assert.equal(await h.sessions.drainSteerMessage(created.id, lease), 'Preserve all records');
+    assert.deepEqual(await h.sessions.drainSteerMessage(created.id, lease), { prompt: 'Preserve all records', attachments: [] });
     assert.equal(await h.sessions.drainSteerMessage(created.id, lease), undefined);
     const messages = await h.sessions.listMessages('user-1', created.id, 100);
     assert.equal(messages.length, 2);
@@ -1049,7 +1119,7 @@ test('a lost create response and retries after completion keep the original sess
   const retried = await Promise.all(Array.from({ length: 4 }, () => h.sessions.create('user-1', 'project-1', input, undefined, key)));
   assert.ok(retried.every((session) => session.id === accepted.id)); assert.equal(h.charges(), 1);
   assert.equal(h.activeSessions().length, 0);
-  await assert.rejects(h.sessions.create('user-1', 'project-1', { ...input, prompt: 'Different' }, undefined, key), { code: 'command/conflict' });
+  await assert.rejects(h.sessions.create('user-1', 'project-1', { ...input, prompt: 'Different' }, undefined, key), { code: 'request/idempotency-conflict' });
 });
 
 test('an accepted message is not queued or charged again after worker completion changes its submission path', async () => {
@@ -1180,4 +1250,21 @@ test('a submission whose HTTP response is lost survives closing the client and r
     const messages = await h.sessions.listMessages('user-1', task.id, 100);
     assert.equal(messages.at(-1)?.content, 'Saved result');
   } finally { request.destroy(); allowResponse(); await app.close(); }
+});
+
+test('plan approval retries replay the accepted mode change while the session is queued', async (t) => {
+  const h = harness(); h.seedSession('approval-retry', 'project-1', 'IDLE');
+  h.firestore.seed('sessions/approval-retry', { ...h.session('approval-retry'), mode: 'plan' });
+  assert.equal(h.session('approval-retry')?.['mode'], 'plan');
+  const app = await routeApp(h); t.after(() => app.close());
+  const request = { method: 'POST' as const, url: '/sessions/approval-retry/messages',
+    headers: { ...authHeaders, 'idempotency-key': 'approve-plan-operation-1' }, payload: { prompt: 'Build the reviewed plan', mode: 'build' } };
+  const first = await app.inject(request);
+  assert.equal(first.statusCode, 202); assert.equal(first.json().session.mode, 'build');
+  const replay = await app.inject(request);
+  assert.equal(replay.statusCode, 202); assert.deepEqual(replay.json(), first.json());
+  const conflict = await app.inject({ ...request, payload: { prompt: 'Build the reviewed plan', mode: 'plan' } });
+  assert.equal(conflict.statusCode, 409); assert.equal(conflict.json().error.code, 'request/idempotency-conflict');
+  assert.equal(h.charges(), 1);
+
 });

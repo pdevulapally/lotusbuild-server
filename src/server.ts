@@ -1,5 +1,10 @@
 import { installHttpTimings, observeMethods } from './diagnostics/timing.ts';
 import cors from '@fastify/cors';
+import { RedisBudgetCounter, UploadBudgetGuard } from './attachments/budget.ts';
+import { registerAttachmentRoutes } from './attachments/routes.ts';
+import type { AttachmentStore } from './attachments/store.ts';
+import type { SkillRepository } from './skills/repository.ts';
+import { registerSkillRoutes } from './skills/routes.ts';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import type { Redis } from 'ioredis';
@@ -7,12 +12,16 @@ import type { Auth } from 'firebase-admin/auth';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 
 import { authenticatedUser, registerAuth } from './auth/plugin.ts';
+import { registerEmailVerificationRoutes } from './auth/email-verification-routes.ts';
+import type { EmailVerificationService } from './auth/email-verification.ts';
 import type { BillingRepository } from './billing/repository.ts';
 import { registerBillingRoutes } from './billing/routes.ts';
 import type { Config } from './config/index.ts';
 import type { EntitlementService } from './entitlements/service.ts';
 import type { ConfigurationStore } from './entitlements/store.ts';
 import type { MeteringService } from './metering/service.ts';
+import { registerProjectContentRoutes } from './projects/content-routes.ts';
+import type { ProjectFiles } from './projects/files.ts';
 import { registerProjectRoutes } from './projects/routes.ts';
 import type { ProjectRepository } from './projects/repository.ts';
 import type Stripe from 'stripe';
@@ -22,6 +31,7 @@ import type { SessionRepository } from './sessions/repository.ts';
 import { registerSessionRoutes } from './sessions/routes.ts';
 import type { UserRepository } from './users/repository.ts';
 import { registerErrorHandler, safeErrorDiagnostic } from './http/errors.ts';
+import { allowedModelCatalog, assertModelSelection } from './models/catalog.ts';
 import { registerRateLimiting } from './http/rate-limit.ts';
 import { redisKeyPrefixes } from './redis/client.ts';
 import { DesktopRelay, registerDesktopRoutes } from './desktop/relay.ts';
@@ -40,11 +50,15 @@ export interface Dependencies {
   readonly privacyRequests: PrivacyRequests;
   readonly family: FamilyService;
   readonly firebaseAuth: Auth;
+  readonly emailVerification: EmailVerificationService;
   readonly redis: Redis;
   readonly entitlements: EntitlementService;
   readonly metering: MeteringService;
   readonly users: UserRepository;
   readonly projects: ProjectRepository;
+  readonly projectFiles: ProjectFiles;
+  readonly attachments: AttachmentStore;
+  readonly skills: SkillRepository;
   readonly sessions: SessionRepository;
   readonly sessionEvents: SessionEvents;
   readonly configuration: ConfigurationStore;
@@ -68,7 +82,7 @@ export const requestLogSerializer = (request: FastifyRequest) => ({
 });
 
 /** Headers a browser may read off a cross-origin response; everything else is hidden from its JavaScript. */
-export const exposedResponseHeaders = ['Retry-After', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'];
+export const exposedResponseHeaders = ['Content-Disposition', 'Retry-After', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'];
 
 export function buildServer(config: Config, dependencies: Dependencies): FastifyInstance {
   const { firebaseAuth, redis, metering, users } = dependencies;
@@ -178,11 +192,46 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
         plan: { key: resolved.planKey, name: resolved.planName },
         subscriptionStatus: resolved.subscriptionStatus,
         capabilities: resolved.capabilities.entries(),
+        models: await allowedModelCatalog(redis, resolved),
         limits: [...resolved.meterLimits.values()].map((limit) => ({
           meterKey: limit.meterKey,
           includedAllowance: limit.includedAllowance,
           hardLimit: limit.hardLimit,
           overageEnabled: limit.overageEnabled,
+        })),
+      };
+    });
+
+    registerEmailVerificationRoutes(api, dependencies.emailVerification);
+
+    api.get<{ Params: { sessionId: string } }>('/sessions/:sessionId/usage', {
+      preHandler: [api.requireAuth, api.enforceRateLimit('read')],
+      schema: { params: { type: 'object', required: ['sessionId'], additionalProperties: false,
+        properties: { sessionId: { type: 'string', pattern: '^[A-Za-z0-9_-]{1,128}$' } } } },
+    }, async (request, reply) => {
+      const user = authenticatedUser(request);
+      const session = await sessions.readOwned(user.uid, request.params.sessionId);
+      reply.header('cache-control', 'no-store');
+      return { sessionId: session.id, meters: await metering.readOperationUsage(user.uid, session.id) };
+    });
+
+    api.get<{ Querystring: { limit?: number } }>('/me/sessions', {
+      preHandler: [api.requireAuth, api.enforceRateLimit('read')],
+      schema: { querystring: { type: 'object', additionalProperties: false,
+        properties: { limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 } } } },
+    }, async (request, reply) => {
+      const user = authenticatedUser(request);
+      const recent = await sessions.listRecentForOwner(user.uid, request.query.limit ?? 20);
+      reply.header('cache-control', 'no-store');
+      return {
+        sessions: recent.map((session) => ({
+          id: session.id,
+          projectId: session.projectId,
+          status: session.status,
+          mode: session.mode,
+          messageCount: session.messageCount,
+          heartbeatAt: session.heartbeatAt?.toISOString() ?? null,
+          createdAt: session.createdAt.toISOString(),
         })),
       };
     });
@@ -237,9 +286,19 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
       ),
     });
     registerProjectRoutes(api, projects);
+    registerProjectContentRoutes(api, projects, dependencies.projectFiles, sessions);
     registerPrivacyRoutes(api, dependencies.privacyRequests);
     registerFamilyRoutes(api, dependencies.family, projects, sessions);
+    registerSkillRoutes(api, dependencies.skills);
+    registerAttachmentRoutes(api, { store: dependencies.attachments, entitlements, budget: new UploadBudgetGuard(new RedisBudgetCounter(redis)) });
     registerSessionRoutes(api, sessions, sessionEvents, {
+      attachments: dependencies.attachments,
+      validateModel: async (uid, model, effort) => {
+        const resolved = await entitlements.forUser(uid);
+        const models = await allowedModelCatalog(redis, resolved);
+        assertModelSelection(models, model, effort);
+        return models.find(item => item.id === model)?.efforts.at(-1);
+      },
       heartbeatSeconds: config.SSE_HEARTBEAT_SECONDS,
       maxConnections: config.SSE_MAX_CONNECTIONS,
       maxConnectionsPerUser: config.SSE_MAX_CONNECTIONS_PER_USER,

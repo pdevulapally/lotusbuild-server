@@ -40,7 +40,7 @@ function projectWith(snapshot: StoredSnapshot, snapshotBytes: number): Project {
     name: 'Project',
     description: undefined,
     platform: 'web',
-    status: 'draft',
+    status: 'draft', visibility: 'private',
     snapshotBytes,
     snapshot,
     activeSessionId: 'session-1',

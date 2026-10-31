@@ -1,3 +1,4 @@
+import { fixtureModels } from './support/models.ts';
 import { TaskTracker } from '../src/runner/task-context.ts';
 import { verifyFallbackModel } from '../src/sessions/fallback.ts';
 import { computerToolset } from '../src/runner/computer.ts';
@@ -81,7 +82,7 @@ test('separate fallback consent is atomic and idempotent even when premium token
   const accepted = await Promise.all(Array.from({ length: 5 }, () => h.sessions.acceptFallback('u', session.id, 'stable-fallback-consent', paused.input)));
   assert.ok(accepted.every((result) => result.id === session.id && result.status === 'QUEUED'));
   assert.equal(h.data.get(`users/u/usage/${h.registry.buildMeterKey}`)?.['consumed'], before);
-  await assert.rejects(h.sessions.acceptFallback('u', session.id, 'stable-fallback-consent', { ...paused.input, model: 'substitution' }), { code: 'command/conflict' });
+  await assert.rejects(h.sessions.acceptFallback('u', session.id, 'stable-fallback-consent', { ...paused.input, model: 'substitution' }), { code: 'request/idempotency-conflict' });
   await assert.rejects(h.sessions.acceptFallback('other', session.id, 'stable-fallback-consent', paused.input), { code: 'session/not-found' });
   const claimed = await h.sessions.claim('fallback-worker'); assert.ok(claimed); assert.equal(claimed.id, session.id);
   const restored = await h.sessions.readContinuation({ sessionId: session.id, runnerId: 'fallback-worker', token: claimed.leaseToken });
@@ -142,10 +143,10 @@ test('dispatch and specialist output holds debit fallback meters without resetti
     take: (input: { meterKey: string; quantity: number; operationId: string }) => h.sessions.reserveSpecialistTokens(session.id, 'worker', { ...input, entitlements: h.entitlements, leaseToken: authority.token, now: new Date() }),
     forget: (id: string) => h.sessions.forgetSpecialistReservation(session.id, authority, id),
   };
-  const admission = createCallAdmission({ anthropic: { messages: { countTokens: async () => ({ input_tokens: 5 }) } } as unknown as Anthropic,
+  const admission = createCallAdmission({ models: fixtureModels, anthropic: { messages: { countTokens: async () => ({ input_tokens: 5 }) } } as unknown as Anthropic,
     uid: 'u', sessionId: session.id, inputMeterKey: policy.inputTokenMeterKey, outputMeterKey: policy.outputTokenMeterKey,
     metering: h.metering, reservations, authorize: () => h.sessions.assertPersistenceLease(authority), onProblem: () => {} });
-  const call = await admission.begin({ params: { model: policy.model, messages: checkpoint().conversation }, maxOutputTokens: 10, signal: new AbortController().signal });
+  const call = await admission.begin({ effort: 'standard', params: { model: policy.model, messages: checkpoint().conversation }, maxOutputTokens: 10, signal: new AbortController().signal });
   await call.settle({ input: 5, output: 3 });
   assert.equal(h.data.get(`users/u/usage/${policy.inputTokenMeterKey}`)?.['consumed'], 5);
   assert.equal(h.data.get(`users/u/usage/${policy.outputTokenMeterKey}`)?.['consumed'], 3);
@@ -208,7 +209,7 @@ test('the real worker pauses at quota, releases resources, and a replacement wor
         : [{ type: 'tool_use', id: 'read-once', name: 'read_file', input: { path: 'README.md' }, caller: { type: 'direct' } }], usage: { input_tokens: 5, output_tokens: 1 }, stop_reason: 'end_turn' }) };
     } },
   } as unknown as Anthropic;
-  const dependencies = { anthropic, sessions: h.sessions, projects: h.projects, configuration: h.configuration,
+  const dependencies = { anthropic, models: fixtureModels, sessions: h.sessions, projects: h.projects, configuration: h.configuration,
     entitlements: h.service, metering: h.metering, sandboxes: new SandboxService(h.configuration, h.metering, new Map([['e2b', adapter]])),
     // This scenario only reads files. Snapshot save/restore correctness is covered by workspace-salvage tests.
     persistence: { restore: async () => 'fresh', save: async () => ({ bytes: 0, committed: false }) },

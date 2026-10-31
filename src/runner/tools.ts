@@ -1025,8 +1025,8 @@ const definitions: readonly ToolDefinition[] = [
       // asking a URL that does not exist yet.
       const deadline = context.previewReadyTimeoutSeconds;
       const probe = await context.sandbox.runCommand(
-        `for attempt in $(seq 1 ${deadline}); do ` +
-          `if curl -sf -o /dev/null "http://127.0.0.1:${port}/"; then exit 0; fi; sleep 1; done; ` +
+        `for attempt in $(seq 1 ${deadline * 4}); do ` +
+          `if curl -sf -o /dev/null "http://127.0.0.1:${port}/"; then exit 0; fi; sleep 0.25; done; ` +
           'exit 1',
         { cwd: context.provider.workdir, timeoutMs: (deadline + 5) * 1000, signal: context.signal },
       );
