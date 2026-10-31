@@ -56,7 +56,7 @@ function fixture(premiumInputLimit?: number) {
   const pause = async (session: BuildSession, status: 'AWAITING_CONSENT' | 'EXHAUSTED' = 'AWAITING_CONSENT') => {
     const claimed = await sessions.claim('initial'); assert.equal(claimed?.id, session.id); assert.ok(claimed);
     const authority = { sessionId: session.id, runnerId: 'initial', token: claimed.leaseToken };
-    await sessions.pauseContinuation(authority, checkpoint(), { status, reason: 'Synthetic quota boundary', offer: {
+    await sessions.pauseContinuation(authority, checkpoint(), { status, reason: 'Synthetic quota boundary', offer: { provider: 'anthropic',
       model: policy.model, effort: policy.effort, inputTokens: 5, maxOutputTokens: policy.maxOutputTokens, maxInputTokens: 10000, policyFingerprint: policyFingerprint(policy),
     } });
     const waiting = await sessions.readOwned('u', session.id); assert.ok(waiting.fallback?.checkpointId);
