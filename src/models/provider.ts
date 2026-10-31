@@ -177,13 +177,15 @@ export class OpenRouterProvider implements ModelProvider {
 
   async refresh(): Promise<void> { await this.#catalog.get(); }
 
-  async describe(id: string): Promise<FallbackModelInfo> {
+  async describe(id: string, signal: AbortSignal): Promise<FallbackModelInfo> {
+    signal.throwIfAborted();
     const row = (await this.#catalog.get()).get(id);
     if (row === undefined) throw new Error('OpenRouter does not list this model with tool support, or it is not configured.');
     return row;
   }
 
-  async countInputTokens(params: MessageCountTokensParams): Promise<TokenCount> {
+  async countInputTokens(params: MessageCountTokensParams, signal: AbortSignal): Promise<TokenCount> {
+    signal.throwIfAborted();
     return estimateInputTokens(params);
   }
 }
