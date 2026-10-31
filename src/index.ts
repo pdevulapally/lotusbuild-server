@@ -22,6 +22,8 @@ import { FamilyService } from './family/service.ts';
 import { releaseRevision } from './release.ts';
 import { BrevoEmailSender } from './email/brevo.ts';
 import { EmailVerificationService } from './auth/email-verification.ts';
+import { keyringFromEnv } from './connections/credentials.ts';
+import { ConnectionRepository } from './connections/service.ts';
 
 
 async function main(): Promise<void> {
@@ -69,6 +71,9 @@ async function main(): Promise<void> {
     config.SNAPSHOT_URL_TTL_SECONDS,
   );
   const users = new UserRepository(firebase.firestore);
+  // Integrations stay dormant (503 configuration_required) until at least one
+  // CONNECTION_KEK_V<n> is present; the key values are never logged.
+  const connectionKeyring = keyringFromEnv(process.env);
   const metering = new MeteringService(firebase.firestore, configuration);
   const projects = new ProjectRepository(
     firebase.firestore,
@@ -92,6 +97,7 @@ async function main(): Promise<void> {
 
   const app = buildServer(config, {
     projectFiles: new ProjectFiles(snapshots),
+    ...(connectionKeyring === undefined ? {} : { connections: new ConnectionRepository(firebase.firestore, connectionKeyring) }),
     attachments: new AttachmentStore(firebase.app, config.FIREBASE_STORAGE_BUCKET),
     skills: new SkillRepository(firebase.firestore, entitlements),
     privacyRequests: new PrivacyRequests(firebase.firestore),

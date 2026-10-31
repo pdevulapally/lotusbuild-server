@@ -16,6 +16,8 @@ import { registerEmailVerificationRoutes } from './auth/email-verification-route
 import type { EmailVerificationService } from './auth/email-verification.ts';
 import type { BillingRepository } from './billing/repository.ts';
 import { registerBillingRoutes } from './billing/routes.ts';
+import { registerConnectionRoutes } from './connections/routes.ts';
+import type { ConnectionRepository } from './connections/service.ts';
 import type { Config } from './config/index.ts';
 import type { EntitlementService } from './entitlements/service.ts';
 import type { ConfigurationStore } from './entitlements/store.ts';
@@ -57,6 +59,8 @@ export interface Dependencies {
   readonly users: UserRepository;
   readonly projects: ProjectRepository;
   readonly projectFiles: ProjectFiles;
+  /** Absent until CONNECTION_KEK_V<n> is configured; the integrations routes then answer 503 configuration_required. */
+  readonly connections?: ConnectionRepository;
   readonly attachments: AttachmentStore;
   readonly skills: SkillRepository;
   readonly sessions: SessionRepository;
@@ -286,6 +290,9 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
       ),
     });
     registerProjectRoutes(api, projects);
+    // No connector has provider credentials on any server yet: the catalogue is
+    // browsable, every start attempt reports configuration_required.
+    registerConnectionRoutes(api, { connections: dependencies.connections, configured: new Set() });
     registerProjectContentRoutes(api, projects, dependencies.projectFiles, sessions);
     registerPrivacyRoutes(api, dependencies.privacyRequests);
     registerFamilyRoutes(api, dependencies.family, projects, sessions);
