@@ -1,0 +1,456 @@
+{
+  "capturedAt": "2026-10-31T17:37:51.161Z",
+  "scope": "offline sequential single-user loopback; in-memory Firestore/Redis/Auth; no sandbox/model/provider/Caddy/network calls",
+  "node": "v24.16.0",
+  "startup": {
+    "n": 1,
+    "fastifyListenMs": 110.827
+  },
+  "measurements": {
+    "GET projects process-first": {
+      "n": 1,
+      "minMs": 63.165,
+      "medianMs": 63.165,
+      "p95Ms": 63.165,
+      "maxMs": 63.165
+    },
+    "GET projects warm": {
+      "n": 30,
+      "minMs": 1.009,
+      "medianMs": 1.507,
+      "p95Ms": 2.969,
+      "maxMs": 5.205
+    },
+    "GET projects cache-cold": {
+      "n": 2,
+      "minMs": 1.664,
+      "medianMs": 1.664,
+      "p95Ms": 1.777,
+      "maxMs": 1.777
+    },
+    "POST session first": {
+      "n": 1,
+      "minMs": 15.833,
+      "medianMs": 15.833,
+      "p95Ms": 15.833,
+      "maxMs": 15.833
+    },
+    "direct claim (no poll sleep)": {
+      "n": 10,
+      "minMs": 0.209,
+      "medianMs": 0.226,
+      "p95Ms": 1.878,
+      "maxMs": 1.878
+    },
+    "POST session repeated": {
+      "n": 9,
+      "minMs": 2.159,
+      "medianMs": 2.74,
+      "p95Ms": 5.041,
+      "maxMs": 5.041
+    },
+    "journal replay 1 entries": {
+      "n": 10,
+      "minMs": 0.034,
+      "medianMs": 0.051,
+      "p95Ms": 0.183,
+      "maxMs": 0.183
+    },
+    "journal replay 10 entries": {
+      "n": 10,
+      "minMs": 0.187,
+      "medianMs": 0.324,
+      "p95Ms": 0.891,
+      "maxMs": 0.891
+    },
+    "journal replay 100 entries": {
+      "n": 10,
+      "minMs": 8.518,
+      "medianMs": 11.386,
+      "p95Ms": 14.005,
+      "maxMs": 14.005
+    },
+    "append to observed SSE bytes (loopback)": {
+      "n": 10,
+      "minMs": 0.345,
+      "medianMs": 0.402,
+      "p95Ms": 0.827,
+      "maxMs": 0.827
+    },
+    "poll pickup after enqueue (synthetic 1s interval)": {
+      "n": 3,
+      "minMs": 972.225,
+      "medianMs": 972.508,
+      "p95Ms": 983.075,
+      "maxMs": 983.075
+    }
+  },
+  "phaseMeasurements": {
+    "GET projects process-first": {
+      "auth.verify": {
+        "n": 1,
+        "minMs": 0.548,
+        "medianMs": 0.548,
+        "p95Ms": 0.548,
+        "maxMs": 0.548
+      },
+      "configuration.firestore": {
+        "n": 1,
+        "minMs": 0.664,
+        "medianMs": 0.664,
+        "p95Ms": 0.664,
+        "maxMs": 0.664
+      },
+      "configuration.get": {
+        "n": 4,
+        "minMs": 0.006,
+        "medianMs": 0.009,
+        "p95Ms": 3.288,
+        "maxMs": 3.288
+      },
+      "subscription.redis.read": {
+        "n": 2,
+        "minMs": 0.008,
+        "medianMs": 0.008,
+        "p95Ms": 0.041,
+        "maxMs": 0.041
+      },
+      "subscription.redis.fill": {
+        "n": 1,
+        "minMs": 0.036,
+        "medianMs": 0.036,
+        "p95Ms": 0.036,
+        "maxMs": 0.036
+      },
+      "subscription.firestore": {
+        "n": 1,
+        "minMs": 0.045,
+        "medianMs": 0.045,
+        "p95Ms": 0.045,
+        "maxMs": 0.045
+      },
+      "subscription.redis.write": {
+        "n": 1,
+        "minMs": 0.137,
+        "medianMs": 0.137,
+        "p95Ms": 0.137,
+        "maxMs": 0.137
+      },
+      "entitlements.resolve": {
+        "n": 2,
+        "minMs": 0.175,
+        "medianMs": 0.175,
+        "p95Ms": 5.92,
+        "maxMs": 5.92
+      },
+      "project.list": {
+        "n": 1,
+        "minMs": 0.2,
+        "medianMs": 0.2,
+        "p95Ms": 0.2,
+        "maxMs": 0.2
+      },
+      "http.total": {
+        "n": 1,
+        "minMs": 11.923,
+        "medianMs": 11.923,
+        "p95Ms": 11.923,
+        "maxMs": 11.923
+      }
+    },
+    "GET projects warm": {
+      "auth.verify": {
+        "n": 30,
+        "minMs": 0.025,
+        "medianMs": 0.039,
+        "p95Ms": 0.062,
+        "maxMs": 0.063
+      },
+      "configuration.get": {
+        "n": 120,
+        "minMs": 0.001,
+        "medianMs": 0.002,
+        "p95Ms": 0.004,
+        "maxMs": 0.065
+      },
+      "subscription.redis.read": {
+        "n": 60,
+        "minMs": 0.002,
+        "medianMs": 0.004,
+        "p95Ms": 0.01,
+        "maxMs": 0.029
+      },
+      "entitlements.resolve": {
+        "n": 60,
+        "minMs": 0.019,
+        "medianMs": 0.039,
+        "p95Ms": 0.1,
+        "maxMs": 0.22
+      },
+      "project.list": {
+        "n": 30,
+        "minMs": 0.013,
+        "medianMs": 0.016,
+        "p95Ms": 0.058,
+        "maxMs": 0.129
+      },
+      "http.total": {
+        "n": 30,
+        "minMs": 0.295,
+        "medianMs": 0.445,
+        "p95Ms": 0.981,
+        "maxMs": 0.992
+      }
+    },
+    "GET projects cache-cold": {
+      "auth.verify": {
+        "n": 2,
+        "minMs": 0.033,
+        "medianMs": 0.033,
+        "p95Ms": 0.037,
+        "maxMs": 0.037
+      },
+      "configuration.firestore": {
+        "n": 2,
+        "minMs": 0.071,
+        "medianMs": 0.071,
+        "p95Ms": 0.13,
+        "maxMs": 0.13
+      },
+      "configuration.get": {
+        "n": 8,
+        "minMs": 0.001,
+        "medianMs": 0.002,
+        "p95Ms": 0.452,
+        "maxMs": 0.452
+      },
+      "subscription.redis.read": {
+        "n": 4,
+        "minMs": 0.003,
+        "medianMs": 0.004,
+        "p95Ms": 0.005,
+        "maxMs": 0.005
+      },
+      "subscription.redis.fill": {
+        "n": 2,
+        "minMs": 0.005,
+        "medianMs": 0.005,
+        "p95Ms": 0.006,
+        "maxMs": 0.006
+      },
+      "subscription.firestore": {
+        "n": 2,
+        "minMs": 0.013,
+        "medianMs": 0.013,
+        "p95Ms": 0.014,
+        "maxMs": 0.014
+      },
+      "subscription.redis.write": {
+        "n": 2,
+        "minMs": 0.006,
+        "medianMs": 0.006,
+        "p95Ms": 0.008,
+        "maxMs": 0.008
+      },
+      "entitlements.resolve": {
+        "n": 4,
+        "minMs": 0.032,
+        "medianMs": 0.04,
+        "p95Ms": 0.57,
+        "maxMs": 0.57
+      },
+      "project.list": {
+        "n": 2,
+        "minMs": 0.014,
+        "medianMs": 0.014,
+        "p95Ms": 0.014,
+        "maxMs": 0.014
+      },
+      "http.total": {
+        "n": 2,
+        "minMs": 0.881,
+        "medianMs": 0.881,
+        "p95Ms": 0.883,
+        "maxMs": 0.883
+      }
+    },
+    "POST session first": {
+      "auth.verify": {
+        "n": 1,
+        "minMs": 0.066,
+        "medianMs": 0.066,
+        "p95Ms": 0.066,
+        "maxMs": 0.066
+      },
+      "configuration.get": {
+        "n": 8,
+        "minMs": 0.001,
+        "medianMs": 0.002,
+        "p95Ms": 0.013,
+        "maxMs": 0.013
+      },
+      "subscription.redis.read": {
+        "n": 3,
+        "minMs": 0.002,
+        "medianMs": 0.006,
+        "p95Ms": 0.009,
+        "maxMs": 0.009
+      },
+      "entitlements.resolve": {
+        "n": 3,
+        "minMs": 0.02,
+        "medianMs": 0.047,
+        "p95Ms": 0.075,
+        "maxMs": 0.075
+      },
+      "project.read": {
+        "n": 2,
+        "minMs": 0.082,
+        "medianMs": 0.082,
+        "p95Ms": 0.646,
+        "maxMs": 0.646
+      },
+      "session.admit": {
+        "n": 1,
+        "minMs": 5.418,
+        "medianMs": 5.418,
+        "p95Ms": 5.418,
+        "maxMs": 5.418
+      },
+      "http.total": {
+        "n": 1,
+        "minMs": 11.376,
+        "medianMs": 11.376,
+        "p95Ms": 11.376,
+        "maxMs": 11.376
+      }
+    },
+    "direct claim (no poll sleep)": {
+      "configuration.get": {
+        "n": 10,
+        "minMs": 0.005,
+        "medianMs": 0.005,
+        "p95Ms": 0.007,
+        "maxMs": 0.007
+      },
+      "session.claim": {
+        "n": 10,
+        "minMs": 0.195,
+        "medianMs": 0.21,
+        "p95Ms": 1.778,
+        "maxMs": 1.778
+      }
+    },
+    "POST session repeated": {
+      "auth.verify": {
+        "n": 9,
+        "minMs": 0.017,
+        "medianMs": 0.025,
+        "p95Ms": 0.078,
+        "maxMs": 0.078
+      },
+      "configuration.get": {
+        "n": 72,
+        "minMs": 0.001,
+        "medianMs": 0.002,
+        "p95Ms": 0.007,
+        "maxMs": 0.011
+      },
+      "subscription.redis.read": {
+        "n": 27,
+        "minMs": 0.002,
+        "medianMs": 0.004,
+        "p95Ms": 0.008,
+        "maxMs": 0.055
+      },
+      "entitlements.resolve": {
+        "n": 27,
+        "minMs": 0.018,
+        "medianMs": 0.03,
+        "p95Ms": 0.178,
+        "maxMs": 0.185
+      },
+      "project.read": {
+        "n": 18,
+        "minMs": 0.014,
+        "medianMs": 0.034,
+        "p95Ms": 0.122,
+        "maxMs": 0.122
+      },
+      "session.admit": {
+        "n": 9,
+        "minMs": 0.308,
+        "medianMs": 0.462,
+        "p95Ms": 0.962,
+        "maxMs": 0.962
+      },
+      "http.total": {
+        "n": 9,
+        "minMs": 1.02,
+        "medianMs": 1.432,
+        "p95Ms": 2.3,
+        "maxMs": 2.3
+      }
+    },
+    "journal replay 1 entries": {},
+    "journal replay 10 entries": {},
+    "journal replay 100 entries": {},
+    "append to observed SSE bytes (loopback)": {}
+  },
+  "adapterOperationTotals": {
+    "GET projects process-first": {
+      "firestore.document.get": 2,
+      "firestore.collection.get": 1,
+      "redis.get": 2,
+      "redis.set": 1,
+      "redis.eval": 1
+    },
+    "GET projects warm": {
+      "redis.get": 60
+    },
+    "GET projects cache-cold": {
+      "firestore.document.get": 4,
+      "firestore.collection.get": 2,
+      "redis.get": 4,
+      "redis.set": 2,
+      "redis.eval": 2
+    },
+    "POST session first": {
+      "redis.get": 3,
+      "firestore.document.get": 3,
+      "firestore.transaction": 2
+    },
+    "direct claim (no poll sleep)": {
+      "firestore.transaction": 10
+    },
+    "POST session repeated": {
+      "redis.get": 27,
+      "firestore.document.get": 27,
+      "firestore.transaction": 18
+    },
+    "journal replay 1 entries": {},
+    "journal replay 10 entries": {},
+    "journal replay 100 entries": {},
+    "append to observed SSE bytes (loopback)": {
+      "firestore.transaction": 10,
+      "firestore.document.get": 18
+    }
+  },
+  "cpuMicroseconds": {
+    "user": 516000,
+    "system": 94000
+  },
+  "eventLoop": {
+    "utilization": 0.07618371957915496,
+    "delayMeanMs": 16.157749894736842,
+    "delayP95Ms": 17.760255,
+    "delayMaxMs": 132.382719
+  },
+  "memory": {
+    "rss": 181460992,
+    "heapTotal": 109531136,
+    "heapUsed": 56182496,
+    "external": 11988748,
+    "arrayBuffers": 99653
+  }
+}

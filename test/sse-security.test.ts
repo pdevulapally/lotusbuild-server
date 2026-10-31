@@ -19,7 +19,7 @@ async function fixture(expiresInSeconds = 3600) {
   app.decorate('enforceRateLimit', () => async () => {});
   registerSessionRoutes(app, { readOwned: async (uid: string, id: string) => {
     if (uid !== 'alice' || id !== 'owned') throw new AppError({ code: 'session/not-found', statusCode: 404, message: 'No such session.' });
-    return { id };
+    return { id, projectId: 'project', status: 'RUNNING', model: 'model', effort: 'standard', mode: 'build', messageCount: 1, createdAt: new Date(0) };
   } } as unknown as SessionRepository, {
     subscribe: async (_id: string, callback: (event: SessionEvent) => void) => {
       subscriptions++; listener = callback; return () => { subscriptions--; listener = undefined; };
@@ -98,4 +98,13 @@ test('SSE sends no closing frame when the client is the one that hung up', async
     await assert.rejects(response.text());
     await until(() => h.count() === 0);
   } finally { abort.abort(); await h.app.close(); }
+});
+
+
+test('malformed resume cursors are rejected without opening a subscription', async () => {
+  const h = await fixture();
+  try {
+    const response = await fetch(`${h.address}/sessions/owned/events`, { headers: { ...headers, 'Last-Event-ID': 'invalid-cursor' } });
+    assert.equal(response.status, 400); assert.equal(h.count(), 0);
+  } finally { await h.app.close(); }
 });

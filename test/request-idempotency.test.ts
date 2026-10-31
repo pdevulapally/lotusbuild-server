@@ -20,12 +20,10 @@ test('project retries across repository instances create one project and increme
   const operation = mutation<Project>('u', 'POST /projects', 'project-operation-1', input,
     (project) => ({ statusCode: 201, body: { id: project.id, createdAt: project.createdAt.toISOString() } }));
   const results = await Promise.allSettled([repository().create('u', input, operation), repository().create('u', input, operation)]);
-  const success = results.find((result) => result.status === 'fulfilled');
-  const replay = results.find((result) => result.status === 'rejected');
-  assert.equal(success?.status, 'fulfilled'); assert.equal(replay?.status, 'rejected');
-  if (success?.status !== 'fulfilled' || replay?.status !== 'rejected') throw new Error('Expected one creation and one replay');
-  assert.ok(replay.reason instanceof MutationReplay);
-  assert.deepEqual(replay.reason.response.body, { id: success.value.id, createdAt: success.value.createdAt.toISOString() });
+  assert.ok(results.every(result => result.status === 'fulfilled'));
+  const projects = results.map(result => { if (result.status !== 'fulfilled') throw result.reason; return result.value; });
+  assert.equal(projects[0]?.id, projects[1]?.id);
+  assert.equal(projects[0]?.createdAt.toISOString(), projects[1]?.createdAt.toISOString());
   assert.equal(data.get('users/u')?.['projectCount'], 1);
   assert.equal([...data.keys()].filter((key) => key.startsWith('projects/')).length, 1);
 });

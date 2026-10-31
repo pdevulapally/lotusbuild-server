@@ -31,3 +31,14 @@ const windowStarts: Readonly<Record<ResetPeriod, (now: Date) => number>> = {
 export function periodStartFor(meter: MeterDefinition, now: Date): Date {
   return new Date(windowStarts[meter.resetPeriod](now));
 }
+
+
+/** The same UTC calendar boundaries as charging; NEVER has no promised reset. */
+export function periodEndFor(meter: MeterDefinition, now: Date): Date | undefined {
+  const ends = {
+    NEVER: () => undefined,
+    DAILY: () => new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)),
+    MONTHLY: () => new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)),
+  };
+  return ends[meter.resetPeriod]();
+}

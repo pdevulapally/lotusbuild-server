@@ -1,3 +1,8 @@
+import { parseTaskContext, type TaskContext } from '../runner/task-context.ts';
+import { parseFallbackState, requireFallbackPolicy, quotaMetadata, type FallbackState } from './fallback.ts';
+import { policyFingerprint } from '../entitlements/fallback.ts';
+import { parseCheckpoint, serializeCheckpoint, continuationProtocolMaxBytes, type ContinuationCheckpoint } from '../runner/continuation.ts';
+import { commandTransaction, reconciledCommand } from './commands.ts';
 import { runnerRecoveryProtocol } from './recovery-protocol.ts';
 import { validateAttachmentRefs, type AttachmentRef } from '../attachments/store.ts';
 import {
@@ -18,9 +23,9 @@ import {
 } from '../entitlements/build-admission.ts';
 import type { ConfigurationStore } from '../entitlements/store.ts';
 import { AppError } from '../http/errors.ts';
-import { readMutation, writeMutation, type Mutation } from '../http/idempotency.ts';
+import { mapMutation, type Mutation } from '../http/idempotency.ts';
 import type { MeteringService, Reservation } from '../metering/service.ts';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import {
   type Project,
@@ -92,6 +97,13 @@ function workspaceRecovery(fields: Fields, where: string): WorkspaceRecovery | u
   }
 }
 
+export interface PendingInput {
+  readonly id: string;
+  readonly kind: 'question' | 'approval';
+  readonly prompt: string;
+}
+export interface InputResponse { readonly id: string; readonly answer: string }
+
 export interface BuildSession {
   readonly id: string;
   readonly projectId: string;
@@ -106,6 +118,11 @@ export interface BuildSession {
   readonly heartbeatAt: Date | undefined;
   readonly error: string | undefined;
   readonly cancelRequested?: boolean | undefined;
+  readonly pendingInput?: PendingInput | undefined;
+  readonly fallback?: FallbackState | undefined;
+  readonly inputContext?: string | undefined;
+  readonly executionStarted?: boolean | undefined;
+  readonly discardQueuedBefore?: Date | undefined;
   readonly workspaceRecovery?: WorkspaceRecovery | undefined;
   /** A late follow-up has not yet been appended or charged as a new turn. */
   readonly queuedTurnPending?: boolean | undefined;
@@ -129,12 +146,14 @@ export interface BuildSession {
    * none: such a session cannot have consulted anyone.
    */
   readonly specialistReservationIds: readonly string[];
+  readonly taskContext?: TaskContext;
   readonly messageCount: number;
   readonly createdAt: Date;
 }
 
 export interface ClaimedSession extends BuildSession {
   readonly status: 'RUNNING';
+  readonly recovered?: boolean;
   readonly claimedBy: string;
   readonly leaseToken: string;
 }
@@ -182,6 +201,24 @@ function messageId(seq: number): string {
   return id;
 }
 
+function continuationSource(project: Project, session: BuildSession): string {
+  return createHash('sha256').update(JSON.stringify([project.snapshot, session.model, session.mode, session.messageCount])).digest('hex');
+}
+function continuationQueued(session: BuildSession): boolean {
+  return session.fallback?.checkpointId !== undefined && ['QUEUED', 'CAPACITY_WAIT', 'RUNNING'].includes(session.fallback.status);
+}
+
+function inputContext(project: Project, session: BuildSession): string {
+  return createHash('sha256').update(JSON.stringify([project.snapshot, session.model, session.mode])).digest('hex');
+}
+
+function parsePendingInput(value: unknown): PendingInput | undefined {
+  if (value === undefined) return undefined;
+  const fields = receiptFields(value);
+  return { id: stringField(fields, 'id', 'pendingInput'), kind: enumField(fields, 'kind', 'pendingInput', ['question', 'approval']),
+    prompt: stringField(fields, 'prompt', 'pendingInput') };
+}
+
 function parseSession(id: string, fields: Fields, where: string): BuildSession {
   return {
     id,
@@ -196,6 +233,12 @@ function parseSession(id: string, fields: Fields, where: string): BuildSession {
     leaseToken: optionalStringField(fields, 'leaseToken'),
     heartbeatAt: optionalTimestampField(fields, 'heartbeatAt', where),
     error: optionalStringField(fields, 'error'),
+    pendingInput: parsePendingInput(fields['pendingInput']),
+    inputContext: optionalStringField(fields, 'inputContext'),
+    fallback: parseFallbackState(fields['fallback']),
+    ...(fields['taskContext'] === undefined ? {} : { taskContext: parseTaskContext(fields['taskContext']) }),
+    discardQueuedBefore: optionalTimestampField(fields, 'discardQueuedBefore', where),
+    executionStarted: fields['executionStarted'] === true ? true : undefined,
     cancelRequested: fields['cancelRequested'] === true ? true : undefined,
     workspaceRecovery: workspaceRecovery(fields, where),
     queuedTurnPending: fields['queuedTurnPending'] === undefined ? undefined : booleanField(fields, 'queuedTurnPending', where),
@@ -245,6 +288,38 @@ function parseQueuedMessage(id: string, sessionId: string, fields: Fields, where
 }
 
 
+export type MessageAcceptance =
+  | { readonly kind: 'steered'; readonly sessionId: string }
+  | { readonly kind: 'queued'; readonly message: QueuedMessage }
+  | { readonly kind: 'prompt'; readonly session: BuildSession };
+
+function receiptFields(value: unknown): Fields {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid command result.');
+  return value as Fields;
+}
+function receiptSession(value: unknown): BuildSession {
+  const fields = receiptFields(value);
+  const date = (key: string) => {
+    const text = stringField(fields, key, 'command');
+    const date = new Date(text);
+    if (!Number.isFinite(date.getTime())) throw new Error('Invalid command timestamp.');
+    return Timestamp.fromDate(date);
+  };
+  return parseSession(stringField(fields, 'id', 'command'), { ...fields, createdAt: date('createdAt'),
+    ...(fields['heartbeatAt'] === undefined ? {} : { heartbeatAt: date('heartbeatAt') }),
+    ...(fields['discardQueuedBefore'] === undefined ? {} : { discardQueuedBefore: date('discardQueuedBefore') }) }, 'command');
+}
+function receiptMessage(value: unknown): MessageAcceptance {
+  const fields = receiptFields(value);
+  if (fields['kind'] === 'steered') return { kind: 'steered', sessionId: stringField(fields, 'sessionId', 'command') };
+  if (fields['kind'] === 'prompt') return { kind: 'prompt', session: receiptSession(fields['session']) };
+  if (fields['kind'] !== 'queued') throw new Error('Invalid message receipt.');
+  const message = receiptFields(fields['message']);
+  return { kind: 'queued', message: parseQueuedMessage(stringField(message, 'id', 'command'),
+    stringField(message, 'sessionId', 'command'), { ...message,
+      createdAt: Timestamp.fromDate(new Date(stringField(message, 'createdAt', 'command'))) }, 'command') };
+}
+
 export interface NewSession {
   readonly prompt: string;
   readonly attachments?: readonly AttachmentRef[];
@@ -256,7 +331,7 @@ export interface NewSession {
 /** What a runner reports when it stops working on a session. */
 export type SessionOutcome =
   | { readonly status: 'IDLE' }
-  | { readonly status: 'FAILED'; readonly error: string };
+  | { readonly status: 'FAILED'; readonly error: string; readonly fallback?: FallbackState };
 
 export class SessionRepository {
   readonly #firestore: Firestore;
@@ -332,16 +407,14 @@ export class SessionRepository {
    * creation: a plan can be downgraded, and a mobile project created on pro must
    * not keep building after the subscription lapses.
    */
-  async create(uid: string, projectId: string, input: NewSession, idempotencyId?: string, operation?: Mutation<BuildSession>): Promise<BuildSession> {
+  async create(uid: string, projectId: string, input: NewSession, idempotencyId?: string, commandId?: string | Mutation<BuildSession>): Promise<BuildSession> {
     const attachments = validateAttachmentRefs(input.attachments);
+
     this.#validatePrompt(input.prompt);
     if (idempotencyId !== undefined && !/^[A-Za-z0-9_-]{1,128}$/.test(idempotencyId)) throw new Error('Invalid internal session id.');
     const project = await this.#projects.readOwned(uid, projectId);
     const entitlements = await this.#entitlements.forUser(uid);
 
-    assertBuildAllowed(entitlements, project.platform, input.model);
-
-    const effort = resolveAiEffort(entitlements, input.effort);
     const mode = input.mode ?? 'build';
     const { registry } = await this.#configuration.get();
 
@@ -349,14 +422,18 @@ export class SessionRepository {
     const collection = this.#firestore.collection(sessionsCollectionPath);
     const ref = idempotencyId === undefined ? collection.doc() : collection.doc(idempotencyId);
     const firstMessage = ref.collection(messagesCollectionName).doc(messageId(0));
-    const result: BuildSession = {
-      id: ref.id, projectId: project.id, ownerUid: uid, status: 'QUEUED',
-      model: input.model, effort, mode, sandboxId: undefined, claimedBy: undefined,
-      leaseToken: undefined, heartbeatAt: undefined, error: undefined,
-      reservationIds: [], specialistReservationIds: [], messageCount: 1, createdAt: now,
-    };
-
-    const existing = await this.#firestore.runTransaction(async (transaction) => {
+    const existing = await commandTransaction<BuildSession>({ db: this.#firestore, parent: this.#projects.refFor(projectId), uid, key: commandId,
+      input: ['create-session', input.prompt, input.model, input.effort ?? null, input.mode ?? null, attachments],
+      encode: (session) => ({ id: session.id }),
+      decode: async (value, transaction) => {
+        const id = stringField(receiptFields(value), 'id', 'command');
+        const snapshot = await transaction.get(this.#ref(id));
+        if (!snapshot.exists) throw new AppError({ code: 'session/not-found', statusCode: 404, message: 'No such session.' });
+        const current = parseSession(id, snapshot.data() ?? {}, snapshot.ref.path);
+        if (current.ownerUid !== uid || current.projectId !== projectId) throw new Error('Session receipt scope disagrees.');
+        await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId);
+        return current;
+      }, work: async (transaction): Promise<BuildSession> => {
       if (idempotencyId !== undefined) {
         const prior = await transaction.get(ref);
         if (prior.exists) {
@@ -366,8 +443,9 @@ export class SessionRepository {
         }
       }
       const currentProject = await this.#projects.readOwnedInTransaction(transaction, uid, project.id);
-      await readMutation(transaction, this.#firestore, operation);
       this.#assertProjectCanActivate(currentProject);
+      assertBuildAllowed(entitlements, currentProject.platform, input.model);
+      const effort = resolveAiEffort(entitlements, input.effort);
 
       await this.#metering.consumeIn(transaction, {
         uid,
@@ -400,12 +478,28 @@ export class SessionRepository {
         activeSessionId: ref.id,
         updatedAt: FieldValue.serverTimestamp(),
       });
-      writeMutation(transaction, this.#firestore, operation, result);
-    });
+    return {
+      id: ref.id,
+      projectId: project.id,
+      ownerUid: uid,
+      status: 'QUEUED',
+      model: input.model,
+      effort,
+      mode,
+      sandboxId: undefined,
+      claimedBy: undefined,
+      leaseToken: undefined,
+      heartbeatAt: undefined,
+      error: undefined,
+      reservationIds: [],
+      specialistReservationIds: [],
+      messageCount: 1,
+      createdAt: now,
+    };
+    } });
 
-    if (existing !== undefined) return existing;
+    return reconciledCommand(existing, await this.readOwned(uid, existing.id));
 
-    return result;
   }
 
   /** A session owned by someone else is reported as missing, as projects are. */
@@ -426,7 +520,11 @@ export class SessionRepository {
     if (session.ownerUid !== ownerUid) {
       throw missing;
     }
-    await this.#projects.readOwned(ownerUid, session.projectId);
+    const project = await this.#projects.readOwned(ownerUid, session.projectId);
+    if (session.fallback?.imageExpiresAt !== undefined && Date.parse(session.fallback.imageExpiresAt) <= Date.now() && session.fallback.resumable === true) return { ...session, fallback: { ...session.fallback, status: 'UNAVAILABLE', resumable: false, reason: 'Saved screenshot context expired. Fresh context is required before continuing.' } };
+    if (session.status === 'IDLE' && session.fallback?.resumable === true && session.fallback.sourceVersion !== continuationSource(project, session)) {
+      return { ...session, fallback: { ...session.fallback, status: 'UNAVAILABLE', resumable: false, reason: 'The project changed while this task was paused. Cancel this continuation and review the updated project before starting different work.' } };
+    }
     return session;
   }
 
@@ -522,121 +620,116 @@ export class SessionRepository {
    * neither is something the user can see happening.
    */
   async appendPrompt(uid: string, sessionId: string, prompt: string, mode?: SessionMode, operation?: Mutation<BuildSession>, attachmentRefs?: readonly AttachmentRef[]): Promise<BuildSession> {
-    this.#validatePrompt(prompt);
-    const attachments = validateAttachmentRefs(attachmentRefs);
-    const session = await this.readOwned(uid, sessionId);
-    const entitlements = await this.#entitlements.forUser(uid);
-    const { registry } = await this.#configuration.get();
-    const now = new Date();
-    const ref = this.#ref(session.id);
-
-    return this.#firestore.runTransaction(async (transaction) => {
-      const snapshot = await transaction.get(ref);
-      if (!snapshot.exists) {
-        throw new AppError({
-          code: 'session/not-found',
-          statusCode: 404,
-          message: 'No such session.',
-        });
-      }
-      const current = parseSession(snapshot.id, snapshot.data() ?? {}, ref.path);
-      if (current.ownerUid !== uid) {
-        throw new AppError({
-          code: 'session/not-found',
-          statusCode: 404,
-          message: 'No such session.',
-        });
-      }
-      const project = await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId);
-      await readMutation(transaction, this.#firestore, operation);
-      this.#assertPromptRecoveryEligible(current);
-      if (current.status === 'QUEUED' || current.status === 'RUNNING') {
-        throw new AppError({
-          code: mode === undefined ? 'session/busy' : 'session/mode-change-busy',
-          statusCode: 409,
-          message: 'This session is still working. Wait for it to finish before sending more.',
-          details: { status: current.status },
-        });
-      }
-
-      this.#assertProjectCanActivate(project, current.id);
-      assertBuildAllowed(entitlements, project.platform, current.model);
-
-      // A follow-up turn is another build, and is charged as one.
-      await this.#metering.consumeIn(transaction, {
-        uid,
-        entitlements,
-        meterKey: registry.buildMeterKey,
-        quantity: 1,
-        now,
-      });
-
-      const seq = current.messageCount;
-      transaction.create(ref.collection(messagesCollectionName).doc(messageId(seq)), {
-        role: 'user',
-        content: prompt,
-        ...attachmentsField(attachments),
-        createdAt: FieldValue.serverTimestamp(),
-      });
-      transaction.update(ref, {
-        status: 'QUEUED',
-        ...(mode !== undefined ? { mode } : {}),
-        messageCount: FieldValue.increment(1),
-        claimableAt: Timestamp.fromDate(now),
-        cancelRequested: FieldValue.delete(),
-        error: FieldValue.delete(),
-        updatedAt: FieldValue.serverTimestamp(),
-      });
-      transaction.update(this.#projects.refFor(current.projectId), {
-        activeSessionId: current.id,
-        updatedAt: FieldValue.serverTimestamp(),
-      });
-
-      const result = { ...current, ...(mode !== undefined ? { mode } : {}), status: 'QUEUED' as const, error: undefined, cancelRequested: undefined, messageCount: seq + 1 };
-      writeMutation(transaction, this.#firestore, operation, result);
-      return result;
+    const accepted = mapMutation<BuildSession, MessageAcceptance>(operation, value => {
+      if (value.kind !== 'prompt') throw new Error('Unexpected prompt result.'); return value.session;
     });
+    const result = await this.submitMessage(uid, sessionId, prompt, false, accepted, 'append', undefined, mode, attachmentRefs);
+    if (result.kind !== 'prompt') throw new Error('Unexpected prompt result.');
+    return result.session;
   }
 
-  /**
-   * Staging a prompt in the session queue while a turn is active.
-   */
   async enqueueMessage(uid: string, sessionId: string, prompt: string, operation?: Mutation<QueuedMessage>, attachmentRefs?: readonly AttachmentRef[]): Promise<QueuedMessage> {
-    this.#validatePrompt(prompt);
+    const accepted = mapMutation<QueuedMessage, MessageAcceptance>(operation, value => {
+      if (value.kind !== 'queued') throw new Error('Unexpected queue result.'); return value.message;
+    });
+    const result = await this.submitMessage(uid, sessionId, prompt, false, accepted, 'enqueue', undefined, undefined, attachmentRefs);
+    if (result.kind !== 'queued') throw new Error('Unexpected queue result.');
+    return result.message;
+  }
+
+  /** Choose the submission path inside the same transaction as its receipt, not from a stale HTTP read. */
+  async submitMessage(uid: string, sessionId: string, prompt: string, steer = false, commandId?: string | Mutation<MessageAcceptance>,
+    strategy?: 'append' | 'enqueue' | 'steer', inputResponse?: InputResponse, mode?: SessionMode, attachmentRefs?: readonly AttachmentRef[]): Promise<MessageAcceptance> {
     const attachments = validateAttachmentRefs(attachmentRefs);
+    this.#validatePrompt(prompt);
+    await this.readOwned(uid, sessionId);
     const entitlements = await this.#entitlements.forUser(uid);
     const limit = await this.#queueLimit(entitlements);
-    const parent = this.#ref(sessionId);
-    const ref = parent.collection(queuedMessagesCollectionName).doc();
-    const result: QueuedMessage = { id: ref.id, sessionId, prompt, attachments, createdAt: new Date() };
-    await this.#firestore.runTransaction(async (transaction) => {
-      const snapshot = await transaction.get(parent);
+    const { registry } = await this.#configuration.get();
+    const ref = this.#ref(sessionId);
+    const queuedRef = ref.collection(queuedMessagesCollectionName).doc();
+    const now = new Date();
+    const accepted = await commandTransaction<MessageAcceptance>({ db: this.#firestore, parent: ref, uid, key: commandId,
+      input: ['message', prompt, steer, inputResponse ?? null, mode ?? null, attachments],
+      decode: async (value, transaction) => {
+        const snapshot = await transaction.get(ref);
+        const current = parseSession(sessionId, snapshot.data() ?? {}, ref.path);
+        await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId);
+        const fields = receiptFields(value);
+        if (fields['kind'] !== undefined) return receiptMessage(value);
+        if (fields['steered'] === true) return { kind: 'steered', sessionId: stringField(fields, 'sessionId', 'receipt') };
+        if (fields['queued'] === true) return receiptMessage({ kind: 'queued', message: fields['queuedMessage'] });
+        if (fields['queued'] === false) return { kind: 'prompt', session: current };
+        throw new Error('Invalid message acceptance receipt.');
+      }, work: async (transaction): Promise<MessageAcceptance> => {
+      const snapshot = await transaction.get(ref);
       if (!snapshot.exists || snapshot.data()?.['ownerUid'] !== uid) {
         throw new AppError({ code: 'session/not-found', statusCode: 404, message: 'No such session.' });
       }
-      const session = parseSession(snapshot.id, snapshot.data() ?? {}, parent.path);
-      const project = await this.#projects.readOwnedInTransaction(transaction, uid, session.projectId);
-      await readMutation(transaction, this.#firestore, operation);
-      this.#assertPromptRecoveryEligible(session);
-      if (!isActiveSessionStatus(session.status) || session.cancelRequested === true) {
+      const current = parseSession(snapshot.id, snapshot.data() ?? {}, ref.path);
+      this.#assertPromptRecoveryEligible(current);
+      const pendingInput = current.pendingInput;
+      if (pendingInput !== undefined && (inputResponse?.id !== pendingInput.id || current.status !== 'IDLE')) {
+        throw new AppError({ code: 'session/input-required', statusCode: 409, message: 'Answer the current request before starting more work.' });
+      }
+      if (inputResponse !== undefined && pendingInput === undefined) throw new AppError({
+        code: 'session/input-stale', statusCode: 409, message: 'This request is no longer awaiting an answer.' });
+      if (pendingInput?.kind === 'approval' && !['approve', 'reject'].includes(inputResponse?.answer ?? '')) throw new AppError({
+        code: 'session/invalid-decision', statusCode: 400, message: 'Choose approve or reject for this request.' });
+      const active = isActiveSessionStatus(current.status);
+      if (strategy === 'append' && active) throw new AppError({ code: 'session/busy', statusCode: 409,
+        message: 'This session is still working. Wait for it to finish before sending more.', details: { status: current.status } });
+      if (active && mode !== undefined) throw new AppError({ code: 'session/mode-change-busy', statusCode: 409, message: 'Wait for the current turn before changing mode.' });
+      if ((active && current.cancelRequested === true) || (strategy === 'enqueue' && !active)) {
         throw new AppError({ code: 'session/not-active', statusCode: 409, message: 'This session is no longer accepting queued messages.' });
       }
-      this.#assertProjectGuard(project, session);
-      assertBuildAllowed(entitlements, project.platform, session.model);
-      const queued = await transaction.get(parent.collection(queuedMessagesCollectionName).limit(limit + 1));
-      if (queued.size >= limit) {
-        throw new AppError({ code: 'session/queue-full', statusCode: 429, message: 'The session message queue is full.' });
+      if (strategy === 'steer' && current.status !== 'RUNNING') throw new AppError({ code: 'session/not-running', statusCode: 409,
+        message: 'This session is no longer accepting steering instructions.' });
+      const project = await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId);
+      if (pendingInput !== undefined && ((mode !== undefined && mode !== current.mode) || current.inputContext !== inputContext(project, current))) throw new AppError({
+        code: 'session/input-context-changed', statusCode: 409, message: 'The project changed while this request was waiting. Cancel this request and review the updated project before continuing.' });
+      if (active) this.#assertProjectGuard(project, current);
+      else this.#assertProjectCanActivate(project, current.id);
+      assertBuildAllowed(entitlements, project.platform, current.model);
+      if ((steer || strategy === 'steer') && current.status === 'RUNNING') {
+        transaction.update(ref, { pendingSteer: prompt, pendingSteerAttachments: attachments, updatedAt: FieldValue.serverTimestamp() });
+        return { kind: 'steered', sessionId };
       }
-      transaction.create(ref, { prompt, ...attachmentsField(attachments), createdAt: FieldValue.serverTimestamp() });
-      // Enqueue and deletion/dequeue share this parent conflict boundary.
-      transaction.update(parent, { updatedAt: FieldValue.serverTimestamp() });
-      writeMutation(transaction, this.#firestore, operation, result);
-    });
-    return result;
+      if (active) {
+        const queued = await transaction.get(this.#queuedMessages(ref, current).limit(limit + 1));
+        if (queued.size >= limit) throw new AppError({ code: 'session/queue-full', statusCode: 429, message: 'The session message queue is full.' });
+        transaction.create(queuedRef, { prompt, ...attachmentsField(attachments), createdAt: FieldValue.serverTimestamp() });
+        transaction.update(ref, { updatedAt: FieldValue.serverTimestamp() });
+        return { kind: 'queued', message: { id: queuedRef.id, sessionId, prompt, attachments, createdAt: now } };
+      }
+      await this.#metering.consumeIn(transaction, { uid, entitlements, meterKey: registry.buildMeterKey, quantity: 1, now });
+      if (current.fallback?.checkpointId !== undefined) transaction.delete(ref.collection('continuations').doc('active'));
+      let content = prompt;
+      if (pendingInput !== undefined) {
+        if (inputResponse === undefined) throw new Error('A current input response is required.');
+        transaction.update(ref.collection('input_requests').doc(pendingInput.id), { answer: inputResponse.answer, answeredAt: FieldValue.serverTimestamp() });
+        content = `Response to ${pendingInput.kind} ${pendingInput.id}: ${inputResponse.answer}\nRequest: ${pendingInput.prompt}`;
+      }
+      transaction.create(ref.collection(messagesCollectionName).doc(messageId(current.messageCount)), {
+        role: 'user', content, ...attachmentsField(attachments), createdAt: FieldValue.serverTimestamp(),
+      });
+      transaction.update(ref, { status: 'QUEUED', ...(mode === undefined ? {} : { mode }), pendingInput: FieldValue.delete(), inputContext: FieldValue.delete(), fallback: FieldValue.delete(), executionStarted: FieldValue.delete(), messageCount: FieldValue.increment(1), claimableAt: Timestamp.fromDate(now),
+        cancelRequested: FieldValue.delete(), error: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() });
+      transaction.update(this.#projects.refFor(current.projectId), { activeSessionId: current.id, updatedAt: FieldValue.serverTimestamp() });
+      return { kind: 'prompt', session: { ...current, status: 'QUEUED', ...(mode === undefined ? {} : { mode }), pendingInput: undefined, inputContext: undefined, fallback: undefined, executionStarted: undefined, error: undefined, cancelRequested: undefined, messageCount: current.messageCount + 1 } };
+    } });
+    return accepted.kind === 'prompt' ? reconciledCommand(accepted, { ...accepted, session: await this.readOwned(uid, sessionId) }) : accepted;
+
   }
 
   // There is no reason to stage more builds than the plan permits in a whole
   // billing window. Reuse that configured bound rather than invent a new plan rule.
+  #queuedMessages(ref: DocumentReference, session: BuildSession) {
+    const collection = ref.collection(queuedMessagesCollectionName);
+    return session.discardQueuedBefore === undefined ? collection
+      : collection.where('createdAt', '>', Timestamp.fromDate(session.discardQueuedBefore));
+  }
+
   async #queueLimit(entitlements: UserEntitlements): Promise<number> {
     const { registry } = await this.#configuration.get();
     const limit = entitlements.meterLimits.get(registry.buildMeterKey);
@@ -647,7 +740,7 @@ export class SessionRepository {
   async listQueuedMessages(uid: string, sessionId: string, limit = 100, after?: string): Promise<readonly QueuedMessage[]> {
     const session = await this.readOwned(uid, sessionId);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new Error('Invalid queue page size.');
-    let query = this.#ref(session.id).collection(queuedMessagesCollectionName)
+    let query = this.#queuedMessages(this.#ref(session.id), session)
       .orderBy('createdAt', 'asc').orderBy(FieldPath.documentId(), 'asc');
     if (after !== undefined) {
       const cursor = await this.#ref(session.id).collection(queuedMessagesCollectionName).doc(after).get();
@@ -689,7 +782,8 @@ export class SessionRepository {
     const now = new Date();
     return this.#firestore.runTransaction(async (transaction) => {
       const session = await this.#requireLease(transaction, ref, authority);
-      const queuedSnapshot = await transaction.get(ref.collection(queuedMessagesCollectionName)
+      if (session.pendingInput !== undefined || continuationQueued(session)) return undefined;
+      const queuedSnapshot = await transaction.get(this.#queuedMessages(ref, session)
         .orderBy('createdAt', 'asc').limit(1));
       const nextDoc = queuedSnapshot.docs[0];
       if (nextDoc === undefined) return undefined;
@@ -726,6 +820,7 @@ export class SessionRepository {
   }
 
   #assertPromptRecoveryEligible(session: BuildSession): void {
+    if (session.fallback !== undefined && (session.fallback.resumable === true || ['AWAITING_CONSENT', 'EXHAUSTED', 'SHARED_LIMIT', 'CAPACITY_WAIT'].includes(session.fallback.status))) throw new AppError({ code: 'fallback/decision-required', statusCode: 409, message: 'Review the paused task, wait for its allowance to reset, or cancel before starting different work.' });
     if (session.workspaceRecovery?.status === 'UNRECOVERABLE') {
       throw new AppError({
         code: 'session/workspace-unrecoverable',
@@ -743,27 +838,7 @@ export class SessionRepository {
 
   /** Redis is only a notification: acceptance commits before the API acknowledges. */
   async queueSteerMessage(uid: string, sessionId: string, prompt: string, operation?: Mutation<void>, attachmentRefs?: readonly AttachmentRef[]): Promise<void> {
-    this.#validatePrompt(prompt);
-    const attachments = validateAttachmentRefs(attachmentRefs);
-    const entitlements = await this.#entitlements.forUser(uid);
-    const ref = this.#ref(sessionId);
-    await this.#firestore.runTransaction(async (transaction) => {
-      const snapshot = await transaction.get(ref);
-      if (!snapshot.exists || snapshot.data()?.['ownerUid'] !== uid) {
-        throw new AppError({ code: 'session/not-found', statusCode: 404, message: 'No such session.' });
-      }
-      const session = parseSession(snapshot.id, snapshot.data() ?? {}, ref.path);
-      const project = await this.#projects.readOwnedInTransaction(transaction, uid, session.projectId);
-      await readMutation(transaction, this.#firestore, operation);
-      this.#assertPromptRecoveryEligible(session);
-      if (session.status !== 'RUNNING' || session.cancelRequested === true) {
-        throw new AppError({ code: 'session/not-running', statusCode: 409, message: 'This session is no longer accepting steering instructions.' });
-      }
-      this.#assertProjectGuard(project, session);
-      assertBuildAllowed(entitlements, project.platform, session.model);
-      transaction.update(ref, { pendingSteer: prompt, pendingSteerAttachments: attachments.length === 0 ? FieldValue.delete() : attachmentsField(attachments).attachments, updatedAt: FieldValue.serverTimestamp() });
-      writeMutation(transaction, this.#firestore, operation, undefined);
-    });
+    await this.submitMessage(uid, sessionId, prompt, true, mapMutation<void, MessageAcceptance>(operation, () => undefined), 'steer', undefined, undefined, attachmentRefs);
   }
 
   /** Consume the latest steering instruction and persist its conversation position atomically. */
@@ -798,7 +873,7 @@ export class SessionRepository {
     return this.#firestore.runTransaction(async (transaction) => {
       const session = await this.#requireLease(transaction, ref, authority);
       if (session.queuedTurnPending !== true) throw new Error('Session has no pending turn to start.');
-      const queued = await transaction.get(ref.collection(queuedMessagesCollectionName).orderBy('createdAt', 'asc').limit(1));
+      const queued = await transaction.get(this.#queuedMessages(ref, session).orderBy('createdAt', 'asc').limit(1));
       const next = queued.docs[0];
       const pending: SteerMessage | undefined = session.pendingSteer !== undefined
         ? { prompt: session.pendingSteer, attachments: session.pendingSteerAttachments ?? [] }
@@ -819,7 +894,8 @@ export class SessionRepository {
       transaction.create(ref.collection(messagesCollectionName).doc(messageId(session.messageCount)), {
         role: 'user', content: prompt, ...attachmentsField(pending?.attachments ?? []), createdAt: FieldValue.serverTimestamp(),
       });
-      transaction.update(ref, { queuedTurnPending: FieldValue.delete(), pendingSteer: FieldValue.delete(), pendingSteerAttachments: FieldValue.delete(),
+      transaction.update(ref, { queuedTurnPending: FieldValue.delete(), fallback: FieldValue.delete(), pendingSteer: FieldValue.delete(),
+
         messageCount: FieldValue.increment(1), updatedAt: FieldValue.serverTimestamp() });
       return true;
     });
@@ -835,14 +911,18 @@ export class SessionRepository {
    * If the session is RUNNING, cancelRequested is set to true so the active runner halts on its
    * next step, tears down resources, and transitions the session to FAILED.
    */
-  async cancel(uid: string, sessionId: string, operation?: Mutation<BuildSession>): Promise<BuildSession> {
+  async cancel(uid: string, sessionId: string, commandId?: string | Mutation<BuildSession>): Promise<BuildSession> {
+
     const session = await this.readOwned(uid, sessionId);
     const entitlements = await this.#entitlements.forUser(uid);
     const { registry } = await this.#configuration.get();
     const ref = this.#ref(sessionId);
     const now = new Date();
 
-    return this.#firestore.runTransaction(async (transaction) => {
+    const accepted = await commandTransaction({ db: this.#firestore, parent: ref, uid, key: commandId, input: ['cancel'], decode: async (_value, transaction) => {
+      const snapshot = await transaction.get(ref); const current = parseSession(sessionId, snapshot.data() ?? {}, ref.path);
+      await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId, true); return current;
+    }, work: async (transaction) => {
       const snapshot = await transaction.get(ref);
       if (!snapshot.exists) {
         throw new AppError({
@@ -861,7 +941,14 @@ export class SessionRepository {
       }
 
       const project = await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId, true);
-      await readMutation(transaction, this.#firestore, operation);
+      if (current.status === 'IDLE' && (current.pendingInput !== undefined || (current.fallback !== undefined && current.fallback.status !== 'COMPLETED'))) {
+        await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId);
+        transaction.delete(ref.collection('continuations').doc('active'));
+        if (current.pendingInput !== undefined) transaction.update(ref.collection('input_requests').doc(current.pendingInput.id), { cancelledAt: FieldValue.serverTimestamp() });
+        transaction.update(ref, { status: 'FAILED', error: 'Cancelled by user', discardQueuedBefore: FieldValue.serverTimestamp(), pendingInput: FieldValue.delete(), fallback: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() });
+        return { ...current, status: 'FAILED' as const, error: 'Cancelled by user', pendingInput: undefined };
+      }
+
       if (current.status === 'IDLE' || current.status === 'FAILED') {
         throw new AppError({
           code: 'session/not-cancellable',
@@ -875,7 +962,7 @@ export class SessionRepository {
       this.#assertProjectGuard(project, current);
 
       if (current.status === 'QUEUED') {
-        if (current.queuedTurnPending !== true) await this.#metering.refundIn(transaction, {
+        if (current.queuedTurnPending !== true && !continuationQueued(current)) await this.#metering.refundIn(transaction, {
           uid,
           entitlements,
           meterKey: registry.buildMeterKey,
@@ -884,11 +971,15 @@ export class SessionRepository {
           now,
         });
 
+        transaction.delete(ref.collection('continuations').doc('active'));
         transaction.update(ref, {
           status: 'FAILED',
+          discardQueuedBefore: FieldValue.serverTimestamp(),
           error: 'Cancelled by user',
           leaseToken: FieldValue.delete(),
           claimableAt: FieldValue.delete(),
+          fallbackClaimableAt: FieldValue.delete(),
+          fallback: FieldValue.delete(),
           queuedTurnPending: FieldValue.delete(),
           pendingSteer: FieldValue.delete(),
           updatedAt: FieldValue.serverTimestamp(),
@@ -904,22 +995,20 @@ export class SessionRepository {
           error: 'Cancelled by user',
           cancelRequested: undefined,
         };
-        writeMutation(transaction, this.#firestore, operation, result);
         return result;
       }
 
+      transaction.delete(ref.collection('continuations').doc('active'));
       transaction.update(ref, {
         cancelRequested: true,
+        discardQueuedBefore: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });
 
-      const result = {
-        ...current,
-        cancelRequested: true,
-      };
-      writeMutation(transaction, this.#firestore, operation, result);
-      return result;
-    });
+      return { ...current, cancelRequested: true };
+    } });
+    return reconciledCommand(accepted, await this.readOwned(uid, sessionId));
+
   }
 
   /**
@@ -953,20 +1042,28 @@ export class SessionRepository {
       .limit(1)
       .get();
 
-    const candidate = candidates.docs[0];
-    if (candidate === undefined) {
-      return undefined;
-    }
-    const ref = candidate.ref;
+    const fallbackCandidates = await this.#firestore.collection(sessionsCollectionPath)
+      .where('fallbackClaimableAt', '<=', Timestamp.fromDate(now)).orderBy('fallbackClaimableAt', 'asc').limit(1).get();
+    const premiumCandidate = candidates.docs[0]; const fallbackCandidate = fallbackCandidates.docs[0];
+    if (premiumCandidate === undefined && fallbackCandidate === undefined) return undefined;
+    const { registry } = await this.#configuration.get();
+    const scheduler = this.#firestore.doc('scheduler/fallback_dispatch');
     const leaseToken = randomUUID();
-
     return this.#firestore.runTransaction(async (transaction) => {
+      const scheduling = fallbackCandidate === undefined ? undefined : await transaction.get(scheduler);
+      const count = scheduling?.exists ? integerField(scheduling.data() ?? {}, 'premiumDispatches', scheduler.path, { min: 0 }) : 0;
+      const recovering = premiumCandidate?.data()?.['status'] === 'RUNNING';
+      const fallbackTurn = !recovering && fallbackCandidate !== undefined && (premiumCandidate === undefined || registry.fallback === undefined || count >= registry.fallback.maxPremiumDispatches);
+      const candidate = fallbackTurn ? fallbackCandidate : premiumCandidate;
+      if (candidate === undefined) return undefined;
+      const ref = candidate.ref;
       const snapshot = await transaction.get(ref);
       if (!snapshot.exists) {
         return undefined;
       }
       const fields = snapshot.data() ?? {};
-      const claimableAt = optionalTimestampField(fields, 'claimableAt', ref.path);
+      if (!fallbackTurn && recovering && fields['status'] !== 'RUNNING') return undefined;
+      const claimableAt = optionalTimestampField(fields, fallbackTurn ? 'fallbackClaimableAt' : 'claimableAt', ref.path);
       // Another runner won the race between the query and this transaction.
       if (claimableAt === undefined || claimableAt.getTime() > now.getTime()) {
         return undefined;
@@ -995,9 +1092,12 @@ export class SessionRepository {
         return undefined;
       }
       this.#assertProjectGuard(project, session);
+      if (fallbackTurn && (!continuationQueued(session) || session.fallback === undefined)) throw new Error('Fallback scheduler state disagrees.');
       signal?.throwIfAborted();
       transaction.update(ref, {
         status: 'RUNNING',
+        ...(continuationQueued(session) ? { fallback: { ...session.fallback, status: 'RUNNING', reason: session.fallback?.lane === 'fallback' ? 'Running with the approved free-to-user model.' : 'Continuing with the original model.' } } : {}),
+        fallbackClaimableAt: FieldValue.delete(),
         claimedBy: runnerId,
         leaseToken,
         heartbeatAt: Timestamp.fromDate(now),
@@ -1006,15 +1106,192 @@ export class SessionRepository {
         updatedAt: FieldValue.serverTimestamp(),
       });
 
+      if (fallbackCandidate !== undefined && !recovering) transaction.set(scheduler, { premiumDispatches: fallbackTurn ? 0 : count + 1, updatedAt: FieldValue.serverTimestamp() });
       return {
         ...session,
+        ...(continuationQueued(session) && session.fallback !== undefined ? { fallback: { ...session.fallback, status: 'RUNNING' as const, reason: session.fallback?.lane === 'fallback' ? 'Running with the approved free-to-user model.' : 'Continuing with the original model.' } } : {}),
         status: 'RUNNING' as const,
+        recovered: session.status === 'RUNNING',
         claimedBy: runnerId,
         leaseToken,
         heartbeatAt: now,
         error: undefined,
       };
     });
+  }
+
+  /** Verify the expiry query before claiming work; no client is needed for retention cleanup. */
+  async assertContinuationRetentionReady(): Promise<void> {
+    await this.#firestore.collectionGroup('continuations').where('imageExpiresAt', '<=', Timestamp.now()).limit(1).get();
+  }
+
+  async collectExpiredContinuations(now = new Date()): Promise<void> {
+    const page = await this.#firestore.collectionGroup('continuations').where('imageExpiresAt', '<=', Timestamp.fromDate(now)).limit(100).get();
+    for (const entry of page.docs) await this.#firestore.runTransaction(async (transaction) => {
+      const checkpoint = await transaction.get(entry.ref);
+      const deadline = checkpoint.data()?.['imageExpiresAt'];
+      if (!(deadline instanceof Timestamp) || deadline.toMillis() > now.getTime()) return;
+      const parts = entry.ref.path.split('/');
+      if (parts.length !== 4 || parts[0] !== 'sessions' || parts[2] !== 'continuations') throw new Error('Invalid continuation parent.');
+      const ref = this.#firestore.doc(parts.slice(0, 2).join('/'));
+      const saved = await transaction.get(ref);
+      const fields = saved.data();
+      if (fields === undefined) { transaction.delete(entry.ref); return; }
+      const session = parseSession(saved.id, fields, ref.path);
+      const projectRef = this.#projects.refFor(session.projectId);
+      const project = await transaction.get(projectRef);
+      transaction.delete(entry.ref);
+      if (session.fallback?.checkpointId !== checkpoint.data()?.['version']) return;
+      const running = session.status === 'RUNNING';
+      transaction.update(ref, {
+        fallback: { ...session.fallback, status: 'UNAVAILABLE', resumable: false, reason: 'Saved screenshot context expired. Fresh context is required before continuing.' },
+        ...(!running ? { status: 'IDLE', claimableAt: FieldValue.delete(), fallbackClaimableAt: FieldValue.delete() } : {}),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      if (!running && project.data()?.['activeSessionId'] === session.id) transaction.update(projectRef, { activeSessionId: null, updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+
+  /** Save a portable admission checkpoint only after workspace publication and resource disposal. */
+  async pauseContinuation(authority: SessionLease, checkpoint: ContinuationCheckpoint, state: FallbackState, retryAt?: Date): Promise<void> {
+    const { registry } = await this.#configuration.get();
+    const policy = registry.fallback;
+    if (policy === undefined) throw new Error('Fallback checkpoint storage is not configured.');
+    const payload = serializeCheckpoint(checkpoint, policy.maxCheckpointBytes);
+    const id = randomUUID(); const ref = this.#ref(authority.sessionId);
+    await this.#firestore.runTransaction(async (transaction) => {
+      const { session, project } = await this.#requireLeaseState(transaction, ref, authority);
+      if (session.workspaceRecovery?.status === 'REQUIRED' || session.sandboxId !== undefined || session.reservationIds.length > 0) throw new Error('Continuation requires saved workspace and disposed resources.');
+      if (session.specialistReservationIds.length > 0) await this.#metering.releaseIn(transaction, session.ownerUid, session.specialistReservationIds, new Date());
+      transaction.set(ref.collection('continuations').doc('active'), { version: id, payload, source: continuationSource(project, session), policy: policyFingerprint(policy), status: 'READY', ...(checkpoint.imageExpiresAt === undefined ? {} : { imageExpiresAt: Timestamp.fromDate(new Date(checkpoint.imageExpiresAt)) }), createdAt: FieldValue.serverTimestamp() });
+      transaction.update(ref, { status: retryAt === undefined ? 'IDLE' : 'QUEUED', fallback: { ...Object.fromEntries(Object.entries(state).filter(([key]) => key !== 'imageExpiresAt')), checkpointId: id, sourceVersion: continuationSource(project, session), resumable: true, ...(checkpoint.imageExpiresAt === undefined ? {} : { imageExpiresAt: checkpoint.imageExpiresAt }) }, lastFinishedLeaseToken: authority.token,
+        executionStarted: FieldValue.delete(), claimableAt: retryAt !== undefined && state.lane === 'premium' ? Timestamp.fromDate(retryAt) : FieldValue.delete(), fallbackClaimableAt: retryAt === undefined || state.lane === 'premium' ? FieldValue.delete() : Timestamp.fromDate(retryAt),
+        claimedBy: FieldValue.delete(), leaseToken: FieldValue.delete(), specialistReservationIds: FieldValue.delete(), error: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() });
+      transaction.update(this.#projects.refFor(project.id), { activeSessionId: retryAt === undefined ? null : session.id, updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+
+  async readContinuation(authority: SessionLease): Promise<ContinuationCheckpoint> {
+    const { registry } = await this.#configuration.get();
+    const policy = registry.fallback;
+    return this.#firestore.runTransaction(async (transaction) => {
+      const { session, project } = await this.#requireLeaseState(transaction, this.#ref(authority.sessionId), authority);
+      const id = session.fallback?.checkpointId;
+      if (id === undefined) throw new Error('The continuation checkpoint is missing.');
+      const checkpoint = await transaction.get(this.#ref(session.id).collection('continuations').doc('active'));
+      const fields = checkpoint.data() ?? {};
+      if (fields['version'] !== id || fields['source'] !== continuationSource(project, session) || (session.fallback?.lane === 'fallback' && (policy === undefined || fields['policy'] !== policyFingerprint(policy)))) throw new AppError({
+        code: 'fallback/checkpoint-stale', statusCode: 409, message: 'The saved project or continuation configuration changed. This task cannot be blindly resumed.' });
+      return parseCheckpoint(stringField(fields, 'payload', 'continuation'), continuationProtocolMaxBytes);
+    });
+  }
+
+  /** Explicit owner consent joins the existing session scheduler; no second build is created or charged. */
+  async acceptFallback(uid: string, sessionId: string, commandId: string, input: { checkpointId: string; model: string; effort: AiEffort; lane?: 'premium' | 'fallback' }): Promise<BuildSession> {
+    await this.readOwned(uid, sessionId);
+    const entitlements = await this.#entitlements.forUser(uid, new Date(), true);
+    const { registry } = await this.#configuration.get();
+    const ref = this.#ref(sessionId);
+    const accepted = await commandTransaction({ db: this.#firestore, parent: ref, uid, key: commandId, input: ['accept-continuation', input.checkpointId, input.model, input.effort, input.lane ?? 'fallback'],
+      decode: receiptSession, work: async (transaction) => {
+      const snapshot = await transaction.get(ref); const current = parseSession(sessionId, snapshot.data() ?? {}, ref.path);
+      const state = current.fallback; const offer = state?.offer;
+      if (current.status !== 'IDLE' || state === undefined || !['AWAITING_CONSENT', 'EXHAUSTED', 'SHARED_LIMIT', 'UNAVAILABLE'].includes(state.status) || (input.lane !== 'premium' && offer === undefined) ||
+          state.checkpointId !== input.checkpointId || (input.lane === 'premium' ? (current.model !== input.model || current.effort !== input.effort) : (offer?.model !== input.model || offer?.effort !== input.effort)) || current.cancelRequested === true) throw new AppError({
+        code: 'fallback/offer-stale', statusCode: 409, message: 'This fallback offer is no longer current. Refresh the task before deciding.' });
+      const policy = input.lane === 'premium' ? undefined : requireFallbackPolicy(registry, entitlements, offer?.policyFingerprint);
+      const project = await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId);
+      assertBuildAllowed(entitlements, project.platform, current.model);
+      if (!entitlements.capabilities.boolean('git.persistence')) throw new AppError({ code: 'fallback/persistence-required', statusCode: 409, message: 'Safe continuation requires saved project persistence.' });
+      this.#assertProjectCanActivate(project, current.id);
+      const checkpoint = await transaction.get(ref.collection('continuations').doc('active'));
+      const fields = checkpoint.data() ?? {};
+      if (fields['version'] !== input.checkpointId || fields['status'] !== 'READY' || fields['source'] !== continuationSource(project, current) || (input.lane !== 'premium' && (policy === undefined || fields['policy'] !== policyFingerprint(policy)))) throw new AppError({ code: 'fallback/checkpoint-stale', statusCode: 409, message: 'The project or checkpoint for this task changed while awaiting your decision.' });
+      parseCheckpoint(stringField(fields, 'payload', 'continuation'), continuationProtocolMaxBytes);
+      const now = new Date();
+      let inputMeterKey = registry.inputTokenMeterKey; let outputMeterKey = registry.outputTokenMeterKey;
+      let inputQuantity = 1; let outputQuantity = 1;
+      if (input.lane !== 'premium') {
+        if (policy === undefined || offer === undefined) throw new Error('Verified fallback configuration is required.');
+        inputMeterKey = policy.inputTokenMeterKey; outputMeterKey = policy.outputTokenMeterKey;
+        inputQuantity = offer.inputTokens; outputQuantity = offer.maxOutputTokens;
+      }
+      const provider = registry.sandboxProviders.get(project.platform);
+      if (provider === undefined) throw new Error('The project execution provider is not configured.');
+      let fallback: FallbackState = { ...state, status: 'QUEUED', lane: input.lane ?? 'fallback', reason: input.lane === 'premium' ? 'Queued for the original model.' : 'Queued for the configured free-to-user model.', consent: input.lane !== 'premium' };
+      let retryAt: Date | undefined;
+      try {
+        await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: inputMeterKey, quantity: inputQuantity, now });
+        await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: outputMeterKey, quantity: outputQuantity, now });
+        // Continuations reuse the already-admitted build; they neither refund nor charge a second build.
+        await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: registry.buildMeterKey, quantity: 0, now });
+        await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: registry.storageMeterKey, quantity: 0, now });
+        await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: registry.sandboxTimeMeterKey, quantity: provider.timeoutSeconds, now });
+        await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: provider.concurrencyMeterKey, quantity: 1, now });
+      } catch (error) {
+        if (!(error instanceof AppError) || error.code !== 'usage/limit-reached' || typeof error.details !== 'object' || error.details === null || !('meterKey' in error.details)) throw error;
+        if (error.details.meterKey === provider.concurrencyMeterKey) {
+          if (registry.fallback === undefined) throw error;
+          retryAt = new Date(now.getTime() + registry.fallback.capacityRetrySeconds * 1000);
+          fallback = { ...fallback, status: 'CAPACITY_WAIT', reason: 'Shared execution capacity is temporarily unavailable. Your task remains queued.', retryAt: retryAt.toISOString() };
+        } else {
+          const modelQuota = error.details.meterKey === inputMeterKey || error.details.meterKey === outputMeterKey;
+          fallback = { ...fallback, status: modelQuota ? 'EXHAUSTED' : 'SHARED_LIMIT', reason: modelQuota ? 'The selected model allowance is exhausted. Wait for reset or upgrade.' : 'A shared resource allowance was reached. Wait for reset or upgrade.', ...quotaMetadata(error) };
+        }
+      }
+      const queued = fallback.status === 'QUEUED' || fallback.status === 'CAPACITY_WAIT';
+      const due = retryAt ?? now;
+      transaction.update(checkpoint.ref, { status: queued ? 'ENQUEUED' : 'READY', consentAt: FieldValue.serverTimestamp() });
+      transaction.update(ref, { status: queued ? 'QUEUED' : 'IDLE', fallback,
+        fallbackClaimableAt: queued && input.lane !== 'premium' ? Timestamp.fromDate(due) : FieldValue.delete(),
+        claimableAt: queued && input.lane === 'premium' ? Timestamp.fromDate(due) : FieldValue.delete(),
+        executionStarted: FieldValue.delete(), error: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() });
+      transaction.update(this.#projects.refFor(project.id), { activeSessionId: queued ? current.id : null, updatedAt: FieldValue.serverTimestamp() });
+      return { ...current, status: queued ? 'QUEUED' as const : 'IDLE' as const, fallback };
+    } });
+    return reconciledCommand(accepted, await this.readOwned(uid, sessionId));
+  }
+
+  async deferContinuation(authority: SessionLease, state: FallbackState, retryAt?: Date): Promise<void> {
+    const ref = this.#ref(authority.sessionId);
+    await this.#firestore.runTransaction(async (transaction) => {
+      const { session, project } = await this.#requireLeaseState(transaction, ref, authority);
+      if (session.sandboxId !== undefined || session.reservationIds.length > 0 || session.workspaceRecovery?.status === 'REQUIRED') throw new Error('Resources must be reconciled before deferring.');
+      if (session.specialistReservationIds.length > 0) await this.#metering.releaseIn(transaction, session.ownerUid, session.specialistReservationIds, new Date());
+      const status = retryAt === undefined ? 'IDLE' : 'QUEUED';
+      if (retryAt === undefined && state.checkpointId !== undefined) transaction.update(ref.collection('continuations').doc('active'), { status: 'READY' });
+      transaction.update(ref, { status, fallback: state, lastFinishedLeaseToken: authority.token, executionStarted: FieldValue.delete(),
+        claimableAt: retryAt !== undefined && state.lane === 'premium' ? Timestamp.fromDate(retryAt) : FieldValue.delete(), fallbackClaimableAt: retryAt === undefined || state.lane === 'premium' ? FieldValue.delete() : Timestamp.fromDate(retryAt),
+        claimedBy: FieldValue.delete(), leaseToken: FieldValue.delete(), specialistReservationIds: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() });
+      transaction.update(this.#projects.refFor(project.id), { activeSessionId: retryAt === undefined ? null : session.id, updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+
+  /** Notes are private session data, fenced like all worker mutations; never exposed in public SSE. */
+  async saveTaskContext(authority: SessionLease, context: TaskContext): Promise<void> {
+    const validated = parseTaskContext(context);
+    await this.#withLease(authority.sessionId, authority, (transaction, ref) => {
+      transaction.update(ref, { taskContext: validated, updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+
+  async markExecutionStarted(authority: SessionLease): Promise<void> {
+    await this.#withLease(authority.sessionId, authority, (tx, ref, session) => {
+      if (session.pendingInput !== undefined) throw new Error('Session is awaiting user input.');
+      tx.update(ref, { executionStarted: true, updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+
+  async requestInput(authority: SessionLease, kind: PendingInput['kind'], prompt: string): Promise<PendingInput> {
+    this.#validatePrompt(prompt);
+    const request = { id: randomUUID(), kind, prompt };
+    if (!['question', 'approval'].includes(kind)) throw new Error('Invalid input request kind.');
+    await this.#withLease(authority.sessionId, authority, (tx, ref, session) => {
+      if (session.pendingInput !== undefined) throw new Error('Session already awaits input.');
+      tx.create(ref.collection('input_requests').doc(request.id), { ...request, createdAt: FieldValue.serverTimestamp() });
+      tx.update(ref, { pendingInput: request, updatedAt: FieldValue.serverTimestamp() });
+    });
+    return request;
   }
 
   async assertPersistenceLease(authority: SessionLease, cleanup = false): Promise<void> {
@@ -1316,7 +1593,7 @@ export class SessionRepository {
   ): Promise<'IDLE' | 'FAILED' | 'QUEUED'> {
     const ref = this.#ref(sessionId);
     return this.#firestore.runTransaction(async (transaction) => {
-      const { session } = await this.#requireLeaseState(transaction, ref, authority, true);
+      const { session, project } = await this.#requireLeaseState(transaction, ref, authority, true);
       if (session.workspaceRecovery?.status === 'REQUIRED') throw new Error('Unsaved workspace prevents finalization.');
       if (session.cancelRequested === true && outcome.status === 'IDLE') {
         throw new AppError({
@@ -1330,8 +1607,8 @@ export class SessionRepository {
       // Enqueue and steering both write this session document, so a concurrent
       // acceptance forces a retry before the scheduler/guard can be cleared.
       const queued = outcome.status === 'IDLE'
-        ? await transaction.get(ref.collection(queuedMessagesCollectionName).limit(1)) : undefined;
-      const pending = outcome.status === 'IDLE' && (session.pendingSteer !== undefined || (queued !== undefined && queued.size > 0));
+        ? await transaction.get(this.#queuedMessages(ref, session).limit(1)) : undefined;
+      const pending = outcome.status === 'IDLE' && session.pendingInput === undefined && (session.pendingSteer !== undefined || (queued !== undefined && queued.size > 0));
       const status = pending ? 'QUEUED' : outcome.status;
 
       // Terminal means `claimableAt` is deleted, and a session without it is
@@ -1352,6 +1629,11 @@ export class SessionRepository {
 
       transaction.update(ref, {
         status,
+        lastFinishedLeaseToken: authority.token,
+        ...(outcome.status === 'FAILED' && outcome.fallback !== undefined ? { fallback: outcome.fallback } : {}),
+        ...(continuationQueued(session) && !(outcome.status === 'FAILED' && outcome.fallback !== undefined) ? { fallback: { ...session.fallback, status: outcome.status === 'IDLE' ? 'COMPLETED' : 'UNAVAILABLE', resumable: false, reason: outcome.status === 'IDLE' ? 'The continuation ended within its execution budget.' : outcome.error } } : {}),
+        executionStarted: FieldValue.delete(),
+        inputContext: session.pendingInput === undefined ? FieldValue.delete() : inputContext(project, session),
         error: outcome.status === 'FAILED' ? outcome.error : FieldValue.delete(),
         claimedBy: FieldValue.delete(),
         leaseToken: FieldValue.delete(),
@@ -1361,6 +1643,7 @@ export class SessionRepository {
         specialistReservationIds: FieldValue.delete(),
         updatedAt: FieldValue.serverTimestamp(),
       });
+      if (continuationQueued(session) && outcome.status === 'IDLE' && session.fallback?.checkpointId !== undefined) transaction.delete(ref.collection('continuations').doc('active'));
       transaction.update(this.#projects.refFor(session.projectId), {
         activeSessionId: pending ? session.id : null,
         updatedAt: FieldValue.serverTimestamp(),
@@ -1408,6 +1691,7 @@ export class SessionRepository {
       });
     }
     const session = parseSession(snapshot.id, snapshot.data() ?? {}, ref.path);
+    if (!allowCancelled && session.fallback?.imageExpiresAt !== undefined && Date.parse(session.fallback.imageExpiresAt) <= Date.now()) throw new AppError({ code: 'fallback/image-context-expired', statusCode: 409, message: 'Saved screenshot context expired. Fresh context is required before continuing.' });
     if (session.cancelRequested === true && !allowCancelled) {
       throw new AppError({
         code: 'session/cancelled',

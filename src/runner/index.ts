@@ -106,13 +106,28 @@ async function main(): Promise<void> {
     baseURL: config.ANTHROPIC_BASE_URL.toString(),
   });
   const models = new ProviderModels(anthropic, redis, config.CONFIG_CACHE_TTL_SECONDS, async () => {
-    const { plans } = await configuration.get();
-    return [...plans.values()].flatMap(plan => {
+    const { plans, registry } = await configuration.get();
+    const configured = [...plans.values()].flatMap(plan => {
       const allowed = plan.entitlements.get('ai.model.allowlist');
       return allowed?.kind === 'stringList' ? [...allowed.value] : [];
     });
+    return registry.fallback === undefined ? configured : [...configured, registry.fallback.model];
   });
   await models.refresh();
+  const events = new SessionEvents(redis, subscriber, {
+    firestore: firebase.firestore,
+    maxEventBytes: config.SESSION_EVENT_MAX_BYTES,
+    retentionSeconds: config.SESSION_EVENT_RETENTION_SECONDS,
+    maxPerSession: config.SESSION_EVENT_MAX_PER_SESSION,
+    onListenerError: (error, sessionId) => {
+      log.error({ diagnostic: safeErrorDiagnostic(error), sessionId }, 'session event delivery failed');
+    },
+  });
+
+  await sessions.assertContinuationRetentionReady();
+  await events.assertReady(); // Verify journal cleanup index/access before claiming paid work.
+
+
   const runner = new SessionRunner({
     runnerId,
     anthropic,
@@ -129,14 +144,7 @@ async function main(): Promise<void> {
       { name: config.GIT_AUTHOR_NAME, email: config.GIT_AUTHOR_EMAIL },
       config.AGENT_COMMAND_TIMEOUT_SECONDS * 1000,
     ),
-    events: new SessionEvents(redis, subscriber, {
-      maxEventBytes: config.SESSION_EVENT_MAX_BYTES,
-      retentionSeconds: config.SESSION_EVENT_RETENTION_SECONDS,
-      maxPerSession: config.SESSION_EVENT_MAX_PER_SESSION,
-      onListenerError: (error, sessionId) => {
-        log.error({ diagnostic: safeErrorDiagnostic(error), sessionId }, 'session event delivery failed');
-      },
-    }),
+    events,
     limits: {
       maxSteps: config.AGENT_MAX_STEPS,
       maxOutputTokens: config.ANTHROPIC_MAX_OUTPUT_TOKENS,
@@ -166,13 +174,26 @@ async function main(): Promise<void> {
     });
   }
 
+  let retentionSweep: Promise<void> | undefined;
+  const sweepRetention = (): Promise<void> => {
+    retentionSweep ??= sessions.collectExpiredContinuations().finally(() => { retentionSweep = undefined; });
+    return retentionSweep;
+  };
+  const retentionTimer = setInterval(() => {
+    void sweepRetention().catch((error: unknown) => log.error({ diagnostic: safeErrorDiagnostic(error) }, 'continuation retention cleanup failed'));
+  }, config.RUNNER_HEARTBEAT_SECONDS * 1000);
+  retentionTimer.unref();
   log.info({ runnerId }, 'runner started');
+  try {
   await withDrainDeadline(shutdown.signal, config.RUNNER_DRAIN_TIMEOUT_SECONDS * 1000, async () => {
     await runUntilStopped(runner, {
       maintenance: async () => {
         try { await models.refresh(); }
         catch (error) { log.warn({ diagnostic: safeErrorDiagnostic(error) }, 'model catalog refresh failed'); }
         await new SnapshotMaintenance(firebase.firestore, metering, snapshots).sweep();
+        await sweepRetention();
+        await events.collectExpired();
+
       },
       idlePollSeconds: config.RUNNER_IDLE_POLL_SECONDS,
       shouldContinue: () => !shutdown.signal.aborted,
@@ -182,6 +203,7 @@ async function main(): Promise<void> {
 
     await Promise.all([redis.quit(), subscriber.quit()]);
   }, log);
+  } finally { clearInterval(retentionTimer); await retentionSweep; }
   log.info({ runnerId }, 'runner drain completed');
 }
 

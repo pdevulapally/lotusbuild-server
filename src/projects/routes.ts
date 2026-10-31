@@ -1,3 +1,4 @@
+import { commandKey } from '../sessions/commands.ts';
 import type { FastifyInstance } from 'fastify';
 
 import { authenticatedUser } from '../auth/plugin.ts';
@@ -97,8 +98,9 @@ export function registerProjectRoutes(app: FastifyInstance, projects: ProjectRep
         platform: newProjectPlatform,
       };
       const project = await projects.create(user.uid, input,
-        mutation<Project>(user.uid, 'POST /projects', request.headers['idempotency-key'], input,
+        mutation<Project>(user.uid, 'POST /projects', commandKey(request.headers['idempotency-key'], true), input,
           (value) => ({ statusCode: 201, body: toResponse(value) })));
+
       return reply.code(201).send(toResponse(project));
     },
   );

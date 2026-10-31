@@ -1,3 +1,4 @@
+import { timed } from '../diagnostics/timing.ts';
 import type { Auth } from 'firebase-admin/auth';
 import type { FastifyInstance, FastifyReply, FastifyRequest, preHandlerHookHandler } from 'fastify';
 
@@ -85,7 +86,7 @@ export function registerAuth(app: FastifyInstance, firebaseAuth: Auth): void {
     let decoded;
     try {
       // Lockdown must invalidate a stolen token before its normal expiry.
-      decoded = await firebaseAuth.verifyIdToken(token, true);
+      decoded = await timed('auth.verify', () => firebaseAuth.verifyIdToken(token, true));
     } catch (cause) {
       const firebaseCode =
         typeof cause === 'object' && cause !== null && 'code' in cause

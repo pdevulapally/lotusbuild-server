@@ -33,7 +33,7 @@ export function mutation<T>(uid: string, scope: string, key: string | string[] |
 }
 
 /** Must run after current ownership/erasure checks and before transaction writes. */
-export async function readMutation<T>(tx: Transaction, db: Firestore, operation: Mutation<T> | undefined): Promise<void> {
+export async function readMutationRecord<T>(tx: Transaction, db: Firestore, operation: Mutation<T> | undefined): Promise<{ response: MutationResponse; acceptance?: unknown } | undefined> {
   if (operation === undefined) return;
   const snap = await tx.get(db.doc(`mutationReceipts/${operation.id}`));
   if (!snap.exists) return;
@@ -47,16 +47,29 @@ export async function readMutation<T>(tx: Transaction, db: Firestore, operation:
   if (!Number.isInteger(statusCode) || statusCode < 200 || statusCode > 299 || !Object.hasOwn(fields, 'body')) {
     throw new Error('Invalid mutation receipt.');
   }
-  throw new MutationReplay({ statusCode, body: fields['body'] });
+  const acceptance = fields['acceptance'];
+  if (acceptance !== undefined && typeof acceptance !== 'string') throw new Error('Invalid acceptance receipt.');
+  return { response: { statusCode, body: fields['body'] }, ...(typeof acceptance === 'string' ? { acceptance: JSON.parse(acceptance) as unknown } : {}) };
+}
+
+export async function readMutation<T>(tx: Transaction, db: Firestore, operation: Mutation<T> | undefined): Promise<void> {
+  const receipt = await readMutationRecord(tx, db, operation);
+  if (receipt !== undefined) throw new MutationReplay(receipt.response);
 }
 
 /** Commit the response in the SAME transaction as the mutation, never afterwards. */
-export function writeMutation<T>(tx: Transaction, db: Firestore, operation: Mutation<T> | undefined, value: T): void {
+export function writeMutation<T>(tx: Transaction, db: Firestore, operation: Mutation<T> | undefined, value: T, acceptance?: unknown): void {
   if (operation === undefined) return;
   const result = operation.response(value);
   tx.create(db.doc(`mutationReceipts/${operation.id}`), {
     uid: operation.uid, scope: operation.scope, fingerprint: operation.fingerprint,
     statusCode: result.statusCode, body: JSON.parse(JSON.stringify(result.body)),
+    ...(acceptance === undefined ? {} : { acceptance: JSON.stringify(acceptance) }),
     createdAt: FieldValue.serverTimestamp(),
   });
+}
+
+/** Keep one receipt identity when a repository uses a richer internal acceptance type. */
+export function mapMutation<A, B>(operation: Mutation<A> | undefined, project: (value: B) => A): Mutation<B> | undefined {
+  return operation === undefined ? undefined : { ...operation, response: value => operation.response(project(value)) };
 }

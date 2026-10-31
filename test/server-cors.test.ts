@@ -15,7 +15,7 @@ test('server permits authenticated SSE resume preflight only for configured orig
   };
   // Only OPTIONS is exercised. Provider methods are deliberately absent, so an
   // unexpected authenticated/provider operation cannot silently succeed.
-  const app = buildServer(config, { redis: { rateLimit, rateLimitRead: rateLimit }, firebaseAuth: {} } as unknown as Dependencies);
+  const app = buildServer(config, { redis: { rateLimit, rateLimitRead: rateLimit }, firebaseAuth: {}, entitlements: {}, projects: {}, sessions: {}, sessionEvents: {} } as unknown as Dependencies);
   try {
     for (const origin of ['https://app.example.test', 'https://untrusted.example.test']) {
       const response = await app.inject({ method: 'OPTIONS', url: '/sessions/owned/events', headers: {
@@ -43,7 +43,7 @@ test('server shutdown closes long-lived HTTP streams', async () => {
   } as unknown as Config;
   const app = buildServer(config, {
     redis: {},
-    firebaseAuth: {},
+    firebaseAuth: {}, entitlements: {}, projects: {}, sessions: {}, sessionEvents: {},
   } as unknown as Dependencies);
   assert.equal(app.initialConfig.forceCloseConnections, true);
   await app.close();

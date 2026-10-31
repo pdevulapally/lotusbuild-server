@@ -1,3 +1,4 @@
+import { installHttpTimings, observeMethods } from './diagnostics/timing.ts';
 import cors from '@fastify/cors';
 import { RedisBudgetCounter, UploadBudgetGuard } from './attachments/budget.ts';
 import { registerAttachmentRoutes } from './attachments/routes.ts';
@@ -84,8 +85,11 @@ export const requestLogSerializer = (request: FastifyRequest) => ({
 export const exposedResponseHeaders = ['Content-Disposition', 'Retry-After', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'];
 
 export function buildServer(config: Config, dependencies: Dependencies): FastifyInstance {
-  const { firebaseAuth, redis, entitlements, metering, users, projects, sessions, sessionEvents } =
-    dependencies;
+  const { firebaseAuth, redis, metering, users } = dependencies;
+  const entitlements = observeMethods(dependencies.entitlements, { forUser: 'entitlements.resolve' });
+  const projects = observeMethods(dependencies.projects, { readOwned: 'project.read', listOwnedBy: 'project.list' });
+  const sessions = observeMethods(dependencies.sessions, { readOwned: 'session.read', create: 'session.admit', submitMessage: 'session.admit' });
+  const sessionEvents = observeMethods(dependencies.sessionEvents, { append: 'events.append', history: 'events.replay' });
   const app = Fastify({
     logger: { level: config.LOG_LEVEL, serializers: {
       // Fastify's serializer type requires these strings; none comes from the error.
@@ -107,6 +111,7 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     forceCloseConnections: true,
   });
 
+  installHttpTimings(app, (timing) => app.log.debug({ timing }, 'phase timing'));
   registerErrorHandler(app);
   registerAuth(app, firebaseAuth);
 

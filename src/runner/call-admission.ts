@@ -1,3 +1,5 @@
+import { timed } from '../diagnostics/timing.ts';
+import { AppError } from '../http/errors.ts';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { MessageCountTokensParams } from '@anthropic-ai/sdk/resources/messages';
 import type { MeteringService } from '../metering/service.ts';
@@ -21,6 +23,7 @@ export function createCallAdmission(deps: {
   readonly models: ModelResolver;
   readonly uid: string;
   readonly sessionId: string;
+  readonly maxInputTokens?: number;
   readonly inputMeterKey: string;
   readonly outputMeterKey: string;
   readonly metering: MeteringService;
@@ -39,11 +42,13 @@ export function createCallAdmission(deps: {
       const { output_config: _ignored, ...base } = input.params;
       const params = { ...base, ...(outputConfig === undefined ? {} : { output_config: outputConfig }) };
       const maxOutputTokens = Math.min(input.maxOutputTokens, model.maxOutputTokens);
-      const count = await deps.anthropic.messages.countTokens(params, { signal: input.signal });
+      const count = await timed('model.count_tokens', () => deps.anthropic.messages.countTokens(params, { signal: input.signal }));
+
       input.signal.throwIfAborted();
       if (!Number.isSafeInteger(count.input_tokens) || count.input_tokens <= 0) {
         throw new Error('Anthropic returned no usable input-token estimate.');
       }
+      if (deps.maxInputTokens !== undefined && count.input_tokens > deps.maxInputTokens) throw new AppError({ code: 'fallback/context-exceeded', statusCode: 409, message: 'The task now exceeds the verified fallback context window.' });
       const holds: { id: string; kind: 'input' | 'output' }[] = [];
       const settle = async (usage: AuthoritativeUsage): Promise<void> => {
         const failures: unknown[] = [];

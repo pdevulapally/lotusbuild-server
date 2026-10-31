@@ -1,3 +1,4 @@
+import { timed } from '../diagnostics/timing.ts';
 import type { Firestore } from 'firebase-admin/firestore';
 
 import {
@@ -150,7 +151,7 @@ export class EntitlementService {
 
     const fillToken = fresh ? undefined : await this.#cache.beginFill(uid);
     const path = `${subscriptionsCollectionPath}/${uid}`;
-    const snapshot = await this.#firestore.doc(path).get();
+    const snapshot = await timed('subscription.firestore', () => this.#firestore.doc(path).get());
     const subscription = snapshot.exists ? parseSubscription(snapshot.data() ?? {}, path) : null;
 
     if (fillToken !== undefined) await this.#cache.write(uid, subscription, fillToken);

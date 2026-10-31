@@ -17,7 +17,7 @@ function harness(count: number, extra: Partial<Dependencies> = {}) {
     (args.at(-1) as (error: null, result: [number, number]) => void)(null, [count, 60000]);
   };
   const app = buildServer(config, { redis: { rateLimit, rateLimitRead: rateLimit }, firebaseAuth: {},
-    configuration: { get: async () => ({}) }, ...extra } as unknown as Dependencies);
+    entitlements: {}, projects: {}, sessions: {}, sessionEvents: {}, configuration: { get: async () => ({}) }, ...extra } as unknown as Dependencies);
   return { app, keys };
 }
 

@@ -43,7 +43,7 @@ function harness(verified: boolean | undefined) {
   return { app, touched };
 }
 
-const headers = { authorization: 'Bearer token' };
+const headers = { authorization: 'Bearer token', 'idempotency-key': 'stable-test-command-1' };
 const gated = [
   { method: 'POST', url: '/projects', payload: { name: 'App', platform: 'web' } },
   { method: 'POST', url: '/projects/p1/sessions', payload: { prompt: 'Build it', model: 'm' } },

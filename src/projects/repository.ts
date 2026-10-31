@@ -1,4 +1,6 @@
+import { commandTransaction, reconciledCommand } from '../sessions/commands.ts';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+
 
 import { FieldValue, type Firestore, type Transaction } from 'firebase-admin/firestore';
 
@@ -6,7 +8,7 @@ import type { ConfigurationStore } from '../entitlements/store.ts';
 import type { EntitlementService } from '../entitlements/service.ts';
 import { type Platform, platforms } from '../entitlements/schema.ts';
 import { AppError } from '../http/errors.ts';
-import { readMutation, writeMutation, type Mutation } from '../http/idempotency.ts';
+import { type Mutation } from '../http/idempotency.ts';
 import type { MeteringService } from '../metering/service.ts';
 import type { SnapshotStore, StoredSnapshot } from '../storage/snapshots.ts';
 import { SnapshotMaintenance } from '../storage/maintenance.ts';
@@ -186,7 +188,8 @@ export class ProjectRepository {
    * arriving together both see the old total and both succeed, so the plan limit
    * a customer pays for is bypassed by the simplest possible retry.
    */
-  async create(ownerUid: string, input: NewProject, operation?: Mutation<Project>): Promise<Project> {
+  async create(ownerUid: string, input: NewProject, commandId?: string | Mutation<Project>): Promise<Project> {
+
     this.#validateName(input.name);
     const entitlements = await this.#entitlements.forUser(ownerUid);
 
@@ -206,9 +209,14 @@ export class ProjectRepository {
     const ref = this.#firestore.collection(projectsCollectionPath).doc();
     const userRef = this.#users.refFor(ownerUid);
 
-    const createdAt = await this.#firestore.runTransaction(async (transaction) => {
+    const accepted = await commandTransaction({ db: this.#firestore, parent: userRef, uid: ownerUid, key: commandId,
+      input: ['create-project', input.name, input.description ?? null, input.platform],
+      encode: (project) => ({ id: project.id }),
+      decode: (value, transaction) => {
+        if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid project receipt.');
+        return this.readOwnedInTransaction(transaction, ownerUid, stringField(value as Fields, 'id', 'command'));
+      }, work: async (transaction): Promise<Project> => {
       const user = await this.#users.readInTransaction(transaction, ownerUid);
-      await readMutation(transaction, this.#firestore, operation);
 
       if (user.projectCount >= limit) {
         throw new AppError({
@@ -235,14 +243,6 @@ export class ProjectRepository {
         updatedAt: FieldValue.serverTimestamp(),
       });
 
-      const now = new Date();
-      writeMutation(transaction, this.#firestore, operation, {
-        id: ref.id, ownerUid, name: input.name, description: input.description,
-        platform: input.platform, status: 'draft', visibility: 'private', snapshotBytes: 0,
-        snapshot: { kind: 'none' }, activeSessionId: null, createdAt: now,
-      });
-      return now;
-    });
 
     return {
       id: ref.id,
@@ -255,8 +255,10 @@ export class ProjectRepository {
       snapshotBytes: 0,
       snapshot: { kind: 'none' },
       activeSessionId: null,
-      createdAt,
+      createdAt: new Date(),
     };
+    } });
+    return reconciledCommand(accepted, await this.readOwned(ownerUid, accepted.id));
   }
 
   /**
@@ -353,6 +355,10 @@ export class ProjectRepository {
         await this.#eraseSessionEvents(session.id);
         await this.#firestore.recursiveDelete(session.ref.collection(messagesCollectionName));
         await this.#firestore.recursiveDelete(session.ref.collection('queued_messages'));
+        await this.#firestore.recursiveDelete(session.ref.collection('commands'));
+        await this.#firestore.recursiveDelete(session.ref.collection('session_events'));
+        await this.#firestore.recursiveDelete(session.ref.collection('input_requests'));
+        await this.#firestore.recursiveDelete(session.ref.collection('continuations'));
         await session.ref.delete();
       }
     }
@@ -367,6 +373,7 @@ export class ProjectRepository {
     if (deletingProject.snapshotUploadId === undefined) await this.#snapshots.removeStored(projectId, deletingProject.snapshot);
     await this.#snapshots.eraseProjectContent(projectId);
 
+    await this.#firestore.recursiveDelete(ref.collection('commands'));
     await this.#firestore.runTransaction(async (transaction) => {
       const snapshot = await transaction.get(ref);
       if (!snapshot.exists) return; // A concurrent deletion already finalized.

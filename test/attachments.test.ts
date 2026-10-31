@@ -18,7 +18,7 @@ import type { SessionRepository } from '../src/sessions/repository.ts';
 
 const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const png: AttachmentRef = { id: id(1), mediaType: 'image/png' };
-const headers = { Authorization: 'Bearer test-token' };
+const headers = { Authorization: 'Bearer test-token', 'Idempotency-Key': 'attachment-test-command' };
 
 test('attachment references are bounded, typed and unique', () => {
   assert.deepEqual(validateAttachmentRefs(undefined), []);
@@ -78,6 +78,7 @@ async function fixture(uid = 'alice') {
   const entitlements = { forUser: async () => ({ planKey: 'free', rateLimits: new Map([['build', { routeClass: 'build', maxRequests: 1, windowSeconds: 60 }]]) }) } as unknown as EntitlementService;
   registerAttachmentRoutes(app, { store, entitlements, budget: new UploadBudgetGuard(counter) });
   const sessions = {
+    submitMessage: async (...args: unknown[]) => { calls.push({ method: 'submitMessage', args }); return { kind: 'prompt', session: { id: 'owned', status: 'QUEUED', messageCount: 2, createdAt: new Date(0), updatedAt: new Date(0), model: 'm', mode: 'build', projectId: 'p', ownerUid: String(args[0]) } }; },
     readOwned: async (owner: string, sessionId: string) => ({ id: sessionId, ownerUid: owner, status: 'IDLE' }),
     appendPrompt: async (...args: unknown[]) => { calls.push({ method: 'appendPrompt', args }); return { id: 'owned', status: 'QUEUED', messageCount: 2, createdAt: new Date(0), updatedAt: new Date(0), model: 'm', mode: 'build', projectId: 'p', ownerUid: owner(args) }; },
     enqueueMessage: async (...args: unknown[]) => { calls.push({ method: 'enqueueMessage', args }); return { id: 'q1', sessionId: 'owned', prompt: args[2], attachments: args[4] ?? [], createdAt: new Date(0) }; },
@@ -106,8 +107,9 @@ test('uploads accept raw images only, within the size limit', async () => {
     assert.equal(svg.status, 415);
     const json = await fetch(`${h.address}/attachments`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: '{}' });
     assert.equal(json.status, 415);
-    const huge = await fetch(`${h.address}/attachments`, { method: 'POST', headers: { ...headers, 'Content-Type': 'image/jpeg' }, body: Buffer.alloc(maxAttachmentBytes + 1) });
-    assert.equal(huge.status, 413);
+    // Exercise the same parser limit without a platform-dependent TCP reset while uploading an oversized body.
+    const huge = await h.app.inject({ method: 'POST', url: '/attachments', headers: { ...headers, 'Content-Type': 'image/jpeg' }, payload: Buffer.alloc(maxAttachmentBytes + 1) });
+    assert.equal(huge.statusCode, 413);
     assert.equal(h.saved.length, 1);
     // The plan allows 1 build per window, so 4 images; the budget refuses the fifth and keeps the count honest.
     for (let n = 0; n < 3; n++) assert.equal((await fetch(`${h.address}/attachments`, { method: 'POST', headers: { ...headers, 'Content-Type': 'image/png' }, body: tinyPng() })).status, 201);
@@ -140,8 +142,8 @@ test('messages carry verified attachment references through to the repository', 
     const sent = await fetch(`${h.address}/sessions/owned/messages`, { method: 'POST',
       headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt: 'Match this design', attachments: [png] }) });
     assert.equal(sent.status, 202, await sent.text());
-    assert.equal(h.calls[0]?.method, 'appendPrompt');
-    assert.deepEqual(h.calls[0]?.args[5], [png]);
+    assert.equal(h.calls[0]?.method, 'submitMessage');
+    assert.deepEqual(h.calls[0]?.args[8], [png]);
     const missing = await fetch(`${h.address}/sessions/owned/messages`, { method: 'POST',
       headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt: 'x', attachments: [{ ...png, id: id(7) }] }) });
     assert.equal(missing.status, 404);

@@ -1,3 +1,4 @@
+import { timed } from '../diagnostics/timing.ts';
 import type { Firestore } from 'firebase-admin/firestore';
 
 import { type Cached, cached } from '../support/cache.ts';
@@ -35,10 +36,10 @@ export class ConfigurationStore {
 
   constructor(firestore: Firestore, ttlMs: number) {
     this.#entry = cached(ttlMs, async (): Promise<Configuration> => {
-      const [registrySnapshot, planSnapshots] = await Promise.all([
+      const [registrySnapshot, planSnapshots] = await timed('configuration.firestore', () => Promise.all([
         firestore.doc(registryDocumentPath).get(),
         firestore.collection(plansCollectionPath).get(),
-      ]);
+      ]));
 
       if (!registrySnapshot.exists) {
         throw new DocumentShapeError(
@@ -79,6 +80,16 @@ export class ConfigurationStore {
         );
       }
 
+      if (registry.fallback !== undefined) {
+        for (const key of registry.fallback.eligiblePlanKeys) {
+          const plan = plans.get(key);
+          if (plan === undefined) throw new DocumentShapeError('Fallback policy names an absent plan.');
+          for (const meterKey of [registry.fallback.inputTokenMeterKey, registry.fallback.outputTokenMeterKey]) {
+            const limit = plan.meterLimits.get(meterKey);
+            if (limit === undefined || limit.hardLimit <= 0 || limit.overageEnabled) throw new DocumentShapeError('Fallback requires explicit bounded allowances without automatic overage for every eligible plan.');
+          }
+        }
+      }
       assertSandboxAllowancesAreUsable(registry, [...plans.values()], registry.sandboxTimeMeterKey);
 
       return { registry, plans };
@@ -86,7 +97,7 @@ export class ConfigurationStore {
   }
 
   get(): Promise<Configuration> {
-    return this.#entry.get();
+    return timed('configuration.get', () => this.#entry.get());
   }
 
   /** Forces the next read to reload, after configuration is edited by hand. */

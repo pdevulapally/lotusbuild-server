@@ -1,3 +1,5 @@
+import { startTiming } from '../diagnostics/timing.ts';
+import { commandKey, commandWasReplayed } from './commands.ts';
 import type { OutgoingHttpHeaders } from 'node:http';
 
 import type { FastifyBaseLogger, FastifyInstance, FastifyReply } from 'fastify';
@@ -18,6 +20,7 @@ import {
   type QueuedMessage,
   type SessionMessage,
   type SessionRepository,
+  type MessageAcceptance,
   promptMaxLength,
   sessionModes,
 } from './repository.ts';
@@ -81,6 +84,15 @@ function toResponse(session: BuildSession) {
     mode: session.mode,
     sandboxId: session.sandboxId,
     error: session.error,
+    cancelRequested: session.cancelRequested === true,
+    workspaceRecovery: session.workspaceRecovery,
+    pendingInput: session.pendingInput,
+    fallback: session.fallback === undefined ? undefined : {
+      status: session.fallback.status, resumable: session.fallback.resumable === true, reason: session.fallback.reason, checkpointId: session.fallback.checkpointId,
+      imageExpiresAt: session.fallback.imageExpiresAt, lane: session.fallback.lane, consent: session.fallback.consent === true, resetAt: session.fallback.resetAt,
+      retryAt: session.fallback.retryAt, limitLabel: session.fallback.limitLabel,
+      offer: session.fallback.offer === undefined ? undefined : { model: session.fallback.offer.model, effort: session.fallback.offer.effort },
+    },
     messageCount: session.messageCount,
     heartbeatAt: session.heartbeatAt?.toISOString(),
     createdAt: session.createdAt.toISOString(),
@@ -214,8 +226,9 @@ export function registerSessionRoutes(
       await options.attachments?.assertOwned(user.uid, input.attachments ?? []);
       const session = await sessions.create(user.uid, request.params.projectId, input, undefined,
         mutation<BuildSession>(user.uid, `POST /projects/${request.params.projectId}/sessions`,
-          request.headers['idempotency-key'], { ...input, effort: request.body.effort }, (value) => ({ statusCode: 201, body: toResponse(value) })));
-      publish(request.log, session.id, 'session.queued', {
+          commandKey(request.headers['idempotency-key'], true), { ...input, effort: request.body.effort }, (value) => ({ statusCode: 201, body: toResponse(value) })));
+      if (!commandWasReplayed(session)) publish(request.log, session.id, 'session.queued', {
+
         status: session.status,
         model: session.model,
         effort: session.effort,
@@ -302,7 +315,8 @@ export function registerSessionRoutes(
     },
   );
 
-  app.post<{ Params: { sessionId: string }; Body: { prompt: string; steer?: boolean; mode?: (typeof sessionModes)[number]; attachments?: AttachmentRef[] } }>(
+  app.post<{ Params: { sessionId: string }; Body: { prompt: string; steer?: boolean; mode?: (typeof sessionModes)[number]; inputResponse?: { id: string; answer: string }; attachments?: AttachmentRef[] } }>(
+
     '/sessions/:sessionId/messages',
     {
       preHandler: [app.requireAuth, app.requireVerifiedEmail, app.enforceRateLimit('build')],
@@ -328,7 +342,12 @@ export function registerSessionRoutes(
               type: 'boolean',
             },
             mode: { type: 'string', enum: [...sessionModes] },
+            inputResponse: { type: 'object', required: ['id', 'answer'], additionalProperties: false, properties: {
+              id: { type: 'string', pattern: documentId },
+              answer: { type: 'string', minLength: 1, maxLength: promptMaxLength, pattern: promptText },
+            } },
             attachments: attachmentsSchema,
+
           },
         },
       },
@@ -337,64 +356,26 @@ export function registerSessionRoutes(
       const user = authenticatedUser(request);
       const prompt = request.body.prompt.trim();
       const attachments = request.body.attachments ?? [];
-      const current = await sessions.readOwned(user.uid, request.params.sessionId);
       await options.attachments?.assertOwned(user.uid, attachments);
-      const mode = request.body.mode;
-      const operation = <T>(response: (value: T) => { statusCode: number; body: unknown }) =>
-        mutation<T>(user.uid, `POST /sessions/${current.id}/messages`, request.headers['idempotency-key'],
-          { prompt, steer: request.body.steer === true, mode, attachments }, response);
-      const queuedOperation = () => operation<QueuedMessage>((value) => ({ statusCode: 202,
-        body: { queued: true, queuedMessage: toQueuedMessageResponse(value) } }));
-      // A mode switch applies to the next turn, so it is refused rather than queued behind a running one.
-      // Busy-state validation lives after receipt replay inside appendPrompt's transaction.
-      if (mode !== undefined && request.body.steer === true) {
-        throw new AppError({ code: 'session/mode-change-busy', statusCode: 409, message: 'Wait for the agent to finish before switching mode.' });
+      const key = commandKey(request.headers['idempotency-key'], true);
+      const operation = mutation<MessageAcceptance>(user.uid, `POST /sessions/${request.params.sessionId}/messages`, key,
+        { prompt, steer: request.body.steer === true, mode: request.body.mode, attachments, ...(request.body.inputResponse === undefined ? {} : { inputResponse: request.body.inputResponse }) },
+        value => value.kind === 'steered' ? { statusCode: 200, body: { steered: true, sessionId: value.sessionId } }
+          : value.kind === 'queued' ? { statusCode: 202, body: { queued: true, queuedMessage: toQueuedMessageResponse(value.message) } }
+          : { statusCode: 202, body: { queued: false, session: toResponse(value.session) } });
+      const result = await sessions.submitMessage(user.uid, request.params.sessionId,
+        prompt, request.body.steer === true, operation, undefined, request.body.inputResponse, request.body.mode, attachments);
+      if (result.kind === 'steered') {
+        if (!commandWasReplayed(result)) publish(request.log, result.sessionId, 'session.steer', {});
+        return reply.code(200).send({ steered: true, sessionId: result.sessionId });
       }
-
-      if (request.body.steer === true) {
-        if (current.status === 'RUNNING') {
-          await sessions.queueSteerMessage(user.uid, current.id, prompt, operation<void>(() => ({ statusCode: 200,
-            body: { steered: true, sessionId: current.id } })), attachments);
-          publish(request.log, current.id, 'session.steer', { prompt, attachments });
-          return reply.code(200).send({ steered: true, sessionId: current.id });
-        }
-        if (current.status === 'QUEUED') {
-          const queued = await sessions.enqueueMessage(user.uid, current.id, prompt, queuedOperation(), attachments);
-          publish(request.log, current.id, 'session.message_queued', {
-            queuedMessageId: queued.id,
-            prompt: queued.prompt,
-            attachments: queued.attachments,
-          });
-          return reply.code(202).send({
-            queued: true,
-            queuedMessage: toQueuedMessageResponse(queued),
-          });
-        }
+      if (result.kind === 'queued') {
+        if (!commandWasReplayed(result)) publish(request.log, result.message.sessionId, 'session.message_queued', { queuedMessageId: result.message.id });
+        return reply.code(202).send({ queued: true, queuedMessage: toQueuedMessageResponse(result.message) });
       }
+      if (result.session.status === 'QUEUED' && !commandWasReplayed(result)) publish(request.log, result.session.id, 'session.queued', { status: result.session.status, messageCount: result.session.messageCount });
+      return reply.code(202).send({ queued: false, session: toResponse(result.session) });
 
-      if (mode === undefined && (current.status === 'QUEUED' || current.status === 'RUNNING')) {
-        const queued = await sessions.enqueueMessage(user.uid, current.id, prompt, queuedOperation(), attachments);
-        publish(request.log, current.id, 'session.message_queued', {
-          queuedMessageId: queued.id,
-          prompt: queued.prompt,
-          attachments: queued.attachments,
-        });
-        return reply.code(202).send({
-          queued: true,
-          queuedMessage: toQueuedMessageResponse(queued),
-        });
-      }
-
-      const session = await sessions.appendPrompt(user.uid, current.id, prompt, mode,
-        operation<BuildSession>((value) => ({ statusCode: 202, body: { queued: false, session: toResponse(value) } })), attachments);
-      publish(request.log, session.id, 'session.queued', {
-        status: session.status,
-        messageCount: session.messageCount,
-      });
-      return reply.code(202).send({
-        queued: false,
-        session: toResponse(session),
-      });
     },
   );
 
@@ -473,7 +454,8 @@ export function registerSessionRoutes(
       const user = authenticatedUser(request);
       const session = await sessions.cancel(user.uid, request.params.sessionId,
         mutation<BuildSession>(user.uid, `POST /sessions/${request.params.sessionId}/cancel`,
-          request.headers['idempotency-key'], {}, (value) => ({ statusCode: 200, body: toResponse(value) })));
+          commandKey(request.headers['idempotency-key'], true), {}, (value) => ({ statusCode: 200, body: toResponse(value) })));
+
       if (session.status === 'FAILED') {
         publish(request.log, session.id, 'session.failed', {
           error: session.error ?? 'Cancelled by user',
@@ -484,6 +466,25 @@ export function registerSessionRoutes(
         });
       }
       return reply.code(200).send(toResponse(session));
+    },
+  );
+
+  app.post<{ Params: { sessionId: string }; Body: { checkpointId: string; lane: 'premium' | 'fallback'; model: string; effort: AiEffort } }>(
+    '/sessions/:sessionId/continuation', {
+      preHandler: [app.requireAuth, app.requireVerifiedEmail, app.enforceRateLimit('build')],
+      schema: {
+        params: { type: 'object', required: ['sessionId'], additionalProperties: false, properties: { sessionId: { type: 'string', pattern: documentId } } },
+        body: { type: 'object', required: ['checkpointId', 'lane', 'model', 'effort'], additionalProperties: false, properties: {
+          checkpointId: { type: 'string', pattern: documentId }, lane: { type: 'string', enum: ['premium', 'fallback'] },
+          model: { type: 'string', pattern: modelIdentifier }, effort: { type: 'string', enum: [...aiEfforts] },
+        } },
+      },
+    }, async (request, reply) => {
+      const user = authenticatedUser(request);
+      const key = commandKey(request.headers['idempotency-key'], true);
+      if (key === undefined) throw new Error('Command identity is required.');
+      const session = await sessions.acceptFallback(user.uid, request.params.sessionId, key, request.body);
+      return reply.code(202).send(toResponse(session));
     },
   );
 
@@ -531,8 +532,10 @@ export function registerSessionRoutes(
       }
 
       // A client resuming after a dropped connection tells us where it stopped.
-      // Anything that is not a stream id is ignored rather than passed to Redis.
+      // Reject malformed cursors before starting a response or contacting storage.
       const resumeFrom = parseStreamId(request.headers['last-event-id']);
+      if (request.headers['last-event-id'] !== undefined && resumeFrom === undefined) throw new AppError({
+        code: 'stream/invalid-cursor', statusCode: 400, message: 'Last-Event-ID is not a valid event cursor.' });
 
       openStreams += 1;
       streamsByUser.set(user.uid, (streamsByUser.get(user.uid) ?? 0) + 1);
@@ -574,16 +577,44 @@ export function registerSessionRoutes(
         if (Date.now() >= authorizedUntil) { finish(lapsedReason()); return; }
         // Close slow readers at backpressure instead of accumulating bytes.
         // The client can resume from its last received event ID.
-        if (Buffer.byteLength(chunk) > options.maxBufferedBytes || !socket.write(chunk)) finish('slow-consumer');
+        const endWrite = startTiming('sse.socket_write');
+        try { if (Buffer.byteLength(chunk) > options.maxBufferedBytes || !socket.write(chunk)) finish('slow-consumer'); } finally { endWrite(); }
       };
 
       // Events published while history is being read are held rather than sent,
       // so the client never sees the future before the past.
+      let lastDelivered = resumeFrom;
+      const deliver = (event: SessionEvent): void => {
+        if (lastDelivered !== undefined && compareStreamIds(event.id, lastDelivered) <= 0) return;
+        write(frame(event));
+        if (!finished) lastDelivered = event.id;
+      };
       let replaying = true;
       const pending: SessionEvent[] = [];
       let pendingBytes = 0;
       let release: (() => void) | undefined;
 
+      let pumping: Promise<void> | undefined;
+      let pumpAgain = false;
+      // Pub/sub is only a wake-up. Always read in durable order, including missed notifications.
+      const catchUp = (): Promise<void> => {
+        pumpAgain = true;
+        if (pumping !== undefined) return pumping;
+        pumping = (async () => {
+          do {
+            pumpAgain = false;
+            if (lastDelivered !== undefined && !await events.resumeAvailable(session.id, lastDelivered)) {
+              write('event: stream.reset\ndata: {"reason":"history-unavailable"}\n\n');
+              lastDelivered = undefined;
+            }
+            for await (const event of events.replay(session.id, lastDelivered)) {
+              if (finished) break;
+              deliver(event);
+            }
+          } while (pumpAgain && !finished);
+        })().finally(() => { pumping = undefined; });
+        return pumping;
+      };
       let authenticating = false;
       const heartbeat = setInterval(() => {
         if (finished) return;
@@ -593,9 +624,10 @@ export function registerSessionRoutes(
         void (async () => {
           try {
             await options.reauthenticate(bearerToken(request.headers.authorization));
-            await sessions.readOwned(user.uid, session.id);
+            const current = await sessions.readOwned(user.uid, session.id);
             authorizedUntil = Math.min(Date.now() + authorizationWindow, tokenExpiry);
-            write(': keep-alive\n\n');
+            if (events.durable) await catchUp();
+            write(`event: session.state\ndata: ${JSON.stringify(toResponse(current))}\n\n`);
           } catch {
             finish('authorization-failed');
           } finally { authenticating = false; }
@@ -638,13 +670,17 @@ export function registerSessionRoutes(
       try {
         release = await events.subscribe(session.id, (event) => {
           if (finished) return;
+          if (events.durable) {
+            if (!replaying) void catchUp().catch(() => finish('stream-error'));
+            return;
+          }
           if (replaying) {
             pendingBytes += Buffer.byteLength(frame(event));
             if (pendingBytes > options.maxBufferedBytes) { finish('slow-consumer'); return; }
             pending.push(event);
             return;
           }
-          write(frame(event));
+          deliver(event);
         });
         if (finished) {
           // The client hung up while the subscription was being established, so
@@ -653,21 +689,22 @@ export function registerSessionRoutes(
           return;
         }
 
-        let lastReplayed: string | undefined;
-        for await (const event of events.replay(session.id, resumeFrom)) {
+
+        if (events.durable) await catchUp();
+        else for await (const event of events.replay(session.id, resumeFrom)) {
           if (finished) break;
-          write(frame(event));
-          lastReplayed = event.id;
+          deliver(event);
+
         }
         replaying = false;
+        if (events.durable) await catchUp();
         for (const event of pending) {
           // Whatever arrived during the replay and was already in it.
-          if (lastReplayed !== undefined && compareStreamIds(event.id, lastReplayed) <= 0) {
-            continue;
-          }
-          write(frame(event));
+          deliver(event);
         }
         pending.length = 0;
+        const current = await sessions.readOwned(user.uid, session.id);
+        write(`event: session.state\ndata: ${JSON.stringify(toResponse(current))}\n\n`);
       } catch (error) {
         // The response is hijacked, so the error handler can no longer reply.
         // All that is left is to log it and hang up, which the client sees as a
