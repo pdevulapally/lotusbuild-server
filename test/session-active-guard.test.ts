@@ -1,3 +1,4 @@
+import { request as httpRequest } from 'node:http';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import Fastify from 'fastify';
@@ -81,7 +82,7 @@ class FakeSnapshot {
 
 interface Filter {
   readonly field: string;
-  readonly operator: '==' | '<=' | 'in';
+  readonly operator: '==' | '<=' | '>' | 'in';
   readonly value: unknown;
 }
 
@@ -115,7 +116,7 @@ class FakeQuery {
     this.after = after;
   }
 
-  where(field: string, operator: '==' | '<=' | 'in', value: unknown): FakeQuery {
+  where(field: string, operator: '==' | '<=' | '>' | 'in', value: unknown): FakeQuery {
     return new FakeQuery(
       this.firestore,
       this.collectionPath,
@@ -832,7 +833,7 @@ async function routeApp(h: ReturnType<typeof harness>, append: SessionEvents['ap
     { heartbeatSeconds: 15, maxConnections: 10, maxConnectionsPerUser: 2, maxBufferedBytes: 1024, reauthenticate: async () => {} });
   return app;
 }
-const authHeaders = { authorization: 'Bearer fixture-token' };
+const authHeaders = { authorization: 'Bearer fixture-token', 'idempotency-key': 'stable-test-command-1' };
 
 for (const status of ['FAILED', 'IDLE', 'QUEUED', 'RUNNING'] as const) {
   for (const steer of [false, true]) {
@@ -1036,4 +1037,147 @@ test('steering accepted after the last step is scheduled without an additional b
   assert.equal(await h.sessions.startPendingTurn(created.id, authority(h, created.id, 'runner-2')), true);
   assert.equal(h.charges(), 1);
   assert.equal((await h.sessions.listMessages('user-1', created.id, 100)).at(-1)?.content, 'Late correction');
+});
+
+
+test('a lost create response and retries after completion keep the original session and one charge', async () => {
+  const h = harness(); const key = 'stable-create-command-1';
+  const input = { prompt: 'Build', model: 'model-1' };
+  const accepted = await h.sessions.create('user-1', 'project-1', input, undefined, key);
+  const claimed = await h.sessions.claim('worker'); assert.ok(claimed);
+  await h.sessions.finish(accepted.id, { sessionId: accepted.id, runnerId: 'worker', token: claimed.leaseToken }, { status: 'IDLE' });
+  const retried = await Promise.all(Array.from({ length: 4 }, () => h.sessions.create('user-1', 'project-1', input, undefined, key)));
+  assert.ok(retried.every((session) => session.id === accepted.id)); assert.equal(h.charges(), 1);
+  assert.equal(h.activeSessions().length, 0);
+  await assert.rejects(h.sessions.create('user-1', 'project-1', { ...input, prompt: 'Different' }, undefined, key), { code: 'command/conflict' });
+});
+
+test('an accepted message is not queued or charged again after worker completion changes its submission path', async () => {
+  const h = harness(); h.seedSession('s', 'project-1', 'IDLE');
+  const first = await h.sessions.submitMessage('user-1', 's', 'Continue', false, 'stable-message-command');
+  assert.equal(first.kind, 'prompt');
+  const claimed = await h.sessions.claim('worker'); assert.ok(claimed);
+  await h.sessions.finish('s', { sessionId: 's', runnerId: 'worker', token: claimed.leaseToken }, { status: 'IDLE' });
+  const retried = await h.sessions.submitMessage('user-1', 's', 'Continue', false, 'stable-message-command');
+  assert.equal(retried.kind, 'prompt'); assert.equal(h.charges(), 1);
+  assert.equal(h.session('s')?.['status'], 'IDLE'); assert.equal((await h.sessions.listQueuedMessages('user-1', 's')).length, 0);
+  await assert.rejects(h.sessions.submitMessage('user-2', 's', 'Continue', false, 'stable-message-command'), { code: 'session/not-found' });
+});
+
+test('queued message receipt survives dequeue and never inserts a replacement', async () => {
+  const h = harness(); h.seedSession('s', 'project-1', 'RUNNING');
+  h.firestore.seed('projects/project-1', { ...h.project(), activeSessionId: 's' });
+  const first = await h.sessions.submitMessage('user-1', 's', 'Next', false, 'stable-queued-command');
+  assert.equal(first.kind, 'queued');
+  const authority = { sessionId: 's', runnerId: 'runner-1', token: 'seed-token' };
+  await h.sessions.dequeueNextMessage('s', authority);
+  const repeat = await h.sessions.submitMessage('user-1', 's', 'Next', false, 'stable-queued-command');
+  assert.deepEqual(repeat, first); assert.equal(h.charges(), 1);
+  assert.equal((await h.sessions.listQueuedMessages('user-1', 's')).length, 0);
+});
+
+test('retrying a previous cancellation after a new turn begins does not cancel that new turn', async () => {
+  const h = harness(); h.seedSession('s', 'project-1', 'QUEUED');
+  h.firestore.seed('projects/project-1', { ...h.project(), activeSessionId: 's' });
+  const key = 'stable-cancellation-command';
+  await h.sessions.cancel('user-1', 's', key);
+  await h.sessions.appendPrompt('user-1', 's', 'New explicit turn');
+  const retry = await h.sessions.cancel('user-1', 's', key);
+  assert.equal(retry.status, 'QUEUED'); assert.equal(retry.cancelRequested, undefined);
+  assert.equal(h.session('s')?.['status'], 'QUEUED');
+});
+
+for (const kind of ['question', 'approval'] as const) {
+  test(`pending ${kind} persists through lease takeover, blocks queued work, and accepts only its current response once`, async () => {
+    const h = harness(); h.seedSession('s', 'project-1', 'RUNNING');
+    h.firestore.seed('projects/project-1', { ...h.project(), activeSessionId: 's' });
+    const authority = { sessionId: 's', runnerId: 'runner-1', token: 'seed-token' };
+    await h.sessions.enqueueMessage('user-1', 's', 'Previously queued');
+    const request = await h.sessions.requestInput(authority, kind, 'Confirm the exact action');
+    assert.equal(await h.sessions.dequeueNextMessage('s', authority), undefined);
+    h.firestore.seed('sessions/s', { ...h.session('s'), claimableAt: Timestamp.fromMillis(0) });
+    const successor = await h.sessions.claim('successor'); assert.ok(successor);
+    assert.deepEqual(successor.pendingInput, request);
+    await assert.rejects(h.sessions.requestInput(authority, kind, 'Stale owner'), { code: 'session/lease-lost' });
+    await h.sessions.finish('s', { sessionId: 's', runnerId: 'successor', token: successor.leaseToken }, { status: 'IDLE' });
+    assert.equal(h.session('s')?.['status'], 'IDLE');
+    await assert.rejects(h.sessions.submitMessage('user-1', 's', 'Continue'), { code: 'session/input-required' });
+    await assert.rejects(h.sessions.submitMessage('user-1', 's', 'Answer', false, undefined, undefined, { id: 'stale', answer: 'approve' }), { code: 'session/input-required' });
+    const answer = kind === 'approval' ? 'reject' : 'The answer';
+    const key = 'stable-input-response-key';
+    const result = await h.sessions.submitMessage('user-1', 's', answer, false, key, undefined, { id: request.id, answer });
+    const again = await h.sessions.submitMessage('user-1', 's', answer, false, key, undefined, { id: request.id, answer });
+    assert.deepEqual(again, result); assert.equal(h.charges(), 1);
+    assert.equal(h.session('s')?.['pendingInput'], undefined);
+    assert.equal(h.firestore.documents.get(`sessions/s/input_requests/${request.id}`)?.data['answer'], answer);
+  });
+}
+
+test('an awaiting-input task can be explicitly cancelled without granting approval', async () => {
+  const h = harness(); h.seedSession('s', 'project-1', 'RUNNING');
+  h.firestore.seed('projects/project-1', { ...h.project(), activeSessionId: 's' });
+  const authority = { sessionId: 's', runnerId: 'runner-1', token: 'seed-token' };
+  const request = await h.sessions.requestInput(authority, 'approval', 'Publish?');
+  await h.sessions.finish('s', authority, { status: 'IDLE' });
+  const result = await h.sessions.cancel('user-1', 's', 'stable-cancel-input-key');
+  assert.equal(result.status, 'FAILED'); assert.equal(result.pendingInput, undefined);
+  assert.equal(h.firestore.documents.get(`sessions/s/input_requests/${request.id}`)?.data['answer'], undefined);
+});
+
+
+test('cancellation prevents old queued instructions from being adopted by an explicit later turn', async () => {
+  const h = harness(); h.seedSession('s', 'project-1', 'RUNNING');
+  h.firestore.seed('projects/project-1', { ...h.project(), activeSessionId: 's' });
+  const authority = { sessionId: 's', runnerId: 'runner-1', token: 'seed-token' };
+  await h.sessions.enqueueMessage('user-1', 's', 'Old queued instruction');
+  await h.sessions.cancel('user-1', 's', 'stable-cancel-queue-key');
+  await h.sessions.finish('s', authority, { status: 'FAILED', error: 'Cancelled by user' });
+  await h.sessions.appendPrompt('user-1', 's', 'New task');
+  const claimed = await h.sessions.claim('successor'); assert.ok(claimed);
+  assert.equal(await h.sessions.dequeueNextMessage('s', { sessionId: 's', runnerId: 'successor', token: claimed.leaseToken }), undefined);
+  assert.equal((await h.sessions.listQueuedMessages('user-1', 's')).length, 0);
+});
+
+test('approval cannot authorize a project version that changed while its owner was away', async () => {
+  const h = harness(); h.seedSession('s', 'project-1', 'RUNNING');
+  h.firestore.seed('projects/project-1', { ...h.project(), activeSessionId: 's' });
+  const authority = { sessionId: 's', runnerId: 'runner-1', token: 'seed-token' };
+  const request = await h.sessions.requestInput(authority, 'approval', 'Publish this version?');
+  await h.sessions.finish('s', authority, { status: 'IDLE' });
+  h.firestore.seed('projects/project-1', { ...h.project(), snapshotBytes: 100, snapshotObjectName: 'object', snapshotObjectGeneration: '1' });
+  await assert.rejects(h.sessions.submitMessage('user-1', 's', 'approve', false, 'stable-stale-approval-key', undefined,
+    { id: request.id, answer: 'approve' }), { code: 'session/input-context-changed' });
+  assert.equal(h.charges(), 0); assert.equal((await h.sessions.readOwned('user-1', 's')).pendingInput?.id, request.id);
+});
+
+
+test('a submission whose HTTP response is lost survives closing the client and replacing the API server', { timeout: 5000 }, async () => {
+  const h = harness(); const originalCreate = h.sessions.create.bind(h.sessions);
+  let signalAccepted!: () => void; let allowResponse!: () => void; let first = true;
+  const accepted = new Promise<void>((resolve) => { signalAccepted = resolve; });
+  const responseGate = new Promise<void>((resolve) => { allowResponse = resolve; });
+  h.sessions.create = async (...args) => {
+    const result = await originalCreate(...args);
+    if (first) { first = false; signalAccepted(); await responseGate; }
+    return result;
+  };
+  let app = await routeApp(h);
+  const address = await app.listen({ host: '127.0.0.1', port: 0 });
+  const headers = { ...authHeaders, 'idempotency-key': 'lost-http-response-command', 'content-type': 'application/json' };
+  const body = { prompt: 'Build once', model: 'model-1' };
+  const request = httpRequest(`${address}/projects/project-1/sessions`, { method: 'POST', headers });
+  request.on('error', () => {}); request.end(JSON.stringify(body));
+  try {
+    await accepted; request.destroy(); allowResponse(); await app.close();
+    const task = await h.sessions.claim('independent-worker'); assert.ok(task);
+    const authority = { sessionId: task.id, runnerId: 'independent-worker', token: task.leaseToken };
+    await h.sessions.appendAssistantMessage(task.id, authority, 'Saved result');
+    await h.sessions.finish(task.id, authority, { status: 'IDLE' });
+    app = await routeApp(h);
+    const retry = await app.inject({ method: 'POST', url: '/projects/project-1/sessions', headers, payload: body });
+    assert.equal(retry.statusCode, 201); assert.equal(retry.json().id, task.id); assert.equal(retry.json().status, 'IDLE');
+    assert.equal(h.charges(), 1); assert.equal(h.activeSessions().length, 0);
+    const messages = await h.sessions.listMessages('user-1', task.id, 100);
+    assert.equal(messages.at(-1)?.content, 'Saved result');
+  } finally { request.destroy(); allowResponse(); await app.close(); }
 });

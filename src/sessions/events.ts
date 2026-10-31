@@ -1,3 +1,6 @@
+import type { SessionLease } from './repository.ts';
+import { SessionJournal } from './journal.ts';
+import type { Firestore } from 'firebase-admin/firestore';
 import type { Redis } from 'ioredis';
 
 import { redisKeyPrefixes } from '../redis/client.ts';
@@ -31,6 +34,7 @@ export function compareStreamIds(left: string, right: string): number {
 }
 
 export interface SessionEventsOptions {
+  readonly firestore?: Firestore;
   readonly maxEventBytes: number;
   /** How long after its last event a session's log is dropped from Redis. */
   readonly retentionSeconds: number;
@@ -52,16 +56,29 @@ export interface SessionEventsOptions {
  * command on the shared connection would stall rate limiting for the whole
  * process. One subscriber connection with in-process fan-out costs a Map.
  *
- * None of this is the system of record. Losing Redis loses the live view of a
- * build in flight, never the session or its transcript.
+ * Production uses the bounded Firestore journal as the durable event source.
+ * Redis remains a notification channel. The Redis-only implementation supports
+ * older test adapters; both production entry points supply Firestore.
  */
 export class SessionEvents {
+  readonly #journal: SessionJournal | undefined;
+  get durable(): boolean { return this.#journal !== undefined; }
+
+  async resumeAvailable(sessionId: string, cursor: string): Promise<boolean> {
+    return this.#journal === undefined || await this.#journal.sequence(sessionId, cursor) !== undefined;
+  }
+
+  async assertReady(): Promise<void> { await this.#journal?.assertReady(); }
+
+  async collectExpired(): Promise<void> { await this.#journal?.collectExpired(); }
+
   readonly #redis: Redis;
   readonly #subscriber: Redis;
   readonly #retentionSeconds: number;
   readonly #maxPerSession: number;
   readonly #maxEventBytes: number;
   readonly #onListenerError: SessionEventsOptions['onListenerError'];
+  readonly #appendTails = new Map<string, Promise<unknown>>();
   readonly #listeners = new Map<string, Set<SessionEventListener>>();
 
   constructor(redis: Redis, subscriber: Redis, options: SessionEventsOptions) {
@@ -73,6 +90,7 @@ export class SessionEvents {
     if (!Number.isSafeInteger(options.maxPerSession) || options.maxPerSession <= 0) {
       throw new Error(`The per-session event ceiling must be a positive integer.`);
     }
+    this.#journal = options.firestore === undefined ? undefined : new SessionJournal(options.firestore, options.maxPerSession, options.retentionSeconds);
     this.#redis = redis;
     this.#subscriber = subscriber;
     this.#retentionSeconds = options.retentionSeconds;
@@ -92,14 +110,29 @@ export class SessionEvents {
    * share a name deliberately: channels are not part of the keyspace, so they
    * cannot collide, and one name means one thing to look at when debugging.
    */
-  async append(
+  append(sessionId: string, type: string, data: Readonly<Record<string, unknown>>, authority?: SessionLease): Promise<SessionEvent> {
+    const prior = this.#appendTails.get(sessionId) ?? Promise.resolve();
+    const result = prior.catch(() => {}).then(() => this.#append(sessionId, type, data, authority));
+    this.#appendTails.set(sessionId, result);
+    void result.finally(() => { if (this.#appendTails.get(sessionId) === result) this.#appendTails.delete(sessionId); }).catch(() => {});
+    return result;
+  }
+
+  async #append(
     sessionId: string,
     type: string,
     data: Readonly<Record<string, unknown>>,
+    authority?: SessionLease,
   ): Promise<SessionEvent> {
     const key = this.#key(sessionId);
     const serialized = JSON.stringify(data);
     if (Buffer.byteLength(serialized) + Buffer.byteLength(type) + 100 > this.#maxEventBytes) throw new Error('Event exceeds the configured byte budget; its authoritative data remains in Firestore.');
+    if (this.#journal !== undefined) {
+      const event = await this.#journal.append(sessionId, type, data, authority);
+      // Notification loss is repaired from the durable journal on the next heartbeat/reconnect.
+      await this.#redis.publish(key, JSON.stringify(event));
+      return event;
+    }
     const id = await this.#redis.xadd(
       key,
       'MAXLEN',
@@ -132,6 +165,11 @@ export class SessionEvents {
    * event the client last saw.
    */
   async history(sessionId: string, afterId: string | undefined): Promise<readonly SessionEvent[]> {
+    if (this.#journal !== undefined) {
+      const history: SessionEvent[] = [];
+      for await (const event of this.#journal.replay(sessionId, afterId)) history.push(event);
+      return history;
+    }
     const entries = await this.#redis.xrange(
       this.#key(sessionId),
       afterId === undefined ? '-' : `(${afterId}`,
@@ -157,6 +195,7 @@ export class SessionEvents {
 
   /** Replay one bounded event at a time instead of allocating an entire session's history per socket. */
   async *replay(sessionId: string, afterId: string | undefined): AsyncGenerator<SessionEvent> {
+    if (this.#journal !== undefined) { yield* this.#journal.replay(sessionId, afterId); return; }
     let cursor = afterId;
     for (let count = 0; count < this.#maxPerSession; count++) {
       const entries = await this.#redis.xrange(this.#key(sessionId), cursor === undefined ? '-' : `(${cursor}`, '+', 'COUNT', 1);

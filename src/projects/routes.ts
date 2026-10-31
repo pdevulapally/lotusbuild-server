@@ -1,3 +1,4 @@
+import { commandKey } from '../sessions/commands.ts';
 import type { FastifyInstance } from 'fastify';
 
 import { authenticatedUser } from '../auth/plugin.ts';
@@ -93,7 +94,7 @@ export function registerProjectRoutes(app: FastifyInstance, projects: ProjectRep
         name: request.body.name.trim(),
         description: request.body.description?.trim(),
         platform: newProjectPlatform,
-      });
+      }, commandKey(request.headers['idempotency-key'], true));
       return reply.code(201).send(toResponse(project));
     },
   );

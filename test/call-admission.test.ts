@@ -106,10 +106,10 @@ async function modelFixture() {
   let calls = 0;
   const sdk = {
     countTokens: async () => ({ input_tokens: 10 }),
-    stream: () => {
+    stream: (params?: { tools?: readonly { name?: string }[] }) => {
       calls++;
       return { on: () => {}, finalMessage: async (): Promise<{ content: ContentBlock[]; usage: { input_tokens: number; output_tokens: number }; stop_reason: string }> => ({
-        content: [{ type: 'text', text: 'Done', citations: null }], usage: { input_tokens: 7, output_tokens: 3 }, stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Done', citations: null }, ...(params?.tools?.some(tool => tool.name === 'finish_task') ? [{ type: 'tool_use' as const, id: 'finish', name: 'finish_task', input: { outcome: 'answered', summary: 'Done', evidence: [] }, caller: { type: 'direct' as const } }] : [])], usage: { input_tokens: 7, output_tokens: 3 }, stop_reason: params?.tools?.some(tool => tool.name === 'finish_task') ? 'tool_use' : 'end_turn',
       }) };
     },
   };

@@ -58,6 +58,7 @@ export class AccountErasure {
     await this.#db.doc(`familyInvitations/${uid}`).delete();
     await this.#clearCaches(uid);
     await this.#ignoreAbsent(() => this.#auth.deleteUser(uid));
+    await this.#db.recursiveDelete(this.#db.collection(`users/${uid}/commands`));
     // Financial subcollections remain segregated from the removed account profile.
     // Their disposal follows the reviewed retention decision, not blanket account deletion.
     await this.#db.doc(`users/${uid}`).delete();

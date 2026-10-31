@@ -1,3 +1,10 @@
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { ContinuationPause, type ContinuationCheckpoint } from '../src/runner/continuation.ts';
+import { AppError } from '../src/http/errors.ts';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
@@ -447,6 +454,8 @@ const oneFinding = [
 
 async function turn(options: {
   readonly script: readonly Responder[];
+  readonly rawFinalReplies?: boolean;
+  readonly goal?: string;
   readonly specialists?: readonly SpecialistDefinition[];
   readonly limits?: AgentLimits;
   readonly signal?: AbortSignal;
@@ -460,9 +469,38 @@ async function turn(options: {
   readonly drainSteer?: () => Promise<string | undefined>;
   readonly provider?: SandboxProvider;
   readonly desktopReady?: boolean;
+  readonly requestInput?: Parameters<typeof runAgentTurn>[0]['requestInput'];
+  readonly resume?: ContinuationCheckpoint;
+  readonly onAdmissionFailure?: Parameters<typeof runAgentTurn>[0]['onAdmissionFailure'];
+  readonly admission?: Parameters<typeof runAgentTurn>[0]['admission'];
+  readonly registry?: Registry;
   readonly session?: BuildSession;
 }) {
-  const { client, scripted } = anthropicOf(options.script);
+  // Existing scenarios use say() as an explicit final outcome. Adapt that fixture shorthand
+  // to the new completion tool; raw scenarios below exercise premature prose unchanged.
+  const script = options.rawFinalReplies ? options.script : options.script.map(responder => async (invocation: ModelCall) => {
+    const response = await responder(invocation);
+    if (!invocation.toolNames.includes('finish_task') || response.stop_reason !== 'end_turn' || response.content.some(block => block.type === 'tool_use')) return response;
+    const facts: { id: string; tool: string; failed: boolean }[] = [];
+    const open = new Map<string, boolean>();
+    let declarations = new Map<string,string>();
+    for (const message of invocation.messages) {
+      if (!Array.isArray(message.content)) continue;
+      if (message.role === 'assistant') declarations = new Map(message.content.filter(block => block.type === 'tool_use').map(block => [block.id,block.name]));
+      for (const block of message.content) if (block.type === 'tool_result') {
+        const name = declarations.get(block.tool_use_id); if (!name || ['update_task','finish_task'].includes(name)) continue;
+        const id = facts.some(fact => fact.id === block.tool_use_id) ? `${block.tool_use_id}/${facts.length}` : block.tool_use_id;
+        facts.push({ id, tool: name, failed: block.is_error === true });
+        if (typeof block.content === 'string') {
+          for (const match of block.content.matchAll(/(?:blocking: blocker |Blocker )([A-Za-z0-9_-]+)/g)) open.set(match[1]!, !block.content.includes(`Blocker ${match[1]} is resolved.`));
+        }
+      }
+    }
+    const evidence = facts.filter(fact => !fact.failed && fact.tool !== 'consult_specialist').map(fact => fact.id).slice(-32);
+    const outcome = [...open.values()].some(Boolean) ? 'blocked' : facts.some(fact => fact.failed || !['read_file','list_files','search_files','consult_specialist'].includes(fact.tool)) ? (evidence.length === 0 ? 'blocked' : 'completed') : 'answered';
+    return { ...response, content: [...response.content, { type: 'tool_use' as const, id: 'fixture-finish', name: 'finish_task', input: { outcome, summary: response.content.filter(block => block.type === 'text').map(block => block.text).join('') || 'Scripted final outcome.', evidence }, caller: { type: 'direct' as const } }], stop_reason: 'tool_use' };
+  });
+  const { client, scripted } = anthropicOf(script);
   const sandbox = options.sandbox ?? new FakeSandbox();
   const published = options.published ?? [];
   const metering = options.metering ?? new FakeMetering();
@@ -472,7 +510,7 @@ async function turn(options: {
     withValidationSandbox: sandbox instanceof ValidationSandbox ? sandbox.withCopy.bind(sandbox) : undefined,
     // Agent orchestration tests inject the billing boundary. The real admission
     // service's reserve-before-dispatch protocol is covered independently.
-    admission: { begin: async ({ outputReservationId }) => ({ settle: async (usage) => {
+    admission: options.admission ?? { begin: async ({ outputReservationId }) => ({ settle: async (usage) => {
       if (options.failSpecialistInput === true && outputReservationId !== undefined) throw new Error('Input settlement failed');
       if (usage.input !== undefined && usage.input > 0) await metering.consume({ meterKey: 'ai.tokens.input', quantity: usage.input });
       if (outputReservationId === undefined && usage.output !== undefined && usage.output > 0) {
@@ -484,9 +522,9 @@ async function turn(options: {
     project: options.project ?? project,
     provider: options.provider ?? provider,
     sandbox,
-    messages: [{ seq: 0, role: 'user', content: 'do the thing', createdAt: new Date(0) }],
+    messages: [{ seq: 0, role: 'user', content: options.goal ?? 'do the thing', createdAt: new Date(0) }],
     entitlements,
-    registry: registryWith(options.specialists ?? [architecture, security]),
+    registry: options.registry ?? registryWith(options.specialists ?? [architecture, security]),
     metering: meteringOf(metering),
     limits: options.limits ?? limits,
     events: eventsOf(published),
@@ -494,6 +532,9 @@ async function turn(options: {
     assertStillOurs: () => {},
     drainSteer: options.drainSteer ?? (() => undefined),
     desktopReady: options.desktopReady ?? false,
+    ...(options.requestInput === undefined ? {} : { requestInput: options.requestInput }),
+    ...(options.resume === undefined ? {} : { resume: options.resume }),
+    ...(options.onAdmissionFailure === undefined ? {} : { onAdmissionFailure: options.onAdmissionFailure }),
     reservations,
     onProblem: (error, what) => {
       problems.push({ error, what });
@@ -753,6 +794,7 @@ test('the primary agent may fix a blocker and clear it by consulting again', asy
           resolves: 'security-1',
         }),
       () => call('submit_review', review('ok', 'Ownership is now enforced.', [])),
+      () => call('read_file', { path: 'routes.ts' }),
       () => say('Added the ownership check.'),
     ],
   });
@@ -1724,6 +1766,7 @@ test('specialists issued together inspect the workspace before any queued write'
         }),
       specialists,
       specialists,
+      () => call('read_file', { path: 'src/app.ts' }),
       () => say('done'),
     ],
   });
@@ -2832,7 +2875,7 @@ for (const other of [
     await turn({
       specialists: [testing],
       sandbox,
-      script: [() => batchOf(testUse, other), router, router, () => say('done')],
+      script: [() => batchOf(testUse, other), router, router, () => call('read_file', { path: 'package.json' }), () => say('done')],
     });
     assert.equal(tracker.max, 1);
   });
@@ -2847,7 +2890,7 @@ test('specialist output remains authoritative when its input settlement fails', 
   assert.deepEqual(h.metering.observed, [20]);
   assert.deepEqual(h.metering.settled, [20]);
   assert.equal(h.metering.released.length, 0);
-  assert.equal(h.run.stopReason, 'end_turn');
+  assert.equal(h.run.stopReason, 'blocked');
 });
 
 test('the agent awaits durable steering before dispatching its next model call', async () => {
@@ -2871,8 +2914,8 @@ test('the primary agent is told to stay grounded, verify its work and report hon
   ] });
   const at = (needle: string) => { const index = system.indexOf(needle); assert.ok(index >= 0, `missing: ${needle}`); return index; };
   // Platform knowledge from the provider row comes first, then how to work, and the safety rules stay last.
-  assert.ok(at('build the thing') < at('Understand before you change'));
-  assert.ok(at('Understand before you change') < at('Platform security and privacy rules apply'));
+  assert.ok(at('build the thing') < at('Inspect the environment needed for your next decision'));
+  assert.ok(at('Inspect the environment needed for your next decision') < at('Platform security and privacy rules apply'));
   for (const rule of [
     'Do not invent anything.',
     'Never claim that something works, passes or is fixed unless you ran it and saw the result.',
@@ -2881,7 +2924,7 @@ test('the primary agent is told to stay grounded, verify its work and report hon
     'check the installed package',
     'Prefer edit_file on an existing file over rewriting it',
     'Do not ask questions you can answer by looking at the project yourself.',
-    'state your plan in a few lines',
+    'Keep a concise revisable plan when useful',
   ]) at(rule);
   // The agent is not told what it is building: that comes from the request and the provider instructions.
   assert.equal(system.includes('You are building a'), false);
@@ -2954,9 +2997,11 @@ test('plan mode is enforced with read-only tools and no computer control', async
   const invocation = scripted.calls[0]!;
   assert.deepEqual([...invocation.toolNames].sort(), [
     'consult_specialist',
+    'finish_task',
     'list_files',
     'read_file',
     'search_files',
+    'update_task',
   ]);
   assert.equal(hasComputer(invocation.tools), false);
   assert.match(invocation.system, /This session is in plan mode/);
@@ -3091,4 +3136,200 @@ test('screenshots that pile up in a long turn are pruned before the next call is
   const sent = scripted.calls.map((invocation) => imagesSent(invocation.messages));
   assert.ok(Math.max(...sent) <= 16, JSON.stringify(sent));
   assert.ok(sent.at(-1)! < shots, 'older screenshots were dropped by the last call');
+});
+
+
+test('request_user_input persists the request and blocks subsequent tool calls in the same response', async () => {
+  const saved: string[] = [];
+  const result = await turn({ requestInput: async (kind, prompt) => { saved.push(prompt); return { id: 'request', kind, prompt }; },
+    script: [() => ({ content: [
+      { type: 'tool_use', id: 'ask', caller: { type: 'direct' }, name: 'request_user_input', input: { kind: 'approval', prompt: 'Publish this exact version?' } },
+      { type: 'tool_use', id: 'after', caller: { type: 'direct' }, name: 'run_command', input: { command: 'must-not-run' } },
+    ], stop_reason: 'tool_use' })],
+  });
+  assert.deepEqual(saved, ['Publish this exact version?']);
+  assert.equal(result.run.stopReason, 'awaiting_input');
+  assert.ok(result.run.reply.includes(saved[0]!));
+  assert.equal(JSON.stringify(result.published).includes('must-not-run'), false);
+});
+
+
+test('a portable admission checkpoint resumes after completed tool results without replay or step-budget reset', async () => {
+  const sandbox = new FakeSandbox(); let attempts = 0; let saved: ContinuationCheckpoint | undefined;
+  await assert.rejects(turn({ sandbox, script: [() => call('run_command', { command: 'write-once' })],
+    admission: { begin: async () => { if (++attempts === 2) throw new AppError({ code: 'usage/limit-reached', statusCode: 402, message: 'Quota' }); return { settle: async () => {} }; } },
+    onAdmissionFailure: async (error, checkpoint) => { saved = checkpoint; throw new ContinuationPause(checkpoint, error as AppError); },
+  }), ContinuationPause);
+  assert.ok(saved); assert.equal(saved.completedSteps, 1); assert.equal(sandbox.commands.length, 1);
+  const resumed = await turn({ sandbox, resume: saved, session: { ...session, model: 'synthetic-fallback' }, script: [() => say('Finished from the saved results')] });
+  assert.equal(sandbox.commands.length, 1); assert.equal(resumed.run.steps, 2); assert.equal(resumed.scripted.calls.length, 1);
+  const resumedCall = resumed.scripted.calls[0]; assert.ok(resumedCall);
+  assert.ok(JSON.stringify(resumedCall.messages).includes('tool_result'));
+});
+
+test('provider failures after generation dispatch cannot produce a fallback checkpoint', async () => {
+  let checkpoints = 0;
+  await assert.rejects(turn({ script: [() => { throw new Error('provider timeout after dispatch'); }], onAdmissionFailure: async () => { checkpoints++; } }));
+  assert.equal(checkpoints, 0);
+});
+
+test('an unconfirmed input request stops later actions even when persistence acknowledgement fails', async () => {
+  const sandbox = new FakeSandbox();
+  await assert.rejects(turn({ sandbox, requestInput: async () => { throw new Error('lost database acknowledgement'); }, script: [() => ({ content: [
+    { type: 'tool_use', id: 'ask', caller: { type: 'direct' }, name: 'request_user_input', input: { kind: 'approval', prompt: 'Publish?' } },
+    { type: 'tool_use', id: 'unsafe', caller: { type: 'direct' }, name: 'run_command', input: { command: 'must-not-run' } },
+  ], stop_reason: 'tool_use' })] }), { code: 'session/input-persistence-unconfirmed' });
+  assert.equal(sandbox.commands.length, 0);
+});
+
+test('the specialist direct output hold follows the selected fallback meter', async () => {
+  const registry = { ...registryWith([security]), inputTokenMeterKey: 'test.fallback.input', outputTokenMeterKey: 'test.fallback.output' };
+  const result = await turn({ registry, script: [() => call('consult_specialist', { role: security.key, question: 'Review' }),
+    () => call('submit_review', review('ok', 'Reviewed', [])), () => say('Done')] });
+  assert.ok(result.metering.reserved.some((hold) => hold.meterKey === 'test.fallback.output'));
+  assert.equal(result.metering.reserved.some((hold) => hold.meterKey === 'ai.tokens.output'), false);
+});
+
+
+test('a resumed desktop refuses historical coordinates until it has observed a fresh screenshot', async () => {
+  let attempts = 0; let saved: ContinuationCheckpoint | undefined;
+  await assert.rejects(turn({ sandbox: new ScreenSandbox(), provider: desktopProvider, desktopReady: true,
+    script: [() => ({ content: [computerCall('old-shot', 'screenshot', {})], stop_reason: 'tool_use' })],
+    admission: { begin: async () => { if (++attempts === 2) throw new AppError({ code: 'usage/limit-reached', statusCode: 402, message: 'Quota' }); return { settle: async () => {} }; } },
+    onAdmissionFailure: async (error, checkpoint) => { saved = checkpoint; throw new ContinuationPause(checkpoint, error as AppError); },
+  }), ContinuationPause);
+  assert.ok(saved); const sandbox = new ScreenSandbox();
+  const resumed = await turn({ sandbox, provider: desktopProvider, desktopReady: true, resume: saved,
+    script: [() => ({ content: [computerCall('stale-click', 'left_click', { coordinate: [1, 1] })], stop_reason: 'tool_use' }),
+      () => ({ content: [computerCall('fresh-shot', 'screenshot', {})], stop_reason: 'tool_use' }),
+      () => say('Observed the current desktop.')],
+  });
+  const answer = resumed.scripted.calls[1]!.messages.at(-1)!.content as { is_error?: boolean; content: string }[];
+  assert.equal(answer[0]!.is_error, true); assert.match(answer[0]!.content, /fresh screenshot/);
+  assert.equal(sandbox.commands.some((command) => command.includes('click')), false);
+});
+
+
+function taskCall(id: string, name: string, input: Record<string, unknown>): { content: ContentBlock[]; stop_reason: string } {
+  return { content: [{ type: 'tool_use', id, name, input, caller: { type: 'direct' } }], stop_reason: 'tool_use' };
+}
+
+test('active goal work investigates a failure, revises strategy, verifies and completes without delegation', async () => {
+  const sandbox = new FakeSandbox();
+  const result = await turn({ sandbox, rawFinalReplies: true, specialists: [], script: [
+    () => taskCall('plan', 'update_task', { plan: [{ action: 'Inspect actual source then verify the fix', status: 'pending' }] }),
+    () => taskCall('failure', 'read_file', { path: '../outside-project' }),
+    () => say('I will investigate.'), // Must not finish a pending goal at a prose promise.
+    invocation => { assert.ok(JSON.stringify(invocation.messages).includes('goal is still active')); return taskCall('observe', 'read_file', { path: 'package.json' }); },
+    () => taskCall('revise', 'update_task', { observations: ['The first path was invalid; inspect within the project.'], plan: [{ action: 'Inspected the actual project file', status: 'completed' }], nextActions: [], unresolved: [] }),
+    () => taskCall('verify', 'run_command', { command: 'verify-actual-project' }),
+    () => taskCall('finish', 'finish_task', { outcome: 'completed', summary: 'Verified the fixture command and inspected source; no other behavior is claimed.', evidence: ['observe','verify'] }),
+  ] });
+  assert.equal(result.run.stopReason, 'completed'); assert.equal(result.scripted.calls.length, 7);
+  assert.equal(sandbox.commands.length, 1); assert.equal(result.published.some(event => event.type === 'agent.specialist_started'), false);
+});
+
+test('a different goal can inspect first, plan later, and stop with an explicit genuine blocker', async () => {
+  const result = await turn({ rawFinalReplies: true, specialists: [], script: [
+    () => taskCall('inspect', 'read_file', { path: 'package.json' }),
+    () => taskCall('context', 'update_task', { observations: ['The project was inspected.'], unresolved: ['The required account configuration is not supplied.'] }),
+    () => taskCall('stop', 'finish_task', { outcome: 'blocked', summary: 'Account configuration is required; deployment is not verified.', evidence: ['inspect'] }),
+  ] });
+  assert.equal(result.run.stopReason, 'blocked'); assert.equal(result.scripted.calls.length, 3);
+});
+
+test('invented completion evidence is refused and the primary can investigate and correct its claim', async () => {
+  const result = await turn({ rawFinalReplies: true, specialists: [], script: [
+    () => taskCall('context', 'update_task', { unresolved: [] }),
+    () => taskCall('invalid', 'finish_task', { outcome: 'completed', summary: 'Assumed it worked.', evidence: ['never-ran'] }),
+    invocation => { assert.match(JSON.stringify(invocation.messages), /never observed/); return taskCall('check', 'read_file', { path: 'package.json' }); },
+    () => taskCall('finish', 'finish_task', { outcome: 'completed', summary: 'Only the observed file inspection is verified.', evidence: ['check'] }),
+  ] });
+  assert.equal(result.run.stopReason, 'completed');
+});
+
+test('identical failed actions stop instead of retrying indefinitely', async () => {
+  const result = await turn({ rawFinalReplies: true, specialists: [], script: [
+    () => taskCall('context', 'update_task', { unresolved: [] }),
+    ...['one','two','three'].map(id => () => taskCall(id, 'read_file', { path: '../outside-project' })),
+  ] });
+  assert.equal(result.run.stopReason, 'no_progress'); assert.equal(result.scripted.calls.length, 4);
+  assert.match(result.run.reply, /not verified/);
+});
+
+test('a provider-truncated answer is continued inside the same budget rather than treated as completed', async () => {
+  const result = await turn({ rawFinalReplies: true, specialists: [], script: [
+    () => ({ ...say('Partial answer'), stop_reason: 'max_tokens' }),
+    () => taskCall('answer', 'finish_task', { outcome:'answered', summary:'The complete answer is now supplied.', evidence:[] }),
+  ] });
+  assert.equal(result.scripted.calls.length, 2); assert.equal(result.run.steps, 2);
+});
+
+
+test('goal loop repairs a real local program after a failing check and verifies the changed file', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'lotus-autonomy-'));
+  const execute = promisify(execFile);
+  class LocalFixture extends FakeSandbox {
+    override async readFile(path = ''): Promise<string> {
+      assert.ok(['/workspace/sum.cjs','/workspace/check.cjs'].includes(path));
+      return readFile(join(directory,path.slice('/workspace/'.length)), 'utf8');
+    }
+    override async writeFile(path: string, content = ''): Promise<void> {
+      assert.equal(path,'/workspace/sum.cjs'); this.writes.push(path);
+      await writeFile(join(directory,'sum.cjs'),content);
+    }
+    override async runCommand(command: string): Promise<CommandOutcome> {
+      assert.ok(command.includes('node check.cjs')); this.commands.push(command);
+      try { const result = await execute(process.execPath,['check.cjs'],{ cwd: directory, timeout: 5000 }); return { exitCode: 0, stdout: result.stdout, stderr: result.stderr }; }
+      catch (error) { const failure = error as { code: number; stdout: string; stderr: string }; assert.equal(typeof failure.code,'number'); return { exitCode: failure.code, stdout: failure.stdout, stderr: failure.stderr }; }
+    }
+  }
+  try {
+    await writeFile(join(directory,'sum.cjs'),'module.exports = (a, b) => a - b;');
+    await writeFile(join(directory,'check.cjs'),"const assert = require('node:assert/strict'); const sum = require('./sum.cjs'); assert.equal(sum(2,3),5);");
+    const sandbox = new LocalFixture();
+    const result = await turn({ sandbox, goal: 'Fix sum(2,3) so the supplied arithmetic assertion passes; verify the actual result.', rawFinalReplies: true, specialists: [], script: [
+      () => taskCall('failed-check','run_command',{ command: 'node check.cjs' }),
+      invocation => { assert.match(JSON.stringify(invocation.messages),/AssertionError/); return taskCall('source','read_file',{ path:'sum.cjs' }); },
+      () => taskCall('plan','update_task',{ plan:[{ action:'Correct arithmetic and rerun the actual assertion',status:'pending' }], observations:['The assertion failed; the actual source subtracts.'] }),
+      () => taskCall('fix','edit_file',{ path:'sum.cjs',old_string:'a - b',new_string:'a + b' }),
+      () => taskCall('passed-check','run_command',{ command:'node check.cjs' }),
+      () => taskCall('notes','update_task',{ plan:[{ action:'Correct arithmetic and rerun the actual assertion',status:'completed' }], nextActions:[],unresolved:[] }),
+      () => taskCall('finish','finish_task',{ outcome:'completed',summary:'The local arithmetic assertion failed before the edit and passed afterwards. Only this assertion is verified.',evidence:['passed-check'] }),
+    ] });
+    assert.equal(result.run.stopReason,'completed'); assert.equal(sandbox.commands.length,2);
+    assert.match(await readFile(join(directory,'sum.cjs'),'utf8'),/a \+ b/);
+  } finally { await rm(directory,{ recursive:true,force:true }); }
+});
+
+
+test('the primary can choose isolated validation directly without a specialist handoff', async () => {
+  const sandbox = new ValidationSandbox({ onCommand: () => ({exitCode:0,stdout:'actual profile result',stderr:''}) });
+  const result = await turn({ sandbox, rawFinalReplies:true, script:[
+    () => taskCall('validate','run_validation',{operation:'test'}),
+    () => taskCall('finish','finish_task',{outcome:'completed',summary:'The configured validation profile passed in its isolated copy.',evidence:['validate']}),
+  ] });
+  assert.equal(result.run.stopReason,'completed');
+  assert.equal(result.published.some(event=>event.type==='agent.specialist_started'),false);
+});
+
+
+test('a prose promise cannot end a goal before any tools have run', async () => {
+  const result=await turn({rawFinalReplies:true,specialists:[],script:[
+    ()=>say('I will investigate this now.'),
+    invocation=>{assert.match(JSON.stringify(invocation.messages),/goal is still active/);return taskCall('answer','finish_task',{outcome:'answered',summary:'An explicit answer with no action claims.',evidence:[]});},
+  ]});
+  assert.equal(result.scripted.calls.length,2);assert.equal(result.run.stopReason,'answered');
+});
+
+test('a provider refusal is a blocker and is not retried to override it', async () => {
+  const result=await turn({rawFinalReplies:true,specialists:[],script:[()=>({...say('Cannot perform that request.'),stop_reason:'refusal'})]});
+  assert.equal(result.scripted.calls.length,1);assert.equal(result.run.stopReason,'blocked');
+});
+
+test('unproductive reads and the step budget stop with an explicit unverified outcome', async () => {
+  const repeated=await turn({rawFinalReplies:true,specialists:[],script:Array.from({length:4},(_,index)=>()=>taskCall(`repeat-${index}`,'read_file',{path:'same-file'}))});
+  assert.equal(repeated.run.stopReason,'no_progress');
+  const limited=await turn({rawFinalReplies:true,specialists:[],limits:{...limits,maxSteps:1},script:[()=>say('Still working.')]});
+  assert.equal(limited.run.stopReason,'max_steps');assert.match(limited.run.reply,/not verified/);
 });

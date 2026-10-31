@@ -1,8 +1,12 @@
+import { TaskTracker, compactTaskConversation, type TaskContext } from './task-context.ts';
+import { timed, startTiming } from '../diagnostics/timing.ts';
+import { contextFingerprint, retainCheckpointImages, type AdmissionBoundary, type ContinuationCheckpoint } from './continuation.ts';
 import type { CallAdmission } from './call-admission.ts';
 import type Anthropic from '@anthropic-ai/sdk';
 import type {
   ContentBlockParam,
   Message,
+  MessageCountTokensParams,
   MessageParam,
   MessageStreamEvent,
   OutputConfig,
@@ -18,7 +22,7 @@ import { AppError } from '../http/errors.ts';
 import type { MeteringService } from '../metering/service.ts';
 import type { Project } from '../projects/repository.ts';
 import type { RunningSandbox } from '../sandboxes/provider.ts';
-import type { BuildSession, SessionMessage } from '../sessions/repository.ts';
+import type { BuildSession, PendingInput, SessionMessage } from '../sessions/repository.ts';
 import {
   type Computer,
   type ComputerResult,
@@ -242,12 +246,16 @@ const agentWorkingInstructions = [
   'The user is watching your steps as they happen, so what you do and say must be true and easy to follow.',
   '',
   'How to work',
-  '- Understand before you change. Read the request, then look at the project: list and search first,',
-  '  read the files that matter, and check package.json, lockfiles and configuration for the real stack,',
-  '  scripts and versions. Find how the project already does things and follow that.',
-  '- For anything larger than a small fix, state your plan in a few lines before you start, then work',
-  '  through it in small steps. Tell the user briefly what you are about to do and why; do not narrate',
-  '  every command.',
+  '- Pursue the goal until verified, genuinely blocked, awaiting a consequential decision or resource-limited.',
+  '- Choose investigation, research, planning, execution and checks in the order the current evidence needs.',
+  '- Use update_task to retain a revisable plan and concise facts for nontrivial work; it is optional for a direct answer.',
+  '- For active work use finish_task with runtime tool-use IDs as evidence. A plan is intent, not completed work.',
+  '- After an unexpected result investigate it, change approach and verify again; optional specialists advise, you integrate.',
+  '- run_validation is available directly when an isolated validation sandbox is supported; delegation is not required.',
+  '- Inspect the environment needed for your next decision. Read, search or reproduce a failure as useful;',
+  '  ground stack, scripts and versions in actual configuration and follow existing project conventions.',
+  '- Keep a concise revisable plan when useful. Research, tests or execution may reveal the next step',
+  '  before a plan is possible. Explain meaningful decisions briefly; do not narrate every command.',
   '- Change only what the request needs. Prefer edit_file on an existing file over rewriting it, reuse',
   '  what the project already has before writing something new, and add a dependency only when it is',
   '  really needed. Do not refactor unrelated code or add features nobody asked for.',
@@ -526,6 +534,8 @@ class BlockerLedger {
 const screenshotLimits = { maxImages: 16, keep: 6 } as const;
 
 interface ModelLoopInput {
+  readonly resume?: ContinuationCheckpoint;
+  readonly onAdmissionFailure?: (error: unknown, boundary: AdmissionBoundary) => Promise<void>;
   readonly admission: CallAdmission;
   readonly outputReservationId?: string;
   readonly anthropic: Anthropic;
@@ -560,6 +570,10 @@ interface ModelLoopInput {
   readonly beforeStep?: (() => string | undefined | Promise<string | undefined>) | undefined;
   /** Ends the loop after a tool call that has produced the caller's answer. */
   readonly stopWhen?: (() => boolean) | undefined;
+  readonly candidateStop?: () => string | undefined;
+  readonly shouldHalt?: () => boolean;
+  readonly observe?: (id: string, name: string, args: unknown, result: { text: string; isError: boolean }) => void;
+  readonly saveContext?: () => Promise<void>;
   /**
    * Decides whether one tool call may share a parallel group. Defaults to the
    * tool's own `parallelSafe` flag; the primary turn overrides it to refine a
@@ -576,8 +590,8 @@ interface ModelLoopOutcome {
 }
 
 /**
- * The model, its tools, and the sandbox, until it stops asking for tools or runs
- * out of the steps it is allowed.
+ * One bounded tool loop. Primary completion is explicitly validated by its caller;
+ * specialists retain their bounded review protocol. Provider pauses are not completion.
  *
  * Shared by the primary coding agent and by any specialist consulted from it, so
  * streaming, metering, tool dispatch, step limits and cancellation exist once.
@@ -594,13 +608,16 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
     ...specsOf(input.tools),
     ...(input.computer === undefined ? [] : [input.computer.toolset]),
   ];
-  const spoken: string[] = [];
+  let uncertainToolOutcome = false;
+  const spoken: string[] = [...(input.resume?.spoken ?? [])];
+  if (input.resume !== undefined && input.resume.contextFingerprint !== contextFingerprint(input.system, specs)) throw new AppError({ code: 'fallback/context-changed', statusCode: 409, message: 'The task?s tool permissions or instructions changed. This checkpoint cannot be resumed automatically.' });
   const providerEffort: NonNullable<OutputConfig['effort']> =
     input.effort === 'standard' ? 'medium' : input.effort;
 
-  for (let step = 1; step <= input.maxSteps; step += 1) {
+  for (let step = (input.resume?.completedSteps ?? 0) + 1; step <= input.maxSteps; step += 1) {
     input.assertStillOurs();
     input.signal.throwIfAborted();
+    if (input.shouldHalt?.()) return { reply: [...spoken, 'Work stopped: repeated identical failures or the bounded evidence limit prevented further safe progress. The goal is not verified.'].join('\n\n'), steps: step - 1, stopReason: 'no_progress' };
 
     const steer = await input.beforeStep?.();
     if (steer !== undefined) {
@@ -614,21 +631,29 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
 
     // Before admission, so what is counted and reserved is what is sent.
     if (input.computer !== undefined) pruneScreenshots(input.conversation, screenshotLimits);
-    const admitted = await input.admission.begin({
-      params: {
+    const request: MessageCountTokensParams = {
         model: input.model,
         system: input.system,
         tools: [...specs],
         messages: input.conversation,
         output_config: { effort: providerEffort },
-      },
-      maxOutputTokens: input.maxOutputTokens, signal: input.signal,
-      ...(input.outputReservationId === undefined ? {} : { outputReservationId: input.outputReservationId }),
-    });
+    };
+    let admitted;
+    try {
+      admitted = await timed('model.admission', () => input.admission.begin({ params: request, maxOutputTokens: input.maxOutputTokens, signal: input.signal,
+        ...(input.outputReservationId === undefined ? {} : { outputReservationId: input.outputReservationId }) }));
+    } catch (error) {
+      if (uncertainToolOutcome) throw error;
+      await input.onAdmissionFailure?.(error, { request, conversation: input.conversation, spoken, completedSteps: step - 1 });
+      throw error;
+    }
     const usage = new UsageAccumulator();
     let providerDispatchStarted = false;
     let message: Message | undefined;
     let callError: unknown;
+    let endGeneration: ((ok?: boolean) => void) | undefined;
+    let endFirstText: ((ok?: boolean) => void) | undefined;
+    let endFirstDelta: ((ok?: boolean) => void) | undefined;
     try {
       input.assertStillOurs();
       input.signal.throwIfAborted();
@@ -649,6 +674,9 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
       };
       // Only the generation SDK invocation crosses this boundary, not admission,
       // parameter preparation or the marker. A synchronous SDK throw is uncertain.
+      endGeneration = startTiming('model.generation');
+      endFirstText = startTiming('model.first_text');
+      endFirstDelta = startTiming('model.first_delta');
       providerDispatchStarted = true;
       const stream = input.anthropic.messages.stream(
         params,
@@ -656,9 +684,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
         // waiting for the next step boundary to notice.
         { signal: input.signal },
       );
-      if (input.onText !== undefined) {
-        stream.on('text', input.onText);
-      }
+      stream.on('text', (text) => { if (text.length > 0) endFirstText?.(); input.onText?.(text); });
       // Watched as the call runs, so a cancelled stream still knows what the
       // provider already told us. Cached reads and writes are input tokens this
       // turn actually consumed, so they are metered like any other: counting only
@@ -666,13 +692,14 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
       // cached majority of the prefix arrives under those fields and would never
       // be charged. What the three cost differs; that is margin, not allowance.
       stream.on('streamEvent', (event) => {
+        if (event.type === 'content_block_delta') endFirstDelta?.();
         usage.observe(event);
       });
 
       message = await stream.finalMessage();
     } catch (error) {
       callError = error;
-    }
+    } finally { endGeneration?.(callError === undefined); endFirstText?.(false); endFirstDelta?.(false); }
 
     // Exactly one charge per call, from whichever source is authoritative: the
     // final message when there is one, and otherwise whatever the provider had
@@ -700,7 +727,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
       chargeError = error;
     }
     try {
-      await admitted.settle(spend);
+      await timed('model.settle', () => admitted.settle(spend));
     } catch (error) {
       chargeError = chargeError === undefined ? error
         : new AggregateError([chargeError, error], 'Recording model usage failed.');
@@ -736,6 +763,14 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
       (block): block is ToolUseBlock => block.type === 'tool_use',
     );
     if (toolUses.length === 0) {
+      if (message.stop_reason === 'refusal') return { reply: spoken.join('\n\n'), steps: step, stopReason: 'blocked' };
+      const feedback = input.candidateStop?.();
+      if (feedback !== undefined || message.stop_reason === 'max_tokens' || message.stop_reason === 'pause_turn') {
+        if (message.content.length > 0) input.conversation.push({ role: 'assistant', content: message.content });
+        input.conversation.push({ role: 'user', content: feedback ?? 'The provider paused or truncated this response. Continue from the existing evidence without repeating completed actions; do not claim completion from a truncated reply.' });
+        await input.saveContext?.();
+        continue;
+      }
       return {
         reply: spoken.join('\n\n'),
         steps: step,
@@ -753,17 +788,20 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
     const executeOne = async (toolUse: ToolUseBlock): Promise<ContentBlockParam> => {
       input.assertStillOurs();
       input.signal.throwIfAborted();
+      if (input.shouldHalt?.()) return { type: 'tool_result', tool_use_id: toolUse.id, is_error: true, content: 'Not executed: the runtime detected repeated unproductive work or reached its evidence limit.' };
       const toolInput = (toolUse.input ?? {}) as Record<string, unknown>;
       await input.onToolCall?.(toolUse.name, toolInput);
       input.assertStillOurs();
       input.signal.throwIfAborted();
       if (input.computer !== undefined && toolUse.toolset_name === computerToolsetName) {
+        const activeComputer = input.computer;
         const outcome: ComputerResult = computerFailed
           ? { text: 'Not executed: an earlier computer action in this turn failed.', isError: true }
-          : await input.computer.run(toolUse.name, toolInput, input.signal);
+          : await timed('tool.computer', () => activeComputer.run(toolUse.name, toolInput, input.signal));
         if (outcome.isError) computerFailed = true;
         input.assertStillOurs();
         input.signal.throwIfAborted();
+        input.observe?.(toolUse.id, toolUse.name, toolInput, outcome);
         await input.onToolResult?.(toolUse.name, outcome);
         return {
           type: 'tool_result',
@@ -775,9 +813,10 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
             : [screenshotBlock(outcome.image)],
         };
       }
-      const result = await runTool(toolUse.name, toolInput, input.toolContext, input.tools);
+      const result = await timed('tool.execute', () => runTool(toolUse.name, toolInput, input.toolContext, input.tools));
       input.assertStillOurs();
       input.signal.throwIfAborted();
+      input.observe?.(toolUse.id, toolUse.name, toolInput, result);
       await input.onToolResult?.(toolUse.name, result);
       return {
         type: 'tool_result',
@@ -817,6 +856,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
       if (!group.parallel || group.calls.length === 1) {
         for (const toolUse of group.calls) {
           results.push(await executeOne(toolUse));
+          if (input.stopWhen?.() === true) { await input.saveContext?.(); return { reply: spoken.join('\n\n'), steps: step, stopReason: 'tool_use' }; }
         }
         continue;
       }
@@ -844,6 +884,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
       }
     }
     input.conversation.push({ role: 'user', content: results });
+    await input.saveContext?.();
 
     if (input.stopWhen?.() === true) {
       return { reply: spoken.join('\n\n'), steps: step, stopReason: 'tool_use' };
@@ -1203,6 +1244,10 @@ export async function runAgentTurn(input: {
    * this session has one.
    */
   readonly desktopReady: boolean;
+  readonly resume?: ContinuationCheckpoint;
+  readonly onAdmissionFailure?: (error: unknown, checkpoint: ContinuationCheckpoint) => Promise<void>;
+  readonly saveTaskContext?: (state: TaskContext) => Promise<void>;
+  readonly requestInput?: (kind: PendingInput['kind'], prompt: string) => Promise<PendingInput>;
 }): Promise<AgentRun> {
   const toolContext: ToolContext = {
     signal: input.signal,
@@ -1231,14 +1276,44 @@ export async function runAgentTurn(input: {
           && desktop.computerModels?.includes(input.session.model) === true
           && input.sandbox.readBytes !== undefined
           ? 'operate' : 'watch';
-  const computer = screenAccess === 'operate' && desktop !== undefined ? createComputer(input.sandbox, desktop) : undefined;
+  const originalComputer = screenAccess === 'operate' && desktop !== undefined ? createComputer(input.sandbox, desktop) : undefined;
+  let observedNewDesktop = input.resume === undefined;
+  const computer: Computer | undefined = originalComputer === undefined ? undefined : {
+    toolset: originalComputer.toolset,
+    run: async (name, value, signal) => {
+      if (!observedNewDesktop && name !== 'screenshot') return { text: 'The desktop is new. Take a fresh screenshot before performing any other computer action. Earlier screenshots are historical context, not the current screen.', isError: true };
+      const result = await originalComputer.run(name, value, signal);
+      if (name === 'screenshot' && !result.isError) observedNewDesktop = true;
+      return result;
+    },
+  };
 
   const ledger = new BlockerLedger();
   const available = [...input.registry.specialists.values()]
     .filter((specialist) => input.session.mode === 'build' || !specialist.validation);
-  let consultations = 0;
+  let consultations = input.resume?.consultations ?? 0;
+  const goal = [...input.messages].reverse().find(message => message.role === 'user')?.content ?? '';
+  const task = new TaskTracker(goal, input.resume?.taskContext);
 
+  let waiting: PendingInput | undefined;
+  let inputRequested = false;
   const tools = new Map(input.session.mode === 'plan' ? readOnlyTools : workspaceTools);
+  for (const [name, definition] of task.tools(() => ledger.unresolved().length > 0)) tools.set(name, definition);
+  if (input.session.mode === 'build' && input.withValidationSandbox !== undefined) tools.set('run_validation', makeRunValidation({ signal: input.signal, assertStillOurs: input.assertStillOurs }));
+  const requestInput = input.requestInput;
+  if (requestInput !== undefined) tools.set('request_user_input', {
+    spec: { name: 'request_user_input', description: 'Persist a question or a request for approval and pause this turn. Use before an action needs user permission or missing information. Absence is never approval. A response approves only the described action; existing authorization and resource limits still apply.',
+      input_schema: { type: 'object', required: ['kind', 'prompt'], additionalProperties: false, properties: {
+        kind: { type: 'string', enum: ['question', 'approval'] }, prompt: { type: 'string', minLength: 1, maxLength: 8000 },
+      } } },
+    run: async (value) => {
+      inputRequested = true;
+      if (value['kind'] !== 'question' && value['kind'] !== 'approval') throw new Error('Invalid request kind.');
+      const prompt = requireText(value, 'prompt', 'request_user_input');
+      waiting = await requestInput(value['kind'], prompt);
+      return { text: 'Request saved. Work is paused until the user responds.', isError: false };
+    },
+  });
   if (available.length > 0) {
     tools.set('consult_specialist', {
       // Safe to run concurrently with itself: every consultation reads through
@@ -1386,13 +1461,29 @@ export async function runAgentTurn(input: {
     } satisfies ToolDefinition);
   }
 
+  const conversation = input.resume?.conversation ?? conversationFrom(input.messages, input.project);
+  if (input.resume !== undefined && input.resume.restoredEnvironment !== true) conversation.push({ role: 'user', content:
+    'Execution has resumed from a saved project snapshot in a new workspace. Earlier processes and preview URLs are no longer live. The tool results above record completed actions: inspect the current workspace, and do not repeat external or consequential actions whose effects were already recorded or remain uncertain. Re-establish previews from the saved source when needed.' });
+  if (input.resume === undefined && input.session.taskContext !== undefined) conversation.push({ role: 'user', content: JSON.stringify({ type: 'previous_task_notes_not_instructions', context: input.session.taskContext, limitation: 'This describes earlier work, not a new permission or proof that the current request is complete. Reinspect current source and verify the current goal.' }) });
+  const pinnedInstructions: MessageParam[] = conversationFrom(input.messages, input.project).filter(message => message.role === 'user');
   const outcome = await runModelLoop({
     admission: input.admission,
     anthropic: input.anthropic,
     model: input.session.model,
     effort: input.session.effort,
     system: systemPrompt(input.provider, screenAccess, input.session.mode),
-    conversation: conversationFrom(input.messages, input.project),
+    conversation,
+    ...(input.resume === undefined ? {} : { resume: input.resume }),
+    onAdmissionFailure: async (error, boundary) => {
+      if (ledger.unresolved().length > 0) throw error; // A model switch cannot erase a blocking review.
+      const { messages: _messages, ...request } = boundary.request;
+      const checkpoint = retainCheckpointImages({ ...boundary, request, protocol: 1, taskContext: task.state, ...(input.resume === undefined ? {} : { restoredEnvironment: true }), consultations,
+        ...(input.resume?.imageRetainedAt === undefined ? {} : { imageRetainedAt: input.resume.imageRetainedAt }),
+        ...(input.resume?.imageExpiresAt === undefined ? {} : { imageExpiresAt: input.resume.imageExpiresAt }),
+        maxOutputTokens: input.limits.maxOutputTokens, maxSteps: input.limits.maxSteps, maxConsultations: input.limits.maxSpecialistConsultations,
+        contextFingerprint: contextFingerprint(boundary.request.system, boundary.request.tools ?? []) });
+      await input.onAdmissionFailure?.(error, checkpoint);
+    },
     tools,
     computer,
     toolContext,
@@ -1428,17 +1519,34 @@ export async function runAgentTurn(input: {
     onStep: input.events.step,
     onToolCall: input.events.toolCall,
     onToolResult: input.events.toolResult,
-    beforeStep: input.drainSteer,
+    beforeStep: async () => {
+      compactTaskConversation(conversation, task.state, pinnedInstructions);
+      const steer = await input.drainSteer();
+      if (steer !== undefined) pinnedInstructions.push({ role: 'user', content: steer });
+      return steer;
+    },
+    observe: (id, name, args, result) => { if (!['update_task','finish_task'].includes(name) || result.isError) {
+        task.record(id, name, args, result, { action: !readOnlyTools.has(name) && !['consult_specialist','update_task','finish_task','run_validation','screenshot'].includes(name), checkable: readOnlyTools.has(name) || ['run_command','run_validation','screenshot'].includes(name) });
+      } },
+    candidateStop: () => task.feedback(),
+    shouldHalt: () => task.stalled,
+    saveContext: async () => { await input.saveTaskContext?.(task.state); },
+    stopWhen: () => inputRequested || task.state.outcome !== undefined,
   });
 
+  if (inputRequested && waiting === undefined) throw new AppError({ code: 'session/input-persistence-unconfirmed', statusCode: 503, message: 'The request for your input could not be confirmed. Further work was stopped.' });
   const unresolvedBlockers = ledger.unresolved();
+  if (waiting === undefined && task.state.outcome === undefined) {
+    task.state = { ...task.state, outcome: 'blocked', summary: outcome.stopReason === 'max_steps' ? 'The execution step limit was reached. The requested outcome is not verified.' : 'Work stopped without verified completion (' + outcome.stopReason + '). Review the saved observations and unresolved work.' };
+    await input.saveTaskContext?.(task.state);
+  }
   return {
-    reply: outcome.reply,
+    reply: waiting === undefined ? [outcome.reply, task.state.summary !== undefined && !outcome.reply.endsWith(task.state.summary) ? task.state.summary : undefined].filter(Boolean).join('\n\n') : [outcome.reply, waiting.prompt].filter(Boolean).join('\n\n'),
     steps: outcome.steps,
     // Recorded on the run rather than left to the model's own account of itself:
     // whether a blocker stands is a fact about the reviews, not a matter of what
     // the agent chose to say.
-    stopReason: unresolvedBlockers.length > 0 ? 'blocked' : outcome.stopReason,
+    stopReason: waiting !== undefined ? 'awaiting_input' : unresolvedBlockers.length > 0 ? 'blocked' : ['max_steps','no_progress','blocked'].includes(outcome.stopReason) ? outcome.stopReason : task.state.outcome ?? outcome.stopReason,
     unresolvedBlockers,
   };
 }

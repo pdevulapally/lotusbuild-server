@@ -9,6 +9,10 @@ api.lotusbuild.co.uk {
 
 	# `encode` only touches responses, so the Stripe webhook still verifies:
 	# its signature is over the raw request body, which is proxied untouched.
+	# SSE is flushed immediately by Caddy for text/event-stream. Stream closure,
+	# including a proxy reload/timeout, only disconnects the observer. Commands
+	# commit in Firestore and the separate runner never depends on this socket.
+	# Do not enable upstream POST retries: clients retry using Idempotency-Key.
 	reverse_proxy 127.0.0.1:4100 {
 		# Replace rather than append. Caddy's default appends the real peer to
 		# whatever X-Forwarded-For the client sent, and Fastify runs with

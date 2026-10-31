@@ -1,3 +1,4 @@
+import { AppError } from '../src/http/errors.ts';
 import assert from 'node:assert/strict';
 import { inspect } from 'node:util';
 import test from 'node:test';
@@ -171,7 +172,7 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
   const events: string[] = [];
   let activeSignal: AbortSignal | undefined;
   let cancelListener: ((event: { type: string }) => void) | undefined;
-  let leaseValid = true;
+  let leaseValid = true; let cancelled = false;
   const running = { externalId: 'vm-fixture', lifetime: async () => ({ startedAt: new Date(Date.now() - 1000), endAt: new Date(Date.now() + 59000) }),
     stopCommands: async () => { events.push('stop-commands'); },
     runCommand: async (_command: string, options: { signal?: AbortSignal }) => {
@@ -206,7 +207,7 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
     leaseToken: 'lease', reservationIds: [], specialistReservationIds: [] };
   const sessions = {
     requireWorkspaceSalvage: async () => { events.push('salvage-required'); },
-    claim: async () => session, heartbeat: async () => { if (!leaseValid) throw new Error('Lease authority lost'); }, assertPersistenceLease: async () => {}, attachSandbox: async () => {},
+    claim: async () => session, heartbeat: async () => { if (!leaseValid) throw new Error('Lease authority lost'); }, assertPersistenceLease: async () => { if (cancelled) throw new AppError({ code: 'session/cancelled', statusCode: 409, message: 'Cancelled by user' }); }, markExecutionStarted: async () => {}, attachSandbox: async () => {},
     detachSandbox: async () => { events.push('detach'); }, drainSteerMessage: async () => undefined,
     listMessages: async () => [{ role: 'user', content: 'Build', seq: 0 }],
     reserveSpecialistTokens: async (_id: string, _runner: string, input: { meterKey: string; quantity: number; operationId: string }) =>
@@ -233,7 +234,7 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
     log: { info: capture, warn: capture, error: capture },
   } as unknown as RunnerDependencies;
   return { runner: new SessionRunner(deps), shutdown, entered, events, data, logs, sessions, running, adapter, signal: () => activeSignal, calls: () => calls,
-    cancel: () => cancelListener?.({ type: 'session.cancel_requested' }), loseLease: () => { leaseValid = false; } };
+    cancel: () => { cancelled = true; cancelListener?.({ type: 'session.cancel_requested' }); }, loseLease: () => { leaseValid = false; } };
 }
 
 test('detachment failure logs safe diagnostics while retaining existing cleanup behavior', async () => {
@@ -329,3 +330,21 @@ for (const mode of ['model', 'command', 'queue', 'save-failure'] as const) {
     }
   });
 }
+
+
+test('a restarted worker never replays a turn whose execution already began', async () => {
+  const h = runnerFixture('command');
+  const original = await h.sessions.claim();
+  h.sessions.claim = async () => ({ ...original, executionStarted: true });
+  await h.runner.runOnce();
+  assert.equal(h.calls(), 0); assert.equal(h.events.includes('finish'), true);
+  assert.equal(h.events.includes('dequeue'), false);
+});
+
+test('a restarted worker preserves an unanswered request without calling the model', async () => {
+  const h = runnerFixture('command');
+  const original = await h.sessions.claim();
+  h.sessions.claim = async () => ({ ...original, pendingInput: { id: 'request', kind: 'approval', prompt: 'Publish?' } });
+  await h.runner.runOnce();
+  assert.equal(h.calls(), 0); assert.equal(h.events.includes('finish'), true);
+});

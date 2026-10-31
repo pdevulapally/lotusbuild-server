@@ -46,11 +46,11 @@ const sharedSpec = {
     { min: 5, max: 3600 },
   ),
   SESSION_EVENT_RETENTION_SECONDS: asInteger(
-    'how long after its last event a session log stays in Redis for reconnecting clients',
+    'how long progress events remain available for reconnecting clients',
     { min: 60, max: 604800 },
   ),
   SESSION_EVENT_MAX_PER_SESSION: asInteger(
-    'ceiling on events held per session, bounding what one runaway build can occupy in Redis',
+    'ceiling on durable progress events held per session',
     { min: 100, max: 100000 },
   ),
   FIREBASE_STORAGE_BUCKET: asString('bucket holding the saved git repository for every project'),

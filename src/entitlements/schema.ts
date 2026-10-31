@@ -1,3 +1,4 @@
+import { parseFallbackPolicy, type FallbackPolicy } from './fallback.ts';
 import { isIP } from 'node:net';
 import {
   DocumentShapeError,
@@ -137,6 +138,7 @@ export interface SpecialistDefinition {
 }
 
 export interface Registry {
+  readonly fallback?: FallbackPolicy;
   /** Applied when a user has no subscription. Configuration, not a fallback. */
   readonly defaultPlanKey: string;
   /** Which meter records sandbox wall-clock time, for the allowance invariant. */
@@ -473,7 +475,9 @@ export function parseRegistry(fields: Fields, where: string): Registry {
     );
   }
 
+  const fallback = parseFallbackPolicy(fields['fallback'], `${where}.fallback`, meters, [inputTokenMeterKey, outputTokenMeterKey, buildMeterKey, sandboxTimeMeterKey, storageMeterKey]);
   return {
+    ...(fallback === undefined ? {} : { fallback }),
     defaultPlanKey,
     sandboxTimeMeterKey,
     buildMeterKey,

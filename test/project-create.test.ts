@@ -23,7 +23,7 @@ function harness() {
   return { app, created };
 }
 
-const headers = { authorization: 'Bearer token' };
+const headers = { authorization: 'Bearer token', 'idempotency-key': 'stable-test-command-1' };
 
 test('a project is created without the caller choosing a platform', async (t) => {
   const h = harness();

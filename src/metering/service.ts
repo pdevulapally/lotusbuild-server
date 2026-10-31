@@ -14,7 +14,7 @@ import { EntitlementConfigError } from '../entitlements/values.ts';
 import { AppError } from '../http/errors.ts';
 import { enumField, integerField, stringField, timestampField } from '../support/documents.ts';
 import { usersCollectionPath } from '../users/repository.ts';
-import { periodStartFor } from './periods.ts';
+import { periodStartFor, periodEndFor } from './periods.ts';
 
 /** `users/{uid}/usage/{meterKey}` — one document per meter the user has touched. */
 export const usageCollectionName = 'usage';
@@ -177,6 +177,7 @@ export class MeteringService {
         reserved: state.reserved,
         requested,
         resetPeriod: meter.resetPeriod,
+        resetAt: periodEndFor(meter, periodStart)?.toISOString(),
         periodStart: periodStart.toISOString(),
         plan: entitlements.planKey,
       },
@@ -428,6 +429,28 @@ export class MeteringService {
    * less and settling more would let a plan be overspent by exactly the amount
    * nobody predicted, which is the amount that matters.
    */
+  /** A queue admission check, using the same window, reservations and hard ceiling as dispatch. */
+  async assertAvailable(input: { readonly uid: string; readonly entitlements: UserEntitlements; readonly meterKey: string; readonly quantity: number; readonly now: Date }): Promise<void> {
+    await this.#firestore.runTransaction((transaction) => this.assertAvailableIn(transaction, input));
+  }
+
+  async assertAvailableIn(transaction: Transaction, input: {
+    readonly uid: string; readonly entitlements: UserEntitlements; readonly meterKey: string; readonly quantity: number; readonly now: Date;
+  }): Promise<void> { await this.#availableIn(transaction, input, true); }
+
+  async #availableIn(transaction: Transaction, input: {
+    readonly uid: string; readonly entitlements: UserEntitlements; readonly meterKey: string; readonly quantity: number; readonly now: Date;
+  }, allowZero = false) {
+    if (!(allowZero && input.quantity === 0)) this.#assertPositive(input.quantity, input.meterKey);
+    const { meter, limit } = await this.#resolve(input.entitlements, input.meterKey);
+    const ref = this.#usageRef(input.uid, input.meterKey);
+    const snapshot = await transaction.get(ref);
+    const periodStart = periodStartFor(meter, input.now);
+    const state = this.#state(snapshot, periodStart, ref.path);
+    if (state.consumed + state.reserved + input.quantity > limit.hardLimit) throw this.#exceeded(input.entitlements, meter, limit, state, input.quantity, periodStart);
+    return { meter, ref, state, periodStart };
+  }
+
   async reserveIn(
     transaction: Transaction,
     input: {
@@ -439,23 +462,8 @@ export class MeteringService {
       readonly now: Date;
     },
   ): Promise<Reservation> {
-    this.#assertPositive(input.quantity, input.meterKey);
-    const { meter, limit } = await this.#resolve(input.entitlements, input.meterKey);
-
-    const usageRef = this.#usageRef(input.uid, input.meterKey);
-    // Firestore generates this locally, so the id exists before anything is
-    // written and a caller can commit it alongside its own record of the hold.
-    const reservationRef = this.#firestore
-      .collection(`${usersCollectionPath}/${input.uid}/${reservationsCollectionName}`)
-      .doc();
-
-    const snapshot = await transaction.get(usageRef);
-    const periodStart = periodStartFor(meter, input.now);
-    const state = this.#state(snapshot, periodStart, usageRef.path);
-
-    if (state.consumed + state.reserved + input.quantity > limit.hardLimit) {
-      throw this.#exceeded(input.entitlements, meter, limit, state, input.quantity, periodStart);
-    }
+    const { meter, ref: usageRef, state, periodStart } = await this.#availableIn(transaction, input);
+    const reservationRef = this.#firestore.collection(`${usersCollectionPath}/${input.uid}/${reservationsCollectionName}`).doc();
 
     transaction.set(usageRef, {
       meterKey: meter.key,

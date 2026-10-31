@@ -1,3 +1,4 @@
+import { commandTransaction } from '../sessions/commands.ts';
 import { FieldValue, type Firestore, type Transaction } from 'firebase-admin/firestore';
 
 import type { ConfigurationStore } from '../entitlements/store.ts';
@@ -171,7 +172,7 @@ export class ProjectRepository {
    * arriving together both see the old total and both succeed, so the plan limit
    * a customer pays for is bypassed by the simplest possible retry.
    */
-  async create(ownerUid: string, input: NewProject): Promise<Project> {
+  async create(ownerUid: string, input: NewProject, commandId?: string): Promise<Project> {
     this.#validateName(input.name);
     const entitlements = await this.#entitlements.forUser(ownerUid);
 
@@ -191,7 +192,13 @@ export class ProjectRepository {
     const ref = this.#firestore.collection(projectsCollectionPath).doc();
     const userRef = this.#users.refFor(ownerUid);
 
-    const createdAt = await this.#firestore.runTransaction(async (transaction) => {
+    return commandTransaction({ db: this.#firestore, parent: userRef, uid: ownerUid, key: commandId,
+      input: ['create-project', input.name, input.description ?? null, input.platform],
+      encode: (project) => ({ id: project.id }),
+      decode: (value, transaction) => {
+        if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid project receipt.');
+        return this.readOwnedInTransaction(transaction, ownerUid, stringField(value as Fields, 'id', 'command'));
+      }, work: async (transaction): Promise<Project> => {
       const user = await this.#users.readInTransaction(transaction, ownerUid);
 
       if (user.projectCount >= limit) {
@@ -218,9 +225,6 @@ export class ProjectRepository {
         updatedAt: FieldValue.serverTimestamp(),
       });
 
-      return new Date();
-    });
-
     return {
       id: ref.id,
       ownerUid,
@@ -231,8 +235,9 @@ export class ProjectRepository {
       snapshotBytes: 0,
       snapshot: { kind: 'none' },
       activeSessionId: null,
-      createdAt,
+      createdAt: new Date(),
     };
+    } });
   }
 
   /**
@@ -329,6 +334,10 @@ export class ProjectRepository {
         await this.#eraseSessionEvents(session.id);
         await this.#firestore.recursiveDelete(session.ref.collection(messagesCollectionName));
         await this.#firestore.recursiveDelete(session.ref.collection('queued_messages'));
+        await this.#firestore.recursiveDelete(session.ref.collection('commands'));
+        await this.#firestore.recursiveDelete(session.ref.collection('session_events'));
+        await this.#firestore.recursiveDelete(session.ref.collection('input_requests'));
+        await this.#firestore.recursiveDelete(session.ref.collection('continuations'));
         await session.ref.delete();
       }
     }
@@ -343,6 +352,7 @@ export class ProjectRepository {
     if (deletingProject.snapshotUploadId === undefined) await this.#snapshots.removeStored(projectId, deletingProject.snapshot);
     await this.#snapshots.eraseProjectContent(projectId);
 
+    await this.#firestore.recursiveDelete(ref.collection('commands'));
     await this.#firestore.runTransaction(async (transaction) => {
       const snapshot = await transaction.get(ref);
       if (!snapshot.exists) return; // A concurrent deletion already finalized.

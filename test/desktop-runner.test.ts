@@ -1,3 +1,4 @@
+import { AppError } from '../src/http/errors.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Sandbox } from 'e2b';
@@ -157,7 +158,7 @@ function runnerFixture(options: { desktop: boolean; startDesktop?: (signal?: Abo
   const emitted: { type: string; data: Record<string, unknown> }[] = [];
   const handoffCalls: { call: string; sessionId: string; handoff?: DesktopHandoff; ttl?: number }[] = [];
   let cancelListener: ((event: { type: string }) => void) | undefined;
-  let modelCalls = 0;
+  let modelCalls = 0; let cancelled = false;
   const startDesktop = options.startDesktop ?? (async () => ({ host: '6080-abcdefghij1234567890x.e2b.test', token: 'traffic-token-fixture' }));
   const running = {
     externalId: 'vm-fixture', lifetime: async () => ({ startedAt: new Date(Date.now() - 1000), endAt: new Date(Date.now() + 59000) }),
@@ -174,7 +175,7 @@ function runnerFixture(options: { desktop: boolean; startDesktop?: (signal?: Abo
   const session = { id: 's', projectId: 'p', ownerUid: 'u', model: entitlements.capabilities.stringList('ai.model.allowlist')[0],
     leaseToken: 'lease', reservationIds: [], specialistReservationIds: [] };
   const sessions = {
-    requireWorkspaceSalvage: async () => {}, claim: async () => session, heartbeat: async () => {}, assertPersistenceLease: async () => {},
+    requireWorkspaceSalvage: async () => {}, claim: async () => session, heartbeat: async () => {}, assertPersistenceLease: async () => { if (cancelled) throw new AppError({ code: 'session/cancelled', statusCode: 409, message: 'Cancelled by user' }); }, markExecutionStarted: async () => {},
     attachSandbox: async () => {}, detachSandbox: async () => {}, drainSteerMessage: async () => undefined,
     listMessages: async () => [{ role: 'user', content: 'Build', seq: 0 }],
     reserveSpecialistTokens: async (_id: string, _runner: string, input: { meterKey: string; quantity: number; operationId: string }) =>
@@ -202,7 +203,7 @@ function runnerFixture(options: { desktop: boolean; startDesktop?: (signal?: Abo
     ...(options.withoutHandoffPort === true ? {} : { desktop: handoffPort }),
   } as unknown as RunnerDependencies;
   return { runner: new SessionRunner(deps), order, emitted, handoffCalls, logs, timeoutSeconds: registry.sandboxProviders.get('web')!.timeoutSeconds,
-    cancel: () => cancelListener?.({ type: 'session.cancel_requested' }), modelCalls: () => modelCalls,
+    cancel: () => { cancelled = true; cancelListener?.({ type: 'session.cancel_requested' }); }, modelCalls: () => modelCalls,
     types: () => emitted.map((event) => event.type),
     diagnostics: () => JSON.stringify({ events: emitted, logs: logs.map((entry) => entry.message), order }) };
 }

@@ -9,7 +9,7 @@ export function ledger() {
     delete: async () => { data.delete(path); },
     update: async (fields: Data) => { const old = data.get(path); if (!old) throw new Error('Document missing'); const next = { ...old, ...fields }; for (const [key, value] of Object.entries(next)) if (value instanceof FieldValue && value.isEqual(FieldValue.delete())) delete next[key]; data.set(path, next); },
     collection: (name: string) => collection(`${path}/${name}`) });
-  const collection = (path: string, filters: { key: string; op: string; value: unknown }[] = [], maximum = 100, ordered: string | false = false, after?: string, direction = 'asc') => ({
+  const collection = (path: string, filters: { key: string; op: string; value: unknown }[] = [], maximum = 100, ordered: string | false = false, after?: string | number, direction = 'asc') => ({
     path,
     doc: (id = `id-${++sequence}`) => doc(`${path}/${id}`),
     where: (key: string, op: string, value: unknown) => collection(path, [...filters, { key, op, value }], maximum, ordered, after, direction),
@@ -17,27 +17,27 @@ export function ledger() {
       if (typeof field !== 'string' && !field.isEqual(FieldPath.documentId())) throw new Error('Unsupported ledger field.');
       return collection(path, filters, maximum, typeof field === 'string' ? field : '__name__', after, order);
     },
-    startAfter: (id: string) => {
+    startAfter: (id: string | number) => {
       if (!ordered) throw new Error('Ledger cursor requires document ID order.');
       return collection(path, filters, maximum, ordered, id, direction);
     },
     limit: (size: number) => collection(path, filters, size, ordered, after, direction),
     get: async (source = data) => {
-      const matches = [...source].filter(([key, fields]) => key.startsWith(path + '/') && key.split('/').length === path.split('/').length + 1
+      const matches = [...source].filter(([key, fields]) => (path.startsWith('@group:') ? key.split('/').at(-2) === path.slice(7) : key.startsWith(path + '/') && key.split('/').length === path.split('/').length + 1)
         && filters.every((filter) => filter.op === '==' ? fields[filter.key] === filter.value
           : filter.op === 'in' ? (filter.value as unknown[]).includes(fields[filter.key])
-            : fields[filter.key] instanceof Timestamp && (fields[filter.key] as Timestamp).toMillis() <= (filter.value as Timestamp).toMillis()));
+            : fields[filter.key] instanceof Timestamp && (filter.op === '>' ? (fields[filter.key] as Timestamp).toMillis() > (filter.value as Timestamp).toMillis() : (fields[filter.key] as Timestamp).toMillis() <= (filter.value as Timestamp).toMillis())));
       if (ordered) matches.sort(([left, a], [right, b]) => {
         const comparison = ordered === '__name__' ? Buffer.compare(Buffer.from(left), Buffer.from(right))
-          : (a[ordered] as Timestamp).toMillis() - (b[ordered] as Timestamp).toMillis();
+          : (a[ordered] instanceof Timestamp ? (a[ordered] as Timestamp).toMillis() : Number(a[ordered])) - (b[ordered] instanceof Timestamp ? (b[ordered] as Timestamp).toMillis() : Number(b[ordered]));
         return direction === 'desc' ? -comparison : comparison;
       });
-      const docs = matches.filter(([key]) => after === undefined || Buffer.compare(Buffer.from(key), Buffer.from(`${path}/${after}`)) > 0)
+      const docs = matches.filter(([key, fields]) => after === undefined || (typeof after === 'number' && ordered ? Number(fields[ordered]) > after : Buffer.compare(Buffer.from(key), Buffer.from(`${path}/${after}`)) > 0))
         .slice(0, maximum).map(([key]) => snapshot(doc(key), source));
       return { docs, empty: docs.length === 0, size: docs.length };
     },
   });
-  const db = { doc, collection,
+  const db = { doc, collection, collectionGroup: (name: string) => collection(`@group:${name}`),
     recursiveDelete: async (ref: { path: string }) => { for (const path of data.keys()) if (path === ref.path || path.startsWith(ref.path + '/')) data.delete(path); },
     runTransaction<T>(work: (tx: unknown) => Promise<T>): Promise<T> {
       const result = tail.then(async () => {

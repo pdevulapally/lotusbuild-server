@@ -36,7 +36,7 @@ export const computerToolset: ComputerToolset20260801 = {
 export interface ComputerResult {
   readonly text: string;
   readonly isError: boolean;
-  /** A PNG, for `screenshot` and `zoom`. Never persisted: it lives for the turn. */
+  /** A PNG for `screenshot` and `zoom`. Normally transient; an approved continuation checkpoint may retain it for at most seven days. */
   readonly image?: Buffer;
 }
 

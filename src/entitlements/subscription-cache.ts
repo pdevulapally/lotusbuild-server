@@ -1,3 +1,4 @@
+import { timed } from '../diagnostics/timing.ts';
 import { randomUUID } from 'node:crypto';
 import type { Redis } from 'ioredis';
 
@@ -56,7 +57,7 @@ export class SubscriptionCache {
   }
 
   async read(uid: string): Promise<CachedSubscription | undefined> {
-    const raw = await this.#redis.get(this.#key(uid));
+    const raw = await timed('subscription.redis.read', () => this.#redis.get(this.#key(uid)));
     if (raw === null || raw.startsWith(fillPrefix)) {
       return undefined;
     }
@@ -101,7 +102,7 @@ export class SubscriptionCache {
   /** Acquire before reading Firestore. Other readers may read without filling. */
   async beginFill(uid: string): Promise<string | undefined> {
     const token = `${fillPrefix}${randomUUID()}`;
-    const result = await this.#redis.set(this.#key(uid), token, 'EX', this.#ttlSeconds, 'NX');
+    const result = await timed('subscription.redis.fill', () => this.#redis.set(this.#key(uid), token, 'EX', this.#ttlSeconds, 'NX'));
     if (result !== 'OK' && result !== null) throw new Error('Unexpected subscription cache fill response.');
     return result === 'OK' ? token : undefined;
   }
@@ -117,7 +118,7 @@ export class SubscriptionCache {
             currentPeriodEnd: subscription.currentPeriodEnd.toISOString(),
           } satisfies Wire);
 
-    const result = await this.#redis.eval(completeFill, 1, this.#key(uid), token, payload, this.#ttlSeconds);
+    const result = await timed('subscription.redis.write', () => this.#redis.eval(completeFill, 1, this.#key(uid), token, payload, this.#ttlSeconds));
     if (result !== 0 && result !== 1) throw new Error('Unexpected subscription cache write response.');
   }
 

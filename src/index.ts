@@ -112,6 +112,7 @@ async function main(): Promise<void> {
       config.SESSION_LEASE_SECONDS,
     ),
     sessionEvents: new SessionEvents(redis, subscriber, {
+      firestore: firebase.firestore,
       maxEventBytes: config.SESSION_EVENT_MAX_BYTES,
       retentionSeconds: config.SESSION_EVENT_RETENTION_SECONDS,
       maxPerSession: config.SESSION_EVENT_MAX_PER_SESSION,
