@@ -27,9 +27,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # The release must match the production host's Node major and ABI;
+      # deploy/unpack-release.py rejects any other build runtime.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - run: npm ci --ignore-scripts --no-audit --no-fund

@@ -33,7 +33,8 @@ test('only the owner can change visibility, and a link needs its exact token', a
   assert.match(shareToken!, /^[A-Za-z0-9_-]{32}$/);
   assert.equal((await h.projects.readShared('p', shareToken!)).id, 'p');
   await assert.rejects(h.projects.readShared('p', undefined), { code: 'project/not-found' });
-  await assert.rejects(h.projects.readShared('p', `${shareToken!.slice(0, 31)}x`), { code: 'project/not-found' });
+  const wrongLast = shareToken!.endsWith('x') ? 'y' : 'x';
+  await assert.rejects(h.projects.readShared('p', `${shareToken!.slice(0, 31)}${wrongLast}`), { code: 'project/not-found' });
   const rotated = await h.projects.setVisibility('owner', 'p', 'link', true);
   assert.notEqual(rotated.shareToken, shareToken);
   await assert.rejects(h.projects.readShared('p', shareToken!), { code: 'project/not-found' });
