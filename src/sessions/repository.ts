@@ -124,6 +124,8 @@ export interface BuildSession {
   readonly executionStarted?: boolean | undefined;
   readonly discardQueuedBefore?: Date | undefined;
   readonly workspaceRecovery?: WorkspaceRecovery | undefined;
+  /** Consecutive failed resource recoveries by successor runners; cleared when recovery completes. */
+  readonly recoveryAttempts?: number | undefined;
   /** A late follow-up has not yet been appended or charged as a new turn. */
   readonly queuedTurnPending?: boolean | undefined;
   /** Latest accepted steering instruction, consumed under the runner lease. */
@@ -219,6 +221,8 @@ function parsePendingInput(value: unknown): PendingInput | undefined {
     prompt: stringField(fields, 'prompt', 'pendingInput') };
 }
 
+const RECOVERY_RETRY_CAP_SECONDS = 3600;
+
 function parseSession(id: string, fields: Fields, where: string): BuildSession {
   return {
     id,
@@ -241,6 +245,7 @@ function parseSession(id: string, fields: Fields, where: string): BuildSession {
     executionStarted: fields['executionStarted'] === true ? true : undefined,
     cancelRequested: fields['cancelRequested'] === true ? true : undefined,
     workspaceRecovery: workspaceRecovery(fields, where),
+    recoveryAttempts: fields['recoveryAttempts'] === undefined ? undefined : integerField(fields, 'recoveryAttempts', where, { min: 1 }),
     queuedTurnPending: fields['queuedTurnPending'] === undefined ? undefined : booleanField(fields, 'queuedTurnPending', where),
     pendingSteer: fields['pendingSteer'] === undefined ? undefined : stringField(fields, 'pendingSteer', where),
     pendingSteerAttachments: fields['pendingSteerAttachments'] === undefined ? undefined : attachmentRefsField(fields, 'pendingSteerAttachments', where),
@@ -1553,9 +1558,32 @@ export class SessionRepository {
       transaction.update(ref, {
         sandboxId: FieldValue.delete(),
         reservationIds: FieldValue.delete(),
+        recoveryAttempts: FieldValue.delete(),
         updatedAt: FieldValue.serverTimestamp(),
       });
     }, true);
+  }
+
+  /**
+   * Keeps a session whose resource recovery just failed claimable, but not
+   * every lease. Each failed attempt doubles the wait, capped at an hour, so
+   * one dead session with unreconcilable holds cannot take the runner away
+   * from healthy work once a minute. Nothing is released or marked resolved:
+   * the holds, sandbox record and RUNNING status stay exactly as they were.
+   */
+  async deferRecovery(sessionId: string, authority: SessionLease, now: Date = new Date()): Promise<Date> {
+    let retryAt = now;
+    await this.#withLease(sessionId, authority, (transaction, ref, session) => {
+      const attempts = (session.recoveryAttempts ?? 0) + 1;
+      const waitSeconds = Math.min(this.#leaseSeconds * 2 ** Math.min(attempts, 10), RECOVERY_RETRY_CAP_SECONDS);
+      retryAt = new Date(now.getTime() + waitSeconds * 1000);
+      transaction.update(ref, {
+        recoveryAttempts: attempts,
+        claimableAt: Timestamp.fromDate(retryAt),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    }, true);
+    return retryAt;
   }
 
   /** End lost-workspace execution without discarding or settling unresolved accounting. */

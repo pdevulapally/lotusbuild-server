@@ -461,12 +461,20 @@ export class SessionRunner {
           await sandboxes.recover({ uid: session.ownerUid, platform: project.platform,
             externalSandboxId: session.sandboxId, reservationIds: abandoned, now: new Date(),
             salvageRequired: recovery !== undefined && !['COMPLETED', 'UNRECOVERABLE'].includes(recovery.status),
-            onProblem: () => log.warn({ sessionId: session.id }, 'resource or usage recovery remains pending'),
+            onProblem: (problem) => log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(problem) }, 'resource or usage recovery remains pending'),
           });
           for (const id of session.specialistReservationIds) await sessions.forgetSpecialistReservation(session.id, authority, id);
           await sessions.detachSandbox(session.id, authority);
         } catch (error) {
-          if (recovery?.status !== 'UNRECOVERABLE') throw new RunnerWorkError(error, 'sandbox/recovery-failed');
+          if (recovery?.status !== 'UNRECOVERABLE') {
+            // Still ours to retry, but not every lease: back off so the queue
+            // behind this session keeps moving.
+            let retryAt: Date | undefined;
+            try { retryAt = await sessions.deferRecovery(session.id, authority); }
+            catch (deferError) { log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(deferError) }, 'could not schedule the next recovery attempt'); }
+            log.error({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error), ...(retryAt === undefined ? {} : { retryAt: retryAt.toISOString() }) }, 'sandbox recovery failed');
+            throw new RunnerWorkError(error, 'sandbox/recovery-failed');
+          }
           try { await sessions.finishUnrecoverable(authority); }
           catch { throw new RunnerWorkError(error, 'workspace/terminalization-failed'); }
           log.warn({ sessionId: session.id }, 'unrecoverable execution ended; accounting references retained for reconciliation');
