@@ -465,8 +465,8 @@ test('unknown recovery protocol or shape blocks claims and leaves sandbox and ac
     assert.deepEqual(h.events, events);
   }
   let attempts = 0;
-  const runner = h.runner('B'); const original = runner.runOnce.bind(runner);
-  t.mock.method(runner, 'runOnce', async () => { attempts++; return original(); });
+  const runner = h.runner('B'); const original = runner.start.bind(runner);
+  t.mock.method(runner, 'start', async () => { attempts++; return original(); });
   await assert.rejects(runUntilStopped(runner, { idlePollSeconds: 1, shouldContinue: () => true, log: h.log }),
     { code: 'session/recovery-protocol-incompatible' });
   assert.equal(attempts, 1);

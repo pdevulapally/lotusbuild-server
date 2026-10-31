@@ -196,6 +196,7 @@ async function main(): Promise<void> {
 
       },
       idlePollSeconds: config.RUNNER_IDLE_POLL_SECONDS,
+      concurrency: config.RUNNER_CONCURRENCY,
       shouldContinue: () => !shutdown.signal.aborted,
       signal: shutdown.signal,
       log,

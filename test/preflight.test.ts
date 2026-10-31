@@ -88,6 +88,7 @@ function validEnv(): Record<string, string> {
     RUNNER_IDLE_POLL_SECONDS: '5',
     RUNNER_DRAIN_TIMEOUT_SECONDS: '90',
     RUNNER_HEARTBEAT_SECONDS: '10',
+    RUNNER_CONCURRENCY: '1',
   };
 }
 

@@ -173,6 +173,10 @@ const runnerSpec = {
     'how long the runner waits before looking for work again when there was none',
     { min: 1, max: 300 },
   ),
+  RUNNER_CONCURRENCY: asInteger(
+    'sessions one runner process works at the same time; each holds its own lease, heartbeat and sandbox',
+    { min: 1, max: 16 },
+  ),
   RUNNER_HEARTBEAT_SECONDS: asInteger(
     'how often the runner renews its lease while working; must be well under SESSION_LEASE_SECONDS',
     { min: 1, max: 600 },
