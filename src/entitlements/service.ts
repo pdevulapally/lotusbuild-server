@@ -20,7 +20,7 @@ import {
 } from './schema.ts';
 import type { ConfigurationStore } from './store.ts';
 import type { SubscriptionCache } from './subscription-cache.ts';
-import { EntitlementConfigError, type EntitlementValue } from './values.ts';
+import { EntitlementConfigError, type EntitlementValue, type NumericLimit, unlimited } from './values.ts';
 
 export const subscriptionsCollectionPath = 'subscriptions';
 
@@ -81,8 +81,19 @@ export class ResolvedEntitlements {
     return this.#require(key, 'boolean').value as boolean;
   }
 
+  /** A finite numeric capability. Use `limit()` where "unlimited" is a valid policy. */
   number(key: string): number {
-    return this.#require(key, 'number').value as number;
+    const value = this.#require(key, 'number').value as NumericLimit;
+    if (value === unlimited) {
+      throw new EntitlementConfigError(
+        `Capability "${key}" is unlimited, but this check needs a finite number.`,
+      );
+    }
+    return value;
+  }
+
+  limit(key: string): NumericLimit {
+    return this.#require(key, 'number').value as NumericLimit;
   }
 
   string(key: string): string {

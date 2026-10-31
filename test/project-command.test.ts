@@ -26,3 +26,31 @@ test('a lost project response can be reconciled without duplicating projects or 
   await assert.rejects(projects.create('alice', input, 'stable-project-command'), { code: 'project/not-found' });
   assert.equal([...data.keys()].filter((key) => /^projects\/[a-z0-9-]+$/.test(key)).length, 0);
 });
+
+test('an unlimited project cap admits a fourth project without weakening the counter', async () => {
+  const { db, data } = ledger();
+  data.set('users/alice', { uid: 'alice', email: 'alice@example.test', projectCount: 3 });
+  const capabilities = new ResolvedEntitlements(new Map([
+    ['platform.web', { kind: 'boolean' as const, value: true }], ['projects.max', { kind: 'number' as const, value: 'unlimited' as const }],
+  ]));
+  const entitlements = { forUser: async () => ({ capabilities, planName: 'Free', planKey: 'free' }) } as unknown as EntitlementService;
+  const projects = new ProjectRepository(db, new UserRepository(db), entitlements);
+  const input = { name: 'Fourth', description: undefined, platform: 'web' as const };
+  const [fourth, fifth] = await Promise.all([projects.create('alice', input, 'fourth-project-command'), projects.create('alice', { ...input, name: 'Fifth' }, 'fifth-project-command')]);
+  assert.notEqual(fourth!.id, fifth!.id);
+  assert.equal(data.get('users/alice')?.['projectCount'], 5);
+  assert.throws(() => capabilities.number('projects.max'), { code: 'entitlement/misconfigured' });
+  assert.equal(capabilities.limit('projects.max'), 'unlimited');
+});
+
+test('a finite project cap still rejects the project that would exceed it', async () => {
+  const { db, data } = ledger();
+  data.set('users/alice', { uid: 'alice', email: 'alice@example.test', projectCount: 3 });
+  const capabilities = new ResolvedEntitlements(new Map([
+    ['platform.web', { kind: 'boolean' as const, value: true }], ['projects.max', { kind: 'number' as const, value: 3 }],
+  ]));
+  const entitlements = { forUser: async () => ({ capabilities, planName: 'Pro', planKey: 'pro' }) } as unknown as EntitlementService;
+  const projects = new ProjectRepository(db, new UserRepository(db), entitlements);
+  await assert.rejects(projects.create('alice', { name: 'Fourth', description: undefined, platform: 'web' as const }, 'fourth-project-command'),
+    { code: 'project/limit-reached' });
+});

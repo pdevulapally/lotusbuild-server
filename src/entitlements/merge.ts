@@ -1,4 +1,6 @@
 import {
+  type NumericLimit,
+  unlimited,
   EntitlementConfigError,
   type EntitlementValue,
   type EntitlementValueKind,
@@ -65,7 +67,8 @@ const strategies: Readonly<Record<MergeStrategy, StrategyDefinition>> = {
     supports: ['number'],
     fold: (left, right) => ({
       kind: 'number',
-      value: (left.value as number) + (right.value as number),
+      value: left.value === unlimited || right.value === unlimited
+        ? unlimited : (left.value as number) + (right.value as number),
     }),
   },
   // On a boolean this is OR: any source may grant, none may take away.
@@ -74,7 +77,8 @@ const strategies: Readonly<Record<MergeStrategy, StrategyDefinition>> = {
     fold: (left, right) =>
       left.kind === 'boolean'
         ? { kind: 'boolean', value: (left.value as boolean) || (right.value as boolean) }
-        : { kind: 'number', value: Math.max(left.value as number, right.value as number) },
+        : { kind: 'number', value: left.value === unlimited || right.value === unlimited
+          ? unlimited : Math.max(left.value as number, right.value as number) },
   },
   // On a boolean this is AND: any source may withhold, none may grant.
   MIN: {
@@ -82,7 +86,8 @@ const strategies: Readonly<Record<MergeStrategy, StrategyDefinition>> = {
     fold: (left, right) =>
       left.kind === 'boolean'
         ? { kind: 'boolean', value: (left.value as boolean) && (right.value as boolean) }
-        : { kind: 'number', value: Math.min(left.value as number, right.value as number) },
+        : { kind: 'number', value: left.value === unlimited ? (right.value as NumericLimit)
+          : right.value === unlimited ? (left.value as NumericLimit) : Math.min(left.value as number, right.value as number) },
   },
   UNION: {
     supports: ['stringList'],

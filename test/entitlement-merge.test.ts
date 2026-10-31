@@ -91,3 +91,13 @@ test('resolving with no contributions is refused rather than returning a default
   // Falling back here would invent an entitlement nobody granted.
   assert.throws(() => resolveCapability(capability('MAX', 'number'), []));
 });
+
+test('an unlimited cap is explicit: MAX keeps it, MIN yields to the finite cap, ADD cannot exceed it', () => {
+  const unlimited = { kind: 'number', value: 'unlimited' } as const;
+  const max = resolveCapability(capability('MAX', 'number'), [from('plan', 0, unlimited), from('grant', 1, number(25))]);
+  assert.equal(max.value, 'unlimited');
+  const min = resolveCapability(capability('MIN', 'number'), [from('plan', 0, unlimited), from('cap', 1, number(2))]);
+  assert.equal(min.value, 2);
+  const add = resolveCapability(capability('ADD', 'number'), [from('plan', 0, number(3)), from('grant', 1, unlimited)]);
+  assert.equal(add.value, 'unlimited');
+});
