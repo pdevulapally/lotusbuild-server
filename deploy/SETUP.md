@@ -224,3 +224,43 @@ instances outside these two managed units before activating the new protocol;
 this single-host deployment cannot stop an external fleet or constrain manual
 administrator actions. No live unit, override or production state was verified
 by the repository tests.
+
+### Fallback lane and OpenRouter (optional)
+
+The free-to-user continuation lane only exists when the registry document
+(`config/registry`) carries a `fallback` block; without it every exhausted
+premium task pauses as `UNAVAILABLE`, which is the intended default. The
+block names exactly one provider and model — nothing is supplied by code:
+
+```json
+"fallback": {
+  "provider": "openrouter",              // or "anthropic"
+  "model": "<exact model id from the provider's catalog>",
+  "effort": "low",
+  "eligiblePlanKeys": ["free"],
+  "inputTokenMeterKey": "ai.fallback.input_tokens",
+  "outputTokenMeterKey": "ai.fallback.output_tokens",
+  "maxPremiumDispatches": 1,
+  "capacityRetrySeconds": 120,
+  "maxCheckpointBytes": 262144,
+  "maxOutputTokens": 8192
+}
+```
+
+Both meters must exist in the registry and be distinct from the premium
+meters; the eligible plans need a bounded, non-overage limit on each.
+
+`provider: "openrouter"` additionally needs, in the runner's `.env`:
+
+```
+OPENROUTER_API_KEY=...
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+```
+
+Set both or neither — preflight rejects one without the other. With neither,
+an `openrouter` policy makes the lane report "provider not set up" instead of
+silently using Anthropic. The runner admits an OpenRouter model only if the
+live `/models` catalog lists it with tool calling; the frontend never sees
+model IDs that are not configured. OpenRouter has no token counter, so each
+fallback call reserves a deliberate over-estimate and settles from the
+stream's reported usage.

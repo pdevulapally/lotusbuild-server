@@ -599,3 +599,18 @@ test('release protocol preflight rejects missing, malformed and future manifests
   writeFileSync(join(root, 'release.json'), JSON.stringify({ runnerRecoveryProtocol: runnerRecoveryProtocol() }));
   assertReleaseRecoveryProtocol(url);
 });
+
+test('OpenRouter credentials are optional, but the key and base URL must be set together', async () => {
+  const neither = await runPreflight(baseDeps({ env: withEnv({ OPENROUTER_API_KEY: undefined, OPENROUTER_BASE_URL: undefined }) }));
+  assert.equal(neither.ok, true);
+  const both = await runPreflight(baseDeps({ env: withEnv({ OPENROUTER_API_KEY: 'sk-or-test', OPENROUTER_BASE_URL: 'https://openrouter.ai/api/v1' }) }));
+  assert.equal(both.ok, true);
+  for (const partial of [{ OPENROUTER_API_KEY: 'sk-or-test' }, { OPENROUTER_BASE_URL: 'https://openrouter.ai/api/v1' }]) {
+    const result = await runPreflight(baseDeps({ env: withEnv(partial) }));
+    assert.equal(result.ok, false);
+    assert.ok(!result.ok && result.stage === 'config');
+    assert.ok(!result.ok && result.problems.some((p) => p.includes('OPENROUTER_API_KEY') && p.includes('OPENROUTER_BASE_URL') && !p.includes('sk-or-test')));
+  }
+  const insecure = await runPreflight(baseDeps({ env: withEnv({ OPENROUTER_API_KEY: 'sk-or-test', OPENROUTER_BASE_URL: 'http://openrouter.ai/api/v1' }) }));
+  assert.ok(!insecure.ok && insecure.stage === 'config' && insecure.problems.some((p) => p.includes('OPENROUTER_BASE_URL')));
+});

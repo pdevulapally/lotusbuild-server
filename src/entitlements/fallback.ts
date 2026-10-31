@@ -1,11 +1,12 @@
 import { continuationProtocolMaxBytes } from '../runner/continuation.ts';
+import { modelProviderKeys, type ModelProviderKey } from '../models/provider.ts';
 import { createHash } from 'node:crypto';
 import { aiEfforts, type AiEffort } from './build-admission.ts';
 import type { MeterDefinition } from './schema.ts';
 import { DocumentShapeError, enumField, integerField, stringArrayField, stringField, type Fields } from '../support/documents.ts';
 
 export interface FallbackPolicy {
-  readonly provider: 'anthropic';
+  readonly provider: ModelProviderKey;
   readonly model: string;
   readonly effort: AiEffort;
   readonly eligiblePlanKeys: readonly string[];
@@ -23,7 +24,7 @@ export function parseFallbackPolicy(value: unknown, where: string, meters: Reado
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new DocumentShapeError(`${where}: expected fallback policy.`);
   const fields = value as Fields;
   const policy: FallbackPolicy = {
-    provider: enumField(fields, 'provider', where, ['anthropic']),
+    provider: enumField(fields, 'provider', where, modelProviderKeys),
     model: stringField(fields, 'model', where), effort: enumField(fields, 'effort', where, aiEfforts),
     eligiblePlanKeys: stringArrayField(fields, 'eligiblePlanKeys', where),
     inputTokenMeterKey: stringField(fields, 'inputTokenMeterKey', where), outputTokenMeterKey: stringField(fields, 'outputTokenMeterKey', where),

@@ -1,6 +1,7 @@
 import { fixtureModels } from './support/models.ts';
 import { TaskTracker } from '../src/runner/task-context.ts';
 import { verifyFallbackModel } from '../src/sessions/fallback.ts';
+import { AnthropicProvider } from '../src/models/provider.ts';
 import { computerToolset } from '../src/runner/computer.ts';
 import { SessionRunner, type RunnerDependencies } from '../src/runner/loop.ts';
 import { SandboxService } from '../src/sandboxes/service.ts';
@@ -237,7 +238,7 @@ test('the real worker pauses at quota, releases resources, and a replacement wor
 test('fallback capability checks reject missing metadata, aliases, incompatible tools and oversized context before offering a model', async () => {
   const h = fixture(); const provider = h.registry.sandboxProviders.get('web')!;
   const metadata = { id: policy.model, capabilities: { effort: { low: { supported: true } }, image_input: { supported: true } }, max_input_tokens: 1000, max_tokens: 100 };
-  const verify = (model: unknown, count = 5, value = checkpoint(), executionProvider = provider) => verifyFallbackModel({ models: { retrieve: async () => model }, messages: { countTokens: async () => ({ input_tokens: count }) } } as unknown as Anthropic,
+  const verify = (model: unknown, count = 5, value = checkpoint(), executionProvider = provider) => verifyFallbackModel(new AnthropicProvider({ models: { retrieve: async () => model }, messages: { countTokens: async () => ({ input_tokens: count }) } } as unknown as Anthropic, fixtureModels),
     policy, value, executionProvider, 'standard', 20, new AbortController().signal);
   assert.equal((await verify(metadata)).model, policy.model);
   await assert.rejects(verify({ ...metadata, capabilities: null }));

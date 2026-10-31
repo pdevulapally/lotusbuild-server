@@ -30,6 +30,8 @@ export interface EnvVarSpec<T> {
   /** Shown in the failure message so an operator knows what to supply. */
   readonly description: string;
   readonly parse: EnvParser<T>;
+  /** An unset or blank value loads as `undefined` instead of failing. */
+  readonly optional?: true;
 }
 
 export type EnvSpec = Readonly<Record<string, EnvVarSpec<unknown>>>;
@@ -53,6 +55,7 @@ export function loadEnv<S extends EnvSpec>(
     const raw = source[name];
 
     if (raw === undefined || raw.trim() === '') {
+      if (varSpec.optional === true) { loaded[name] = undefined; continue; }
       problems.push(`${name} is not set — ${varSpec.description}`);
       continue;
     }
@@ -73,6 +76,9 @@ export function loadEnv<S extends EnvSpec>(
 }
 
 /* ------------------------------------------------------------------ parsers */
+
+/** Marks a variable the deployment may leave unset; the feature it configures must then report itself unavailable. */
+export const asOptional = <T>(spec: EnvVarSpec<T>): EnvVarSpec<T | undefined> => ({ ...spec, optional: true });
 
 export const asString =
   (description: string, { minLength = 1 }: { minLength?: number } = {}): EnvVarSpec<string> => ({

@@ -133,7 +133,7 @@ export function safeErrorDiagnostic(error: unknown): SafeErrorDiagnostic {
 }
 
 /** SDK log arguments include request bodies and URLs, even at non-error levels. */
-export function safeProviderLogger(log: Record<'error' | 'warn' | 'info' | 'debug', (details: object, message: string) => void>, provider: 'anthropic') {
+export function safeProviderLogger(log: Record<'error' | 'warn' | 'info' | 'debug', (details: object, message: string) => void>, provider: 'anthropic' | 'openrouter') {
   const write = (level: 'error' | 'warn' | 'info' | 'debug') => (...args: unknown[]): void => {
     log[level]({ provider, diagnostic: safeErrorDiagnostic(args) }, 'provider diagnostic');
   };
