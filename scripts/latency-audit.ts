@@ -12,6 +12,7 @@ import type Anthropic from '@anthropic-ai/sdk';
 import { SandboxService } from '../src/sandboxes/service.ts';
 import type { RunningSandbox, SandboxAdapter } from '../src/sandboxes/provider.ts';
 import { ledger } from '../test/support/ledger.ts';
+import { fixtureModels } from '../test/support/models.ts';
 import { registryDocument, planDocuments } from '../src/seed/config.ts';
 import { ConfigurationStore } from '../src/entitlements/store.ts';
 import { EntitlementService } from '../src/entitlements/service.ts';
@@ -151,7 +152,8 @@ try {
         return { content: [{ type: 'text', text: 'Controlled first text.' }, { type: 'tool_use', id: 'controlled-finish', name: 'finish_task', input: { outcome: 'answered', summary: 'Controlled first text.', evidence: [] }, caller: { type: 'direct' } }], usage: { input_tokens: 5, output_tokens: 1 }, stop_reason: 'end_turn' };
       } };
     } } } as unknown as Anthropic;
-    const runner = new SessionRunner({ runnerId: 'controlled-worker', anthropic, sessions, projects, configuration: config, entitlements, metering,
+    const runner = new SessionRunner({ runnerId: 'controlled-worker', models: fixtureModels, anthropic, sessions, projects, configuration: config, entitlements, metering,
+      skills: { enabledFor: async () => [] }, attachments: { read: async () => { throw new Error('No attachments in the offline audit.'); } },
       sandboxes: new SandboxService(config,metering,new Map([['e2b',adapter]])),
       persistence: { restore: async () => 'fresh', save: async () => ({ bytes: 0, committed: false }) }, events,
       limits: { maxSteps: 4, maxOutputTokens: 20, toolOutputMaxChars: 5000, maxSpecialistConsultations: 0, specialistMaxSteps: 1, commandTimeoutMs: 1000, previewReadyTimeoutSeconds: 1 },
