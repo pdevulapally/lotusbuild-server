@@ -176,7 +176,7 @@ export const planDocuments = [
       { capabilityKey: "ai.effort", value: {"kind": "string", "value": "low"} },
       { capabilityKey: "platform.web", value: {"kind": "boolean", "value": true} },
       { capabilityKey: "platform.mobile", value: {"kind": "boolean", "value": false} },
-      { capabilityKey: "projects.max", value: {"kind": "number", "value": 3} },
+      { capabilityKey: "projects.max", value: {"kind": "number", "value": "unlimited"} },
       { capabilityKey: "skills.max", value: {"kind": "number", "value": 10} },
       { capabilityKey: "git.persistence", value: {"kind": "boolean", "value": false} },
       { capabilityKey: "preview.live", value: {"kind": "boolean", "value": true} },

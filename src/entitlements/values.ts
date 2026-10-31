@@ -10,9 +10,13 @@ import { AppError } from '../http/errors.ts';
 export const entitlementValueKinds = ['boolean', 'number', 'string', 'stringList'] as const;
 export type EntitlementValueKind = (typeof entitlementValueKinds)[number];
 
+/** A numeric cap, or the explicit absence of one. Never an arbitrary large number. */
+export type NumericLimit = number | typeof unlimited;
+export const unlimited = 'unlimited' as const;
+
 export type EntitlementValue =
   | { readonly kind: 'boolean'; readonly value: boolean }
-  | { readonly kind: 'number'; readonly value: number }
+  | { readonly kind: 'number'; readonly value: NumericLimit }
   | { readonly kind: 'string'; readonly value: string }
   | { readonly kind: 'stringList'; readonly value: readonly string[] };
 
@@ -27,7 +31,7 @@ const validators: Readonly<Record<EntitlementValueKind, (value: unknown) => bool
   boolean: (value) => typeof value === 'boolean',
   // Rejects NaN and Infinity: both survive JSON round-trips through some clients
   // and would silently poison a limit comparison.
-  number: (value) => typeof value === 'number' && Number.isFinite(value),
+  number: (value) => value === unlimited || (typeof value === 'number' && Number.isFinite(value)),
   string: (value) => typeof value === 'string',
   stringList: (value) => Array.isArray(value) && value.every((item) => typeof item === 'string'),
 };

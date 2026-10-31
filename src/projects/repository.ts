@@ -6,6 +6,7 @@ import { FieldValue, type Firestore, type Transaction } from 'firebase-admin/fir
 
 import type { ConfigurationStore } from '../entitlements/store.ts';
 import type { EntitlementService } from '../entitlements/service.ts';
+import { unlimited } from '../entitlements/values.ts';
 import { type Platform, platforms } from '../entitlements/schema.ts';
 import { AppError } from '../http/errors.ts';
 import { type Mutation } from '../http/idempotency.ts';
@@ -205,7 +206,7 @@ export class ProjectRepository {
       });
     }
 
-    const limit = entitlements.capabilities.number('projects.max');
+    const limit = entitlements.capabilities.limit('projects.max');
     const ref = this.#firestore.collection(projectsCollectionPath).doc();
     const userRef = this.#users.refFor(ownerUid);
 
@@ -218,7 +219,7 @@ export class ProjectRepository {
       }, work: async (transaction): Promise<Project> => {
       const user = await this.#users.readInTransaction(transaction, ownerUid);
 
-      if (user.projectCount >= limit) {
+      if (limit !== unlimited && user.projectCount >= limit) {
         throw new AppError({
           code: 'project/limit-reached',
           statusCode: 403,
