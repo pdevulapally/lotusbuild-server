@@ -211,39 +211,33 @@ export class MeteringService {
       readonly now: Date;
     },
   ): Promise<Consumption> {
-    this.#assertPositive(input.quantity, input.meterKey);
-    const { meter, limit } = await this.#resolve(input.entitlements, input.meterKey);
-    if (meter.kind !== 'COUNTER') {
-      // A gauge measures how much of something is held right now — concurrent
-      // sandboxes, bytes stored. Adding to it permanently would burn a slot that
-      // is never returned, and the user would run out of sandboxes for good.
-      throw new EntitlementConfigError(
-        `Meter "${meter.key}" is a ${meter.kind}, which is held and released rather than ` +
-          'consumed. Charging it would never be given back.',
-      );
+    return (await this.consumeManyIn(transaction, { uid: input.uid, entitlements: input.entitlements, quantities: [{ meterKey: input.meterKey, quantity: input.quantity }], now: input.now }))[0]!;
+  }
+
+  /** Read every meter before writing any: several counters can be admitted atomically. */
+  async consumeManyIn(transaction: Transaction, input: {
+    uid: string; entitlements: UserEntitlements;
+    quantities: readonly { meterKey: string; quantity: number }[]; now: Date;
+  }): Promise<readonly Consumption[]> {
+    if (!input.quantities.length || input.quantities.length > 10 || new Set(input.quantities.map(item => item.meterKey)).size !== input.quantities.length) throw new Error('Counter batch must have one to ten distinct meters.');
+    const changes = [];
+    for (const item of input.quantities) {
+      this.#assertPositive(item.quantity, item.meterKey);
+      const { meter, limit } = await this.#resolve(input.entitlements, item.meterKey);
+      if (meter.kind !== 'COUNTER') throw new EntitlementConfigError(`Meter "${meter.key}" is a ${meter.kind}, which is held and released rather than consumed.`);
+      const ref = this.#usageRef(input.uid, item.meterKey);
+      const snapshot = await transaction.get(ref);
+      const periodStart = periodStartFor(meter, input.now);
+      const state = this.#state(snapshot, periodStart, ref.path);
+      const after = state.consumed + item.quantity;
+      if (!Number.isSafeInteger(after) || after + state.reserved > limit.hardLimit) throw this.#exceeded(input.entitlements, meter, limit, state, item.quantity, periodStart);
+      changes.push({ ref, meter, state, after, periodStart });
     }
-
-    const ref = this.#usageRef(input.uid, input.meterKey);
-    const snapshot = await transaction.get(ref);
-    const periodStart = periodStartFor(meter, input.now);
-    const state = this.#state(snapshot, periodStart, ref.path);
-
-    const after = state.consumed + input.quantity;
-    // Held capacity counts against the same ceiling: a reservation is capacity
-    // already promised to something else.
-    if (after + state.reserved > limit.hardLimit) {
-      throw this.#exceeded(input.entitlements, meter, limit, state, input.quantity, periodStart);
-    }
-
-    transaction.set(ref, {
-      meterKey: meter.key,
-      consumed: after,
-      reserved: state.reserved,
-      periodStart: Timestamp.fromDate(periodStart),
-      updatedAt: FieldValue.serverTimestamp(),
+    for (const change of changes) transaction.set(change.ref, {
+      meterKey: change.meter.key, consumed: change.after, reserved: change.state.reserved,
+      periodStart: Timestamp.fromDate(change.periodStart), updatedAt: FieldValue.serverTimestamp(),
     });
-
-    return { meterKey: meter.key, consumed: after, periodStart };
+    return changes.map(change => ({ meterKey: change.meter.key, consumed: change.after, periodStart: change.periodStart }));
   }
 
   /**

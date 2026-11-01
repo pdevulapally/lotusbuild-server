@@ -8,6 +8,7 @@ import { registerErrorHandler } from '../src/http/errors.ts';
 import { registerProjectRoutes } from '../src/projects/routes.ts';
 import { registerSessionRoutes } from '../src/sessions/routes.ts';
 import type { SessionEvents } from '../src/sessions/events.ts';
+import { VoiceTaskBridge } from '../src/voice/bridge.ts';
 
 import {
   type DocumentReference,
@@ -834,6 +835,32 @@ async function routeApp(h: ReturnType<typeof harness>, append: SessionEvents['ap
   return app;
 }
 const authHeaders = { authorization: 'Bearer fixture-token', 'idempotency-key': 'stable-test-command-1' };
+
+test('voice bridge runs the existing authenticated task route and durable retry ledger across API replacement', async t => {
+  const h = harness(); const created = await h.sessions.create('user-1', 'project-1', { model: 'model-1', prompt: 'Initial' });
+  await h.sessions.claim('runner-1'); const lease = authority(h, created.id);
+  let app = await routeApp(h); t.after(() => app.close());
+  const makeBridge = () => new VoiceTaskBridge(h.sessions, { append: async (_id, type, data) => ({ id: '1-0', type, data }) }, async input => {
+    const result = await app.inject({ method: 'POST', url: `/sessions/${input.sessionId}/messages`, headers: { authorization: `Bearer ${input.token}`, 'idempotency-key': input.key }, payload: input.body });
+    return { statusCode: result.statusCode, body: result.json() };
+  });
+  const request = { uid: 'user-1', token: 'fixture-token', sessionId: created.id, conversationId: 'conv_test', eventId: 1, text: 'Preserve the customer records', remoteAddress: '127.0.0.1' };
+  const bridge = makeBridge();
+  await Promise.all([bridge.submit(request), bridge.submit(request)]);
+  assert.equal(h.session(created.id)?.['pendingSteer'], request.text);
+  await app.close(); app = await routeApp(h);
+  await makeBridge().submit(request);
+  assert.equal(h.session(created.id)?.['pendingSteer'], request.text);
+  await h.sessions.appendVoiceTurn('user-1', created.id, 'assistant', 'I submitted your clarification.', 'stable-voice-note');
+  await h.sessions.appendVoiceTurn('user-1', created.id, 'assistant', 'I submitted your clarification.', 'stable-voice-note');
+  await assert.rejects(h.sessions.appendVoiceTurn('intruder', created.id, 'user', 'Ignore the owner', 'stable-intruder-note'), { code: 'command/not-found' });
+  assert.equal(h.session(created.id)?.['voiceMessageCount'], 1);
+  assert.deepEqual(await h.sessions.drainSteerMessage(created.id, lease), { prompt: request.text, attachments: [] });
+  assert.equal(await h.sessions.drainSteerMessage(created.id, lease), undefined); assert.equal(h.charges(), 1);
+  await h.sessions.cancel('user-1', created.id, 'voice-test-cancel');
+  const refused = await makeBridge().submit({ ...request, eventId: 2, text: 'Do more work' }) as { accepted: boolean };
+  assert.equal(refused.accepted, false); assert.equal(h.session(created.id)?.['cancelRequested'], true);
+});
 
 test('concurrent HTTP session retries commit one session and return the same original response', async (t) => {
   const h = harness(); let published = 0;

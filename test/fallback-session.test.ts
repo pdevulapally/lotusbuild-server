@@ -90,6 +90,19 @@ test('separate fallback consent is atomic and idempotent even when premium token
   assert.equal(restored.completedSteps, 1); assert.equal(restored.consultations, 1);
 });
 
+test('voice conversation context does not invalidate an existing durable checkpoint', async () => {
+  const h = fixture(); const target = await h.create('voice-project'); const paused = await h.pause(target);
+  await h.sessions.appendVoiceTurn('u', target.id, 'user', 'What is happening?', 'voice-user-message-stable');
+  await h.sessions.appendVoiceTurn('u', target.id, 'assistant', 'The task is paused; review the continuation controls.', 'voice-assistant-message-stable');
+  const current = await h.sessions.readOwned('u', target.id);
+  assert.equal(current.fallback?.resumable, true);
+  assert.equal(current.voiceMessageCount, 2);
+  const messages = await h.sessions.listMessages('u', target.id, 20);
+  assert.equal(messages.at(-1)?.voiceSpeaker, 'assistant');
+  await h.sessions.acceptFallback('u', target.id, 'stable-voice-continuation-consent', paused.input);
+  const claimed = await h.sessions.claim('voice-fallback-worker'); assert.equal(claimed?.id, target.id);
+});
+
 test('waiting fallback work is admitted after the configured number of premium claims', async () => {
   const h = fixture(); const target = await h.create('fallback-project'); const paused = await h.pause(target);
   await h.sessions.acceptFallback('u', target.id, 'stable-fairness-consent', paused.input);

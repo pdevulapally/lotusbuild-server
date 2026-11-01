@@ -25,7 +25,7 @@ import { EmailVerificationService } from './auth/email-verification.ts';
 import { keyringFromEnv } from './connections/credentials.ts';
 import { ConnectionRepository } from './connections/service.ts';
 import { VoiceRelay } from './voice/relay.ts';
-import { ElevenLabsAudio } from './voice/provider.ts';
+import { ElevenLabsRealtime } from './voice/provider.ts';
 import { MeteredVoiceBudget } from './voice/budget.ts';
 
 
@@ -108,7 +108,7 @@ async function main(): Promise<void> {
     ...(config.ELEVENLABS_API_KEY === undefined || config.ELEVENLABS_VOICE_CONFIG === undefined ? {} : { voice: new VoiceRelay({
       auth: firebase.auth, sessions, events: sessionEvents,
       entitlements, budget: new MeteredVoiceBudget(firebase.firestore, redis, metering, configuration, config.ELEVENLABS_VOICE_CONFIG),
-      provider: new ElevenLabsAudio(config.ELEVENLABS_API_KEY, config.ELEVENLABS_VOICE_CONFIG), config: config.ELEVENLABS_VOICE_CONFIG,
+      provider: new ElevenLabsRealtime(config.ELEVENLABS_API_KEY, config.ELEVENLABS_VOICE_CONFIG), config: config.ELEVENLABS_VOICE_CONFIG,
       allowedOrigins: new Set(config.CORS_ALLOWED_ORIGINS.map(url => url.origin)),
     }) }),
     projectFiles: new ProjectFiles(snapshots),

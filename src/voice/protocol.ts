@@ -1,7 +1,7 @@
 import type { BuildSession } from '../sessions/repository.ts';
 import type { SessionEvent } from '../sessions/events.ts';
 
-export const voicePrivacyNotice = 'Your microphone audio and text selected for speech are sent to ElevenLabs. LotusBuild does not save audio. Sent messages are saved in this project’s chat and use the same AI providers as text. Voice requires verified provider zero retention. Approvals and task cancellation use the on-screen controls. End the call at any time to stop audio sharing; accepted work continues.';
+export const voicePrivacyNotice = 'Your live audio and recent project conversation are sent to your configured ElevenLabs realtime agent. LotusBuild saves final voice dialogue as project chat context, not audio. Submitted work uses the same task providers, tools and permissions as text. Voice requires verified provider and downstream privacy coverage. Approvals and task cancellation use the on-screen controls. End the call to stop audio sharing; accepted work continues.';
 
 /** Facts from durable state, without promising tool success or interpreting model-authored claims. */
 export function voiceTaskStatus(session: Pick<BuildSession, 'status' | 'pendingInput' | 'cancelRequested' | 'fallback'>): string {
@@ -30,12 +30,10 @@ export function voiceProgress(event: SessionEvent): string | undefined {
   return typeof event.data['name'] === 'string' ? tools[event.data['name']] : undefined;
 }
 
-export type VoiceCommand = { type: 'interrupt' } | { type: 'end' } | { type: 'speak'; source: 'status' } | { type: 'speak'; source: 'message'; seq: number };
+export type VoiceCommand = { type: 'interrupt' } | { type: 'end' };
 export function parseVoiceCommand(value: unknown): VoiceCommand {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid voice command.');
   const record = value as Record<string, unknown>;
   if ((record['type'] === 'interrupt' || record['type'] === 'end') && Object.keys(record).length === 1) return record as VoiceCommand;
-  if (record['type'] === 'speak' && record['source'] === 'status' && Object.keys(record).length === 2) return record as VoiceCommand;
-  if (record['type'] === 'speak' && record['source'] === 'message' && Object.keys(record).length === 3 && Number.isSafeInteger(record['seq']) && (record['seq'] as number) >= 0) return record as VoiceCommand;
   throw new Error('Invalid voice command.');
 }
