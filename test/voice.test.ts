@@ -119,6 +119,33 @@ test('pinned native agent rejects public access, recordings, non-ZRM models, ext
   mutate(item => { item.agent.version_id = 'wrong_version'; });
   mutate(item => { item.policy.agentConfigSha256 = 'b'.repeat(64); });
 });
+test('hydrated agent client tools must exactly match the separately fetched definitions, even with a matching digest', () => {
+  const f = providerFixture();
+  const check = (tools: unknown) => {
+    const agent = structuredClone(f.agent);
+    Object.assign(agent.conversation_config.agent.prompt, { tools });
+    validateVoiceAgent(agent, f.tools, { ...f.policy, agentConfigSha256: voiceAgentDigest(agent, f.tools) });
+  };
+  const definitions = f.tools.map(tool => tool.tool_config);
+  check(definitions); check([...definitions].reverse()); check([]);
+  for (const tools of [
+    {}, [definitions[0]], [definitions[0], definitions[0]], [...definitions, definitions[0]],
+    [definitions[0], { ...definitions[1], type: 'webhook' }],
+    [definitions[0], { ...definitions[1], description: 'Modified definition' }],
+    [definitions[0], { ...definitions[1], parameters: { type: 'object', properties: { command: { type: 'string' } } } }],
+  ]) assert.throws(() => check(tools), /Unapproved expanded tool definitions/);
+});
+
+test('provider null client-tool parameter schemas mean no arguments; malformed or nonempty schemas remain refused', () => {
+  const f = providerFixture();
+  const check = (parameters: unknown) => {
+    const tools = f.tools.map(tool => ({ ...tool, tool_config: { ...tool.tool_config, parameters } }));
+    validateVoiceAgent(f.agent, tools, { ...f.policy, agentConfigSha256: voiceAgentDigest(f.agent, tools) });
+  };
+  check(null); check(undefined); check({});
+  for (const parameters of [[], '', { type: 'array' }, { properties: { command: { type: 'string' } } }, { required: ['command'] }]) assert.throws(() => check(parameters));
+});
+
 test('blank-agent Start node is allowed, while executable or extended workflows remain refused even with a matching digest', () => {
   const f = providerFixture();
   const start = { type: 'start', position: { x: 0, y: 0 }, edge_order: [], parent_subgraph_id: null };

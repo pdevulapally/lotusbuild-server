@@ -63,7 +63,15 @@ export function validateVoiceAgent(raw: unknown, tools: readonly unknown[], conf
   if (!Number.isSafeInteger(prompt['max_tokens']) || (prompt['max_tokens'] as number) < 1024 || (prompt['max_tokens'] as number) > 4096 || record(prompt['backup_llm_config'])['preference'] !== 'disabled') throw new Error('Bounded output and disabled model cascading required.');
   const toolIds = prompt['tool_ids'];
   if (!Array.isArray(toolIds) || toolIds.length !== 2 || !toolIds.includes(config.statusToolId) || !toolIds.includes(config.submitToolId)) throw new Error('Only the two LotusBuild bridge tools may be attached.');
-  for (const field of ['tools', 'mcp_server_ids', 'native_mcp_server_ids', 'knowledge_base']) if (Array.isArray(prompt[field]) && (prompt[field] as unknown[]).length) throw new Error('Provider-side tools, MCP and knowledge bases are not permitted.');
+  // Agent GET responses hydrate attached tool_ids into prompt.tools. These are
+  // safe only as exact, unique copies of the separately fetched pinned tools;
+  // inline additions or modified definitions must still be refused.
+  if (prompt['tools'] !== undefined && prompt['tools'] !== null) {
+    const expanded = prompt['tools'];
+    if (!Array.isArray(expanded) || (expanded.length !== 0 && (expanded.length !== 2 || tools.length !== 2 ||
+        tools.some(tool => expanded.filter(value => canonical(value) === canonical(record(tool)['tool_config'])).length !== 1)))) throw new Error('Unapproved expanded tool definitions.');
+  }
+  for (const field of ['mcp_server_ids', 'native_mcp_server_ids', 'knowledge_base']) if (Array.isArray(prompt[field]) && (prompt[field] as unknown[]).length) throw new Error('Provider-side tools, MCP and knowledge bases are not permitted.');
   const builtins = prompt['built_in_tools'];
   if (builtins && Object.values(record(builtins)).some(value => value !== null && value !== undefined)) throw new Error('Unapproved built-in tools.');
   noExecutableWorkflow(agent['workflow']);
@@ -75,7 +83,7 @@ export function validateVoiceAgent(raw: unknown, tools: readonly unknown[], conf
     const tool = record(tools[i]), definition = record(tool['tool_config']);
     const expected = i === 0 ? config.statusToolId : config.submitToolId;
     const name = i === 0 ? 'lotus_task_status' : 'lotus_submit_request';
-    const parameters = definition['parameters'] === undefined ? {} : record(definition['parameters']);
+    const parameters = definition['parameters'] === undefined || definition['parameters'] === null ? {} : record(definition['parameters']);
     // The provider's custom schema omits JSON Schema additionalProperties. Strict empty arguments are enforced by our dispatcher.
     if (tool['id'] !== expected || definition['type'] !== 'client' || definition['name'] !== name || definition['expects_response'] !== true || definition['pre_tool_speech'] !== 'off' || definition['interruption_mode'] !== 'allow' || (parameters['type'] !== undefined && parameters['type'] !== 'object') || (parameters['properties'] !== undefined && Object.keys(record(parameters['properties'])).length) || (parameters['required'] !== undefined && (!Array.isArray(parameters['required']) || parameters['required'].length))) throw new Error('Bridge tools must be interruptible client tools without arguments.');
   }
