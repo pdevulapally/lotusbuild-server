@@ -1,6 +1,6 @@
 # Native realtime voice for LotusBuild
 
-Disabled by default. The owner's agent remains unpublished. No provider configuration writes, paid calls, registry migration, merge or production deployment are authorized here. The earlier STT/TTS adapter and illustrative audio-only cost table are superseded.
+Voice requires explicit activation policy and provider secrets. The owner reports the private native agent published and has approved launch allowances for all three plans; those registry/plan allowances were applied and read back on 2026-11-01. API activation, provider cost/privacy verification and live voice verification remain outstanding. See `voice-activation-proposal.md` for the approved numerical limits and current operational status. The earlier STT/TTS adapter and illustrative audio-only cost table are superseded.
 
 ## Architecture
 
@@ -35,7 +35,7 @@ One task/conversation/user-event identity fences multiple tool calls for the sam
 
 ## Limits and costs
 
-Nothing is seeded. Activation requires explicit registry capabilities `voice.enabled` (boolean), `voice.concurrent` (integer 1–10), `voice.call.seconds` (positive integer). Call duration is the lower of plan and deployment ceilings.
+Activation requires explicit registry capabilities `voice.enabled` (boolean), `voice.concurrent` (integer 1–10), `voice.call.seconds` (positive integer). The approved voice-only migration adds these without re-seeding existing configuration. Call duration is the lower of plan and deployment ceilings.
 
 Add monthly COUNTER meters `voice.seconds` and `voice.cost.microgbp`, with explicit per-plan allowances/hard limits and **overage disabled**. Seconds are prepaid in up-to-ten-second windows, including silence. The full approved worst-case per-call cost allocation is consumed before each conversation, including reconnects. Existing metering batches both counters atomically with the Firestore global allocation/dispatch claim. Failed/uncertain dispatches conservatively retain allocation. These are budgets, not Stripe charges or exact invoices.
 
@@ -43,15 +43,15 @@ Add monthly COUNTER meters `voice.seconds` and `voice.cost.microgbp`, with expli
 
 Redis server-time leases enforce global/per-user concurrency, expire after 20 seconds and renew every five. Local audio authority expires within ten seconds without renewal. Hard call/idle/auth/provider-connect timeouts, turn/tool counts, buffer/byte bounds, realtime upload limits and control-rate limits bound abandoned/abusive sessions. Task work retains the runner's separate lifecycle.
 
-### Plan breakdown for separate approval
+### Approved initial plan allowances
 
-| Existing plan | Current voice allowance | Proposed policy |
+| Existing plan | Monthly voice allowance | Maximum call / concurrent calls per user |
 |---|---|---|
-| Free | Unset; disabled | Explicit monthly seconds/cost ceilings; no overage; approved call/concurrency limits |
-| Pro | Unset; disabled | Same counters; owner selects paid-plan allowance/cost envelope |
-| Business | Unset; disabled | Same counters; owner selects team/concurrency envelope |
+| Free | 5 minutes | 5 minutes / 1 |
+| Pro | 60 minutes | 10 minutes / 1 |
+| Business | 180 minutes | 10 minutes / 1 |
 
-For each plan approve monthly seconds `S`, allocated cost `B`, max-call seconds `D` and concurrency `N`. Estimate cost as `minutes × contracted agent rate + input tokens × input rate + cached tokens × cached rate + output tokens × output rate`, explicitly accounting for FX/tax/fees/subscription minimums. Task model/sandbox/MCP costs stay separate. Per-call allocation `C` also bounds admitted calls by `floor(B/C)` and remaining global allocation. No tier numbers or monetary quote are proposed without the required contract/owner limits.
+The owner approved a shared GBP 100 monthly application allocation cap, two concurrent calls globally and a 60-second inactivity timeout. Each plan's cost counter uses that same ceiling; it does not create a separate GBP 100 pool per user. No overage is enabled. These admission allocations are not a guaranteed provider invoice cap. Estimate actual cost as `minutes × contracted agent rate + input tokens × input rate + cached tokens × cached rate + output tokens × output rate`, explicitly accounting for FX/tax/fees/subscription minimums. Task model/sandbox/MCP costs stay separate. Per-call allocation `C` also bounds admitted calls by `floor(B/C)` and remaining global allocation. Provider rates, the conservative per-call allocation and acceptable account spending controls still require verification.
 
 ## ElevenLabs and VPS configuration
 
