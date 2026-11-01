@@ -71,8 +71,9 @@ Leave **both** variables absent to keep voice disabled; partial configuration fa
 | `maxConnections`, `maxTurns` | Approved global connection/per-call turn ceilings; maxima 1000/100 |
 | `maxCallMicroGbp`, `globalMonthlyMicroGbp` | Approved per-call/global monthly allocations, positive integer millionths of GBP |
 | `zeroRetentionVerified`, `downstreamZeroRetentionVerified` | True only after exact account/model/region/downstream coverage is evidenced |
-| `trainingOptOutVerified` | Separate training-use verification, never a substitute for zero retention |
 | `providerSpendingLimitVerified` | True only after acceptable spending controls and cost assumptions are verified |
+
+Owner decision 2026-11-01: the separate workspace training-opt-out requirement (`trainingOptOutVerified`) was removed from this policy at the owner's explicit request, with zero-retention coverage still required. The workspace's "Improve the models for everyone" setting was left as the owner found it; it is no longer gated by this config.
 
 Prepare the current **unpublished** dashboard draft without publishing or Preview-calling it:
 

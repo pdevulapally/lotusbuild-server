@@ -22,7 +22,7 @@ import { conversationFrom } from '../src/runner/agent.ts';
 
 // Synthetic provider/auth/datastore, never live ElevenLabs or paid usage.
 export const config: VoiceConfig = { environment: 'global', agentId: 'agent_test', agentVersionId: 'version_test', agentConfigSha256: 'a'.repeat(64), statusToolId: 'tool_status', submitToolId: 'tool_submit',
-  privacyVersion: 'test-v1', zeroRetentionVerified: true, downstreamZeroRetentionVerified: true, trainingOptOutVerified: true, providerSpendingLimitVerified: true,
+  privacyVersion: 'test-v1', zeroRetentionVerified: true, downstreamZeroRetentionVerified: true, providerSpendingLimitVerified: true,
   maxCallSeconds: 60, idleSeconds: 20, maxConnections: 4, maxTurns: 20, maxCallMicroGbp: 1000, globalMonthlyMicroGbp: 100000 };
 const entitlements = { planKey: 'test', planName: 'Test', subscriptionStatus: undefined,
   capabilities: new ResolvedEntitlements(new Map([
