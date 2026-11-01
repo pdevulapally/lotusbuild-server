@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { Timestamp } from 'firebase-admin/firestore';
 
-import { ProjectFiles, isProjectPath } from '../src/projects/files.ts';
+import { ProjectFiles, isProjectPath, snapshotMembers, type ProjectFilesOptions } from '../src/projects/files.ts';
 import { type Project, ProjectRepository } from '../src/projects/repository.ts';
 import type { UserRepository } from '../src/users/repository.ts';
 import type { EntitlementService } from '../src/entitlements/service.ts';
@@ -56,7 +56,7 @@ test('public projects are readable without a token, but not once the account is 
   await assert.rejects(h.projects.readShared('p', undefined), { code: 'project/not-found' });
 });
 
-function snapshotOf(build: (repo: string) => void) {
+function snapshotOf(build: (repo: string) => void, options: Partial<ProjectFilesOptions> = {}) {
   const repo = mkdtempSync(join(tmpdir(), 'lb-files-test-'));
   const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
   git('init', '-q', '-b', 'main');
@@ -73,7 +73,7 @@ function snapshotOf(build: (repo: string) => void) {
   execFileSync('tar', ['-czf', join(repo, 'snap.tgz'), '.git'], { cwd: repo });
   const archive = readFileSync(join(repo, 'snap.tgz'));
   rmSync(repo, { recursive: true, force: true });
-  const files = new ProjectFiles({ readUrl: async () => 'https://storage.invalid/snap' }, async () => new Response(archive));
+  const files = new ProjectFiles({ readUrl: async () => 'https://storage.invalid/snap' }, async () => new Response(archive), options);
   const project = { id: 'p', snapshot: { kind: 'immutable', objectName: 'o', generation: '1' } } as unknown as Project;
   return { files, project };
 }
@@ -92,9 +92,112 @@ test('the saved tree, branches and file contents are read from the git snapshot'
   await assert.rejects(files.read(project, '.git/config'), { code: 'project/file-not-found' });
 });
 
-test('a snapshot containing a symlink is refused as a whole', async () => {
+test('a snapshot containing a symlink or hardlink is refused as a whole', async () => {
   const { files, project } = snapshotOf((repo) => symlinkSync('/etc', join(repo, '.git', 'escape')));
   await assert.rejects(files.tree(project), { code: 'project/files-unavailable' });
+  const linked = snapshotOf((repo) => linkSync(join(repo, '.git', 'HEAD'), join(repo, '.git', 'HEAD2')));
+  await assert.rejects(linked.files.tree(linked.project), { code: 'project/files-unavailable' });
+});
+
+/** Puts logging `git` and `tar` wrappers first on PATH so a test can see exactly which commands ran. */
+async function withCommandLog<T>(body: (log: () => string[]) => Promise<T>): Promise<T> {
+  const bin = mkdtempSync(join(tmpdir(), 'lb-bin-'));
+  const logFile = join(bin, 'log');
+  writeFileSync(logFile, '');
+  for (const tool of ['git', 'tar']) {
+    const real = execFileSync('sh', ['-c', `command -v ${tool}`], { encoding: 'utf8' }).trim();
+    writeFileSync(join(bin, tool), `#!/bin/sh\necho "${tool} $*" >> '${logFile}'\nexec '${real}' "$@"\n`);
+    chmodSync(join(bin, tool), 0o755);
+  }
+  const path = process.env['PATH'];
+  process.env['PATH'] = `${bin}:${path}`;
+  try {
+    return await body(() => readFileSync(logFile, 'utf8').split('\n').filter(Boolean));
+  } finally {
+    process.env['PATH'] = path;
+    rmSync(bin, { recursive: true, force: true });
+  }
+}
+
+function plantSmudgeFilter(repo: string, gitDir: string, marker: string, infoAttributes = true) {
+  writeFileSync(join(gitDir, 'config'), `[core]\n\trepositoryformatversion = 0\n[filter "x"]\n\tsmudge = touch ${marker}; cat\n\tclean = cat\n`);
+  if (infoAttributes) {
+    mkdirSync(join(gitDir, 'info'), { recursive: true });
+    writeFileSync(join(gitDir, 'info', 'attributes'), '* filter=x\n');
+  }
+  writeFileSync(join(repo, '.gitattributes'), '* filter=x\n');
+}
+
+test('a snapshot that redirects git through commondir to a smudge filter is refused before git runs', async () => {
+  const marker = join(mkdtempSync(join(tmpdir(), 'lb-marker-')), 'pwned');
+  const { files, project } = snapshotOf((repo) => {
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+    writeFileSync(join(repo, '.gitattributes'), '* filter=x\n');
+    git('add', '.gitattributes'); git('commit', '-q', '-m', 'attributes');
+    mkdirSync(join(repo, '.git', 'cd'));
+    plantSmudgeFilter(repo, join(repo, '.git', 'cd'), marker);
+    writeFileSync(join(repo, '.git', 'commondir'), 'cd\n');
+  });
+  await withCommandLog(async (log) => {
+    await assert.rejects(files.tree(project), { code: 'project/files-unavailable' });
+    await assert.rejects(files.archive(project), { code: 'project/files-unavailable' });
+    assert.ok(!log().some((line) => line.startsWith('git ')), log().join('\n'));
+    assert.ok(!log().some((line) => line.startsWith('tar -x')), log().join('\n'));
+  });
+  assert.equal(existsSync(marker), false);
+  for (const planted of ['gitdir', 'config.worktree', 'info/attributes', 'objects/info/alternates', 'worktrees/w/HEAD']) {
+    const line = `-rw-r--r-- 0/0 1 2026-01-01 00:00:00 .git/${planted}`;
+    assert.throws(() => snapshotMembers(`${line}\n-rw-r--r-- 0/0 1 2026-01-01 00:00:00 .git/HEAD\n`, { maxBytes: 1e9, maxMembers: 10 }), { code: 'project/files-unavailable' }, planted);
+  }
+});
+
+test('filters and attributes written into the snapshot never run, and the zip holds the raw saved blobs', async () => {
+  const marker = join(mkdtempSync(join(tmpdir(), 'lb-marker-')), 'pwned');
+  const { files, project } = snapshotOf((repo) => {
+    execFileSync('chmod', ['+x', join(repo, 'index.html')]);
+    execFileSync('git', ['add', 'index.html'], { cwd: repo });
+    execFileSync('git', ['commit', '-q', '-m', 'exec'], { cwd: repo, env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+    execFileSync('git', ['gc', '-q'], { cwd: repo });
+    plantSmudgeFilter(repo, join(repo, '.git'), marker, false);
+    execFileSync('git', ['add', '.gitattributes'], { cwd: repo });
+    execFileSync('git', ['commit', '-q', '-m', 'attributes'], { cwd: repo, env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+  });
+  rmSync(marker, { force: true });
+  const zip = await withCommandLog(async (log) => {
+    const out = await files.archive(project);
+    assert.ok(!log().some((line) => / archive /.test(` ${line} `)), log().join('\n'));
+    return out;
+  });
+  assert.equal(existsSync(marker), false);
+  const dir = mkdtempSync(join(tmpdir(), 'lb-zip-'));
+  try {
+    writeFileSync(join(dir, 'out.zip'), zip);
+    const listing = JSON.parse(execFileSync('python3', ['-I', '-c', [
+      'import json, sys, zipfile',
+      'z = zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None',
+      'print(json.dumps({i.filename: [z.read(i).hex(), i.external_attr >> 16] for i in z.infolist()}))',
+    ].join('\n'), join(dir, 'out.zip')], { encoding: 'utf8' })) as Record<string, [string, number]>;
+    assert.deepEqual(Object.keys(listing).sort(), ['.gitattributes', 'index.html', 'logo.bin', 'src/app.ts']);
+    assert.equal(Buffer.from(listing['src/app.ts']![0], 'hex').toString('utf8'), 'export const ok = true;\n');
+    assert.equal(listing['logo.bin']![0], '00010203');
+    assert.equal(listing['index.html']![1], 0o100755);
+    assert.equal(listing['src/app.ts']![1], 0o100644);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a snapshot whose unpacked size or member count exceeds the cap is refused before anything is extracted', async () => {
+  const big = (repo: string) => writeFileSync(join(repo, '.git', 'objects', 'pack', `pack-${'a'.repeat(40)}.pack`), Buffer.alloc(4 * 1024 * 1024));
+  const { files, project } = snapshotOf(big, { maxUnpackedBytes: 1024 * 1024 });
+  await withCommandLog(async (log) => {
+    await assert.rejects(files.tree(project), { code: 'project/files-unavailable' });
+    assert.ok(log().some((line) => line.startsWith('tar -tvzf')), log().join('\n'));
+    assert.ok(!log().some((line) => line.startsWith('tar -x')), log().join('\n'));
+    assert.ok(!log().some((line) => line.startsWith('git ')), log().join('\n'));
+  });
+  const many = snapshotOf(() => {}, { maxArchiveMembers: 5 });
+  await assert.rejects(many.files.tree(many.project), { code: 'project/files-unavailable' });
+  const ok = snapshotOf(big, { maxUnpackedBytes: 64 * 1024 * 1024 });
+  assert.equal((await ok.files.tree(ok.project)).head, 'main');
 });
 
 test('project paths reject traversal, absolute paths and git internals', () => {
