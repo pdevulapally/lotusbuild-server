@@ -4,7 +4,7 @@ import { policyFingerprint } from '../entitlements/fallback.ts';
 import { parseCheckpoint, serializeCheckpoint, continuationProtocolMaxBytes, type ContinuationCheckpoint } from '../runner/continuation.ts';
 import { commandTransaction, reconciledCommand } from './commands.ts';
 import { runnerRecoveryProtocol } from './recovery-protocol.ts';
-import { validateAttachmentRefs, type AttachmentRef } from '../attachments/store.ts';
+import { validateAttachmentRefs, maxAttachmentsPerMessage, type AttachmentRef } from '../attachments/store.ts';
 import {
   type DocumentReference,
   FieldPath,
@@ -697,7 +697,14 @@ export class SessionRepository {
       else this.#assertProjectCanActivate(project, current.id);
       assertBuildAllowed(entitlements, project.platform, current.model);
       if ((steer || strategy === 'steer') && current.status === 'RUNNING') {
-        transaction.update(ref, { pendingSteer: prompt, pendingSteerAttachments: attachments, updatedAt: FieldValue.serverTimestamp() });
+        // Several spoken or typed clarifications can arrive before the next safe point.
+        // Preserve every accepted instruction rather than overwriting an acknowledged one.
+        const pendingSteer = current.pendingSteer === undefined ? prompt : `${current.pendingSteer}\n\n${prompt}`;
+        const pendingAttachments = [...(current.pendingSteerAttachments ?? []), ...attachments];
+        if (pendingSteer.length > promptMaxLength || pendingAttachments.length > maxAttachmentsPerMessage) throw new AppError({
+          code: 'session/steer-full', statusCode: 409, message: 'Wait for the current clarification to be read before adding more.',
+        });
+        transaction.update(ref, { pendingSteer, pendingSteerAttachments: pendingAttachments, updatedAt: FieldValue.serverTimestamp() });
         return { kind: 'steered', sessionId };
       }
       if (active) {
