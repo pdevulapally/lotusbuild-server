@@ -105,6 +105,7 @@ export interface PendingInput {
 export interface InputResponse { readonly id: string; readonly answer: string }
 
 export interface BuildSession {
+  readonly entrypoint?: 'voice';
   readonly id: string;
   readonly projectId: string;
   readonly ownerUid: string;
@@ -230,7 +231,10 @@ function parsePendingInput(value: unknown): PendingInput | undefined {
 const RECOVERY_RETRY_CAP_SECONDS = 3600;
 
 function parseSession(id: string, fields: Fields, where: string): BuildSession {
+  const entrypoint = fields['entrypoint'] === undefined ? undefined : enumField(fields, 'entrypoint', where, ['voice']);
+  const messageCount = integerField(fields, 'messageCount', where, { min: entrypoint === 'voice' ? 0 : 1 });
   return {
+    ...(entrypoint === undefined ? {} : { entrypoint }),
     id,
     projectId: stringField(fields, 'projectId', where),
     ownerUid: stringField(fields, 'ownerUid', where),
@@ -257,8 +261,8 @@ function parseSession(id: string, fields: Fields, where: string): BuildSession {
     pendingSteerAttachments: fields['pendingSteerAttachments'] === undefined ? undefined : attachmentRefsField(fields, 'pendingSteerAttachments', where),
     reservationIds: stringArrayField(fields, 'reservationIds', where),
     specialistReservationIds: stringArrayField(fields, 'specialistReservationIds', where),
-    messageCount: integerField(fields, 'messageCount', where, { min: 1 }),
-    ...(fields['voiceMessageCount'] === undefined ? {} : { voiceMessageCount: integerField(fields, 'voiceMessageCount', where, { min: 0, max: integerField(fields, 'messageCount', where, { min: 1 }) - 1 }) }),
+    messageCount,
+    ...(fields['voiceMessageCount'] === undefined ? {} : { voiceMessageCount: integerField(fields, 'voiceMessageCount', where, { min: 0, max: messageCount - (entrypoint === 'voice' ? 0 : 1) }) }),
     createdAt: timestampField(fields, 'createdAt', where),
   };
 }
@@ -333,13 +337,14 @@ function receiptMessage(value: unknown): MessageAcceptance {
       createdAt: Timestamp.fromDate(new Date(stringField(message, 'createdAt', 'command'))) }, 'command') };
 }
 
-export interface NewSession {
-  readonly prompt: string;
-  readonly attachments?: readonly AttachmentRef[];
+export type NewSession = {
   readonly model: string;
   readonly effort?: AiEffort;
   readonly mode?: SessionMode;
-}
+} & (
+  | { readonly entrypoint?: undefined; readonly prompt: string; readonly attachments?: readonly AttachmentRef[] }
+  | { readonly entrypoint: 'voice'; readonly mode: 'plan'; readonly prompt?: never; readonly attachments?: never }
+);
 
 /** What a runner reports when it stops working on a session. */
 export type SessionOutcome =
@@ -423,7 +428,10 @@ export class SessionRepository {
   async create(uid: string, projectId: string, input: NewSession, idempotencyId?: string, commandId?: string | Mutation<BuildSession>): Promise<BuildSession> {
     const attachments = validateAttachmentRefs(input.attachments);
 
-    this.#validatePrompt(input.prompt);
+    const voice = input.entrypoint === 'voice';
+    if (voice) {
+      if (input.mode !== 'plan' || input.prompt !== undefined || input.attachments !== undefined) throw new AppError({ code: 'session/invalid-voice-session', statusCode: 400, message: 'A new voice session must use Plan mode without a prompt or attachments.' });
+    } else this.#validatePrompt(input.prompt);
     if (idempotencyId !== undefined && !/^[A-Za-z0-9_-]{1,128}$/.test(idempotencyId)) throw new Error('Invalid internal session id.');
     const project = await this.#projects.readOwned(uid, projectId);
     const entitlements = await this.#entitlements.forUser(uid);
@@ -436,7 +444,8 @@ export class SessionRepository {
     const ref = idempotencyId === undefined ? collection.doc() : collection.doc(idempotencyId);
     const firstMessage = ref.collection(messagesCollectionName).doc(messageId(0));
     const existing = await commandTransaction<BuildSession>({ db: this.#firestore, parent: this.#projects.refFor(projectId), uid, key: commandId,
-      input: ['create-session', input.prompt, input.model, input.effort ?? null, input.mode ?? null, attachments],
+      input: voice ? ['create-voice-session', input.model, input.effort ?? null, input.mode ?? null]
+        : ['create-session', input.prompt, input.model, input.effort ?? null, input.mode ?? null, attachments],
       encode: (session) => ({ id: session.id }),
       decode: async (value, transaction) => {
         const id = stringField(receiptFields(value), 'id', 'command');
@@ -460,7 +469,7 @@ export class SessionRepository {
       assertBuildAllowed(entitlements, currentProject.platform, input.model);
       const effort = resolveAiEffort(entitlements, input.effort);
 
-      await this.#metering.consumeIn(transaction, {
+      if (!voice) await this.#metering.consumeIn(transaction, {
         uid,
         entitlements,
         meterKey: registry.buildMeterKey,
@@ -469,33 +478,35 @@ export class SessionRepository {
       });
 
       transaction.create(ref, {
+        ...(voice ? { entrypoint: 'voice' } : {}),
         projectId: project.id,
         ownerUid: uid,
-        status: 'QUEUED',
+        status: voice ? 'IDLE' : 'QUEUED',
         model: input.model,
         effort,
         mode,
-        messageCount: 1,
+        messageCount: voice ? 0 : 1,
         // The single field a runner queries on. See `claim`.
-        claimableAt: Timestamp.fromDate(now),
+        ...(voice ? {} : { claimableAt: Timestamp.fromDate(now) }),
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });
-      transaction.create(firstMessage, {
+      if (!voice) transaction.create(firstMessage, {
         role: 'user',
         content: input.prompt,
         ...attachmentsField(attachments),
         createdAt: FieldValue.serverTimestamp(),
       });
       transaction.update(this.#projects.refFor(project.id), {
-        activeSessionId: ref.id,
+        activeSessionId: voice ? null : ref.id,
         updatedAt: FieldValue.serverTimestamp(),
       });
     return {
+      ...(voice ? { entrypoint: 'voice' as const } : {}),
       id: ref.id,
       projectId: project.id,
       ownerUid: uid,
-      status: 'QUEUED',
+      status: voice ? 'IDLE' : 'QUEUED',
       model: input.model,
       effort,
       mode,
@@ -506,7 +517,7 @@ export class SessionRepository {
       error: undefined,
       reservationIds: [],
       specialistReservationIds: [],
-      messageCount: 1,
+      messageCount: voice ? 0 : 1,
       createdAt: now,
     };
     } });
