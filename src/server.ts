@@ -315,6 +315,12 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
       maxBufferedBytes: config.SSE_BUFFER_MAX_BYTES,
       reauthenticate: async (token) => { await firebaseAuth.verifyIdToken(token, true); },
     });
+    dependencies.voice?.bindTaskCommands(async input => {
+      const result = await api.inject({ method: 'POST', url: `/sessions/${input.sessionId}/messages`,
+        remoteAddress: input.remoteAddress,
+        headers: { authorization: `Bearer ${input.token}`, 'idempotency-key': input.key }, payload: input.body });
+      return { statusCode: result.statusCode, body: result.json() as unknown };
+    });
     registerBillingRoutes(api, {
       stripe: dependencies.stripe,
       billing: dependencies.billing,

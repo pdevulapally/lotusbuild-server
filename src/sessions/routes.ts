@@ -109,6 +109,7 @@ export function toMessageResponse(message: SessionMessage) {
     content: message.content,
     attachments: message.attachments,
     createdAt: message.createdAt.toISOString(),
+    ...(message.voiceSpeaker === undefined ? {} : { voiceSpeaker: message.voiceSpeaker }),
   };
 }
 

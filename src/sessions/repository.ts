@@ -150,6 +150,8 @@ export interface BuildSession {
   readonly specialistReservationIds: readonly string[];
   readonly taskContext?: TaskContext;
   readonly messageCount: number;
+  /** Conversational notes do not change execution/checkpoint authority. */
+  readonly voiceMessageCount?: number | undefined;
   readonly createdAt: Date;
 }
 
@@ -173,6 +175,8 @@ export interface SessionMessage {
   /** Images the user attached; the bytes live in `AttachmentStore` under the owner. */
   readonly attachments: readonly AttachmentRef[];
   readonly createdAt: Date;
+  /** Conversation context, never runner/tool evidence or approval authority. */
+  readonly voiceSpeaker?: 'user' | 'assistant' | undefined;
 }
 
 export interface SteerMessage {
@@ -204,7 +208,9 @@ function messageId(seq: number): string {
 }
 
 function continuationSource(project: Project, session: BuildSession): string {
-  return createHash('sha256').update(JSON.stringify([project.snapshot, session.model, session.mode, session.messageCount])).digest('hex');
+  const executionMessages = session.messageCount - (session.voiceMessageCount ?? 0);
+  if (!Number.isSafeInteger(executionMessages) || executionMessages < 1) throw new Error('Invalid execution message count.');
+  return createHash('sha256').update(JSON.stringify([project.snapshot, session.model, session.mode, executionMessages])).digest('hex');
 }
 function continuationQueued(session: BuildSession): boolean {
   return session.fallback?.checkpointId !== undefined && ['QUEUED', 'CAPACITY_WAIT', 'RUNNING'].includes(session.fallback.status);
@@ -252,6 +258,7 @@ function parseSession(id: string, fields: Fields, where: string): BuildSession {
     reservationIds: stringArrayField(fields, 'reservationIds', where),
     specialistReservationIds: stringArrayField(fields, 'specialistReservationIds', where),
     messageCount: integerField(fields, 'messageCount', where, { min: 1 }),
+    ...(fields['voiceMessageCount'] === undefined ? {} : { voiceMessageCount: integerField(fields, 'voiceMessageCount', where, { min: 0, max: integerField(fields, 'messageCount', where, { min: 1 }) - 1 }) }),
     createdAt: timestampField(fields, 'createdAt', where),
   };
 }
@@ -263,6 +270,7 @@ function parseMessage(id: string, fields: Fields, where: string): SessionMessage
     content: stringField(fields, 'content', where),
     attachments: attachmentRefsField(fields, 'attachments', where),
     createdAt: timestampField(fields, 'createdAt', where),
+    ...(fields['voiceSpeaker'] === undefined ? {} : { voiceSpeaker: enumField(fields, 'voiceSpeaker', where, ['user', 'assistant']) }),
   };
 }
 
@@ -1424,14 +1432,25 @@ export class SessionRepository {
     });
   }
 
-  /**
-   * Adds what the agent said to the transcript, under the runner's lease.
-   *
-   * Separate from `appendPrompt` because the rules are opposite: a user may only
-   * speak when the session is idle, and a runner may only speak while it holds
-   * it. Sharing one method would mean a check that means different things to
-   * different callers.
-   */
+  /** Final voice dialogue shares this history without scheduling work or impersonating a worker. */
+  async appendVoiceTurn(uid: string, sessionId: string, speaker: 'user' | 'assistant', text: string, key: string): Promise<void> {
+    this.#validatePrompt(text);
+    const parent = this.#ref(sessionId);
+    await commandTransaction<{ recorded: true }>({ db: this.#firestore, parent, uid, key,
+      input: ['voice-turn', speaker, text], decode: () => ({ recorded: true }), work: async tx => {
+        const snapshot = await tx.get(parent);
+        if (!snapshot.exists || snapshot.data()?.['ownerUid'] !== uid) throw new AppError({ code: 'session/not-found', statusCode: 404, message: 'No such session.' });
+        const session = parseSession(sessionId, snapshot.data()!, parent.path);
+        await this.#projects.readOwnedInTransaction(tx, uid, session.projectId);
+        tx.create(parent.collection(messagesCollectionName).doc(messageId(session.messageCount)), {
+          role: 'user', voiceSpeaker: speaker, content: text, createdAt: FieldValue.serverTimestamp(),
+        });
+        tx.update(parent, { messageCount: FieldValue.increment(1), voiceMessageCount: FieldValue.increment(1), updatedAt: FieldValue.serverTimestamp() });
+        return { recorded: true };
+      } });
+  }
+
+  /** Adds execution-agent dialogue under the runner's lease, unlike owner voice context. */
   async appendAssistantMessage(
     sessionId: string,
     authority: SessionLease,

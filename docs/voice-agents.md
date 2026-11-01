@@ -1,97 +1,116 @@
-# ElevenLabs voice for the existing LotusBuild agent
+# Native realtime voice for LotusBuild
 
-Status: local implementation, disabled by default. No provider account, keys, agent, paid evaluation, registry migration or production deployment was created. Configuration and policy approval are separate activation steps.
+Disabled by default. The owner's agent remains unpublished. No provider configuration writes, paid calls, registry migration, merge or production deployment are authorized here. The earlier STT/TTS adapter and illustrative audio-only cost table are superseded.
 
-## Architecture and boundaries
+## Architecture
 
-Voice is another input/output surface for an existing owned session. It does not create a voice task, model loop, tool registry, approval store or MCP client. Realtime Scribe transcribes audio; committed text goes through the existing authenticated `/sessions/:id/messages` route and its durable mutation receipt. While work is running it uses the existing safe-point steering mechanism. Several accepted clarifications are now preserved together within its existing length/attachment bounds, rather than overwriting earlier accepted instructions. Text and voice share project guards, task context, queued work, model entitlements, approvals, resource reservations and cancellation.
+The browser streams bounded mono PCM16 to the authenticated LotusBuild WebSocket and plays negotiated PCM output. The backend connects to a pinned private **ElevenAgents Realtime** agent using native fetch and the existing `ws` dependency. The live voice model handles conversation and natural turns; every utterance does not automatically become a build request.
 
-The API relays audio using server-only ElevenLabs authentication. Browsers receive no ElevenLabs key, signed URL, agent credentials or long-lived provider access. Firebase authentication is sent in the first WebSocket frame, never the URL, and rechecked with revocation checking during the call. Ownership and plan permissions are checked before microphone permission and again on socket admission. The relay accepts only PCM, stop-speech, end-call, and requests to read server-selected status/completed messages. It cannot execute a provider tool, accept an approval, change grants or cancel a task. No provider tool webhook is registered; unsolicited callbacks have no voice command endpoint. This design therefore has no incoming provider webhook signature or replay-authentication contract to invent.
+Exactly two argument-free provider **client tools** are attached and executed on the server relay:
 
-The existing runner remains autonomous after the audio connection ends. Spoken acknowledgments are requested after HTTP acceptance, and progress uses factual runtime event labels. A tool call is never described as successful from its name, input, or model claims. Completed assistant responses are read from owned durable chat after the turn becomes idle; their accuracy follows the same evidence and completion rules as text. Raw tool output and code blocks are not read aloud. No independent voice model generates success claims.
+- `lotus_task_status`: current owned task state, pending question/approval kind and bounded recent chat.
+- `lotus_submit_request`: actual latest captured user utterance through the existing authenticated `POST /sessions/:id/messages` route. No model-supplied prompt substitution, identity, project, model, grant or approval is accepted. The server supplies a pending question's identity. Approval and saved-checkpoint continuation require existing UI controls.
 
-## Current documentation checked on 1 November 2026
+The HTTP boundary rechecks Firebase auth, verified email, ownership/project access, permissions, rate limits, admission, metering and durable idempotency receipts. The existing runner executes development tools and MCP integrations. No separate execution pipeline, provider-hosted MCP, knowledge base, webhook action or workflow is created. Existing safe-point steering preserves accepted clarifications within its bounds.
 
-- [Realtime transcription API](https://elevenlabs.io/docs/api-reference/speech-to-text/v-1-speech-to-text-realtime): authenticated server WebSocket, `scribe_v2_realtime`, mono PCM16, VAD commits, partial/final transcripts, errors and privacy warnings.
-- [Commit strategies](https://elevenlabs.io/docs/eleven-api/guides/how-to/speech-to-text/realtime/transcripts-and-commit-strategies): microphone VAD and bounded audio chunks. The documented initial audio buffer means the advertised model latency is not an end-to-end conversational latency guarantee.
-- [Streamed speech API](https://elevenlabs.io/docs/api-reference/text-to-speech/stream): HTTP streaming, configured voice/model and PCM output. The existing `ws` package and native fetch implement these small documented protocols; no extra provider SDK or provider LLM is needed.
-- [Authentication for ElevenAgents](https://elevenlabs.io/docs/eleven-agents/customization/authentication): private browser agents can use short-lived signed access. This implementation uses server-relayed audio APIs instead of creating a separate ElevenAgents conversation.
-- [Zero retention](https://elevenlabs.io/docs/eleven-api/resources/zero-retention-mode): eligibility and covered endpoint payloads; account verification remains required.
-- [Training/data use](https://elevenlabs.io/docs/help-center/legal/is-my-data-used-to-improve-eleven-labs-ai-models): training policy is a separate question.
+Final voice dialogue shares the existing project chat as explicit voice notes. Voice assistant messages are never worker/tool completion evidence; all voice notes are marked non-executable context for the runner. Separately admitted task commands carry actual instructions. Notes do not change the execution count used to validate durable checkpoints. Text and voice use the same session without starting another task.
 
-## Controls, recovery and approvals
+Pre-tool speech is disabled and audio is suppressed while a bridge tool runs. Acceptance results say `completionVerified: false`; status/progress uses backend facts rather than raw tool content. Native model wording still needs live evaluation: instructions do not prove perfect model compliance.
 
-- Stop speech aborts synthesis and immediately stops local buffered playback. Generation fencing rejects stale audio. It does not stop tools or task execution.
-- Mute disables the microphone track; silence frames keep transport alive until the idle/time limit. No spoken audio is captured from a disabled track.
-- End call closes capture, playback, upstream synthesis/transcription, event subscription, timers and the concurrency lease. It does not cancel accepted work. Browser hiding/page exit also ends capture.
-- Cancel task uses the existing authenticated UI command and mutation identity. Already dispatched external effects can have uncertain outcomes; ending audio never replays them.
-- Consequential approvals remain on screen, bound to the existing pending request and approval controls. Spoken recognition is not identity or consent to an external operation. A pending approval cannot be answered by the voice transcript path.
-- Unexpected audio disconnects get at most three bounded reconnect attempts, fresh authentication and a canonical task refresh. No captured audio or historical utterance is replayed. Partial words during a gap are discarded and the UI says to repeat them. Expiry, privacy rejection, usage limits and normal timeouts require an explicit new call.
-- HTTP acceptance uncertainty retains the original text-command identity, prompt and steering flag across reloads. It stops automatic voice submission; subsequent unsent words remain visible for review. Call ending does not cancel an HTTP request already sent.
+## Security and recovery
 
-## Metering, limits and cost cap
+Firebase tokens go only in the first WebSocket frame, not URLs/subprotocols. The server checks origins, payload/rate bounds, access, plans and leases; revocation/access/entitlements are rechecked every five seconds. Every task command independently traverses the existing HTTP authorization boundary. Speech recognition is never identity.
 
-Activation must add explicit capabilities to the existing registry/plan system: `voice.enabled` (boolean), `voice.concurrent` (finite number, maximum 10), and `voice.call.seconds` (finite number). No values have been written. User call time is the lower of the plan allowance and deployment ceiling. Missing fields fail explicitly.
+Before paid connection, read-only agent/tool/workspace GETs validate the pinned version, audited SHA-256 configuration, private authentication, Zero Retention Mode, no recordings, native model, bounded duration/output and exactly two client tools. Agent and inherited workspace initiation/post-call webhooks are rejected; workspace settings are included in the reviewed digest. Use a suitably isolated workspace if other agents need those callbacks. Signed access uses `include_conversation_id=true`, documented as single use. Signed URLs, provider keys and persistent session tokens stay server-side; fixed TLS host/path and disabled redirects prevent destination substitution.
 
-Add existing-style monthly COUNTER meters `voice.seconds` and `voice.characters` and a hard limit for each eligible plan, with overage disabled. No free or paid tier receives an inferred allowance. Voice uses `MeteringService.consumeIn` in the same Firestore transaction as the platform spend claim. Missing meters or permissive overage settings refuse dispatch.
+Provider tool events arrive only on the server-owned authenticated TLS socket. No incoming HTTP tool/webhook endpoint exists, so no invented webhook signature scheme is needed. Unknown tools, arguments, malformed frames and conflicting replay fail closed. Restrict provider administration: shared tool definitions must not be edited behind the reviewed configuration.
 
-Seconds are admitted in bounded, prepaid windows of up to 10 seconds, including silence; characters are consumed before a synthesis request. Unused or uncertain dispatch allowance is conservatively consumed, not refunded or charged to Stripe. The UI must not present these counters as an exact ElevenLabs invoice. The global monthly GBP estimate cap is durable and atomic across users/processes. It uses configured conservative unit rates, rounded up per dispatch. Claims fence duplicate paid dispatches. A crash cannot leave an indefinitely open billing reservation. This cap bounds estimates for voice calls made through this backend; it cannot bound unrelated use of the same provider account or unapproved/changed provider prices. Configure the provider's own hard spending controls too.
+One task/conversation/user-event identity fences multiple tool calls for the same utterance; durable HTTP receipts survive API replacement. Uncertain outcomes are retained without blind retry. Reconnection restores actual task state/history but starts with no fresh executable utterance, so history and progress notifications cannot replay work.
 
-Redis server-time leases atomically limit concurrent calls across API instances. Leases expire after 20 seconds, renew every 5 seconds, and local audio authority expires after 10 seconds without renewal. Slow consumers, oversized audio, faster-than-realtime upload, input beyond prepaid seconds, control-message floods and excessive synthesis are refused. Calls have absolute lifetime, idle, authentication and synthesis timeouts. API shutdown closes them. No recording continues indefinitely after a browser disappears.
+- **Stop speech** immediately clears local playback and suppresses the current response; tools/tasks continue. Natural barge-in uses provider interruption events. There is no undocumented upstream cancel-generation message. Local silence does not promise to stop provider token generation.
+- **Mute** disables the microphone track; time and idle limits continue.
+- **End call**, hiding the page or leaving it closes capture/playback, provider socket, subscription and lease. Accepted task work continues independently.
+- **Cancel task** and consequential **Approve/Reject** remain separate authenticated, action-bound UI commands. Spoken agreement cannot approve.
+- Unexpected transport failures get at most three bounded reconnect attempts with fresh authentication/task refresh. Gap audio is discarded, never replayed. Privacy/expiry/quota/time-limit failures require explicit restart.
 
-## Required provider/deployment configuration
+## Limits and costs
 
-Keep both variables absent to keep voice disabled:
+Nothing is seeded. Activation requires explicit registry capabilities `voice.enabled` (boolean), `voice.concurrent` (integer 1–10), `voice.call.seconds` (positive integer). Call duration is the lower of plan and deployment ceilings.
 
-- `ELEVENLABS_API_KEY`: server secret with only the required STT/TTS permissions and approved spending controls. Do not add it to public environment variables, a prompt, chat or logs.
-- `ELEVENLABS_VOICE_CONFIG`: one strict JSON object containing every field below; unknown fields fail validation.
+Add monthly COUNTER meters `voice.seconds` and `voice.cost.microgbp`, with explicit per-plan allowances/hard limits and **overage disabled**. Seconds are prepaid in up-to-ten-second windows, including silence. The full approved worst-case per-call cost allocation is consumed before each conversation, including reconnects. Existing metering batches both counters atomically with the Firestore global allocation/dispatch claim. Failed/uncertain dispatches conservatively retain allocation. These are budgets, not Stripe charges or exact invoices.
 
-| Field | Required value/meaning |
+`globalMonthlyMicroGbp` atomically limits allocations across users/replicas, **not an independently proven provider invoice**. Native realtime charges agent minutes plus input/cached/output model tokens. The operator must approve `maxCallMicroGbp`, conservative contract/FX/token assumptions and acceptable provider-account spending controls. If an enforceable spending boundary is unavailable, report that limitation and leave voice disabled. No unit rates are invented.
+
+Redis server-time leases enforce global/per-user concurrency, expire after 20 seconds and renew every five. Local audio authority expires within ten seconds without renewal. Hard call/idle/auth/provider-connect timeouts, turn/tool counts, buffer/byte bounds, realtime upload limits and control-rate limits bound abandoned/abusive sessions. Task work retains the runner's separate lifecycle.
+
+### Plan breakdown for separate approval
+
+| Existing plan | Current voice allowance | Proposed policy |
+|---|---|---|
+| Free | Unset; disabled | Explicit monthly seconds/cost ceilings; no overage; approved call/concurrency limits |
+| Pro | Unset; disabled | Same counters; owner selects paid-plan allowance/cost envelope |
+| Business | Unset; disabled | Same counters; owner selects team/concurrency envelope |
+
+For each plan approve monthly seconds `S`, allocated cost `B`, max-call seconds `D` and concurrency `N`. Estimate cost as `minutes × contracted agent rate + input tokens × input rate + cached tokens × cached rate + output tokens × output rate`, explicitly accounting for FX/tax/fees/subscription minimums. Task model/sandbox/MCP costs stay separate. Per-call allocation `C` also bounds admitted calls by `floor(B/C)` and remaining global allocation. No tier numbers or monetary quote are proposed without the required contract/owner limits.
+
+## ElevenLabs and VPS configuration
+
+Leave **both** variables absent to keep voice disabled; partial configuration fails startup:
+
+- `ELEVENLABS_API_KEY`: server secret restricted to required agent/tool/workspace-settings reads and authenticated conversation access. Restrict administration and configure approved spending controls. Never place in `NEXT_PUBLIC_`, chat, prompts or logs.
+- `ELEVENLABS_VOICE_CONFIG`: strict application policy JSON with every field below. The dashboard does not automatically supply this object.
+
+| Field | Value source |
 |---|---|
-| `voiceId` | Owner-selected, licensed voice ID verified in the provider account |
-| `ttsModel` | Account-available low-latency speech model, verified against its model catalogue |
-| `maxCallSeconds` | Approved deployment ceiling, at most 1800 seconds |
-| `idleSeconds` | Approved inactivity timeout, no higher than call ceiling |
-| `maxConnections` | Approved global concurrency ceiling, at most 1000 |
-| `maxSpeechCharacters` | Approved per-call synthesis ceiling, at most 20000 |
-| `globalMonthlyMicroGbp` | Approved global monthly voice estimate cap, integer millionths of GBP |
-| `sttMicroGbpPerMinute` | Approved conservative contracted cost rate, including applicable minimums/FX/fees |
-| `ttsMicroGbpPerThousandCharacters` | Same, per thousand speech characters |
-| `privacyVersion` | Version of the owner-approved consent notice, letters/digits/underscore/hyphen |
-| `zeroRetentionVerified` | `true` only after exact ElevenLabs endpoint/account coverage is verified |
-| `downstreamZeroRetentionVerified` | `true` only after all reachable task model providers/fallback lanes have verified acceptable zero-retention coverage |
-| `trainingOptOutVerified` | `true` only after separately verifying the required account data-use setting |
+| `environment` | Explicit `global` or `eu`; EU uses its separately eligible workspace/key, never an automatic fallback |
+| `agentId`, `agentVersionId` | Selected agent and reviewed immutable published version, after separate publication approval |
+| `statusToolId`, `submitToolId` | IDs of the two client tools |
+| `agentConfigSha256` | Reviewed digest from read-only audit below |
+| `privacyVersion` | Approved consent-notice identifier |
+| `maxCallSeconds`, `idleSeconds` | Approved ceilings; call ≤1800 seconds, idle ≤call |
+| `maxConnections`, `maxTurns` | Approved global connection/per-call turn ceilings; maxima 1000/100 |
+| `maxCallMicroGbp`, `globalMonthlyMicroGbp` | Approved per-call/global monthly allocations, positive integer millionths of GBP |
+| `zeroRetentionVerified`, `downstreamZeroRetentionVerified` | True only after exact account/model/region/downstream coverage is evidenced |
+| `trainingOptOutVerified` | Separate training-use verification, never a substitute for zero retention |
+| `providerSpendingLimitVerified` | True only after acceptable spending controls and cost assumptions are verified |
 
-These booleans are operator attestations, not provider introspection or proof of compliance. No attestation has been made here. Verify all live plan/model/fallback combinations before setting them, and re-review them when that configuration changes. The currently implemented provider origins are the global ElevenLabs API; an EU-only residency requirement needs a separately verified endpoint/configuration change before activation. No ElevenLabs agent ID, OAuth app, webhook secret, cloned voice, or ElevenLabs-hosted MCP connection is required.
+Prepare the current **unpublished** dashboard draft without publishing or Preview-calling it:
 
-## Privacy: data, retention and deletion
+1. Name LotusBuild Voice; Voice mode **Realtime**; **Eleven Realtime v1 Max**; owner's licensed voice/language. Max supports ZRM in US/EU; Mini does not. Realtime manages ASR/LLM/TTS, so the old Custom LLM selector is not used. Set an AI-disclosing first message, for example: "Hi, I'm LotusBuild's AI assistant. What would you like to work on?"
+2. Require authentication; no public/shareable access. Enable per-agent Zero Retention Mode, disable recordings and backup LLM cascading. Verify account eligibility and exact audio/transcript/conversation-log/all downstream coverage. No recording/analytics/transcript webhooks.
+3. Output token limit 1024–4096; bounded duration; interruptible first message/turns; client events `audio`, `interruption`, `user_transcript`, `agent_response`, `agent_response_correction`, `agent_response_complete`, `client_tool_call`. Optional VAD events improve idle detection.
+4. Exactly two client tools: `lotus_task_status` and `lotus_submit_request`, expecting response, pre-tool speech **off**, interruption **allow**, empty object parameters/no properties or required arguments. Descriptions distinguish checked status from exact-current-utterance submission; neither approves/cancels.
+5. Enable system-prompt override. Server supplies safety instructions/current context at connection initiation. No browser prompt/identity override. Leave provider KB/workflows/procedures/language overrides/hosted MCP/built-in actions absent. Hosted MCP is unavailable with ZRM; existing LotusBuild MCP stays in its runner.
+6. After separate privacy/cost/publication approval, pin the resulting version and audit it. Provide a syntactically valid 64-character digest for initial strict-policy parsing, then explicitly review/pin the candidate; never auto-accept drift:
 
-ElevenLabs receives live microphone PCM and the text selected for speech. It returns transcripts and audio. Both paths request `enable_logging=false`. Its published coverage lists STT audio input/text output and TTS text input/audio output as eligible for zero retention for eligible enterprise accounts. Request analytics can remain without content. The API documents that STT can warn that zero retention was ignored; the relay closes on any warning. A query flag alone does not prove eligibility or prevent data already sent from having been processed.
+   `node --experimental-strip-types src/voice/audit.ts`
 
-This implementation creates no ElevenAgents conversation log and adds no ElevenLabs downstream LLM. However, committed messages still reach LotusBuild's existing Anthropic/OpenRouter task providers, and tools/MCP may reach approved external systems. Their retention and any continuing task/checkpoint retention are separate from ElevenLabs ZRM. Existing provider credentials, model-provider contracts, account eligibility, moderation/log exceptions, residency and deletion coverage have **not** been verified in the owner's accounts. Training exclusion is not zero retention. The published ElevenAgents ZRM documentation also states MCP is currently unavailable there; using LotusBuild's existing MCP execution avoids assuming that ElevenAgents feature combination is supported.
+   Supply secrets through the approved process environment/secret store. This utility performs only agent/tool/workspace-settings GETs and prints digest/match boolean. It never requests signed access, opens a conversation, prints raw config or publishes anything. It has **not** been run against the owner's account.
 
-LotusBuild stores no audio file, partial-transcript log or extra voice transcript. Final sent text uses normal project chat storage, durable command receipts and approved existing task/checkpoint policy. Visible unsent words stay in component memory; uncertain sent commands use the existing pending-command browser storage. End call stops future audio transfer. Uncheck consent to withhold the next call; deleting a project and the existing account privacy-request controls apply to saved chat. Account erasure uses the existing operator-reviewed workflow. New platform spend records contain quantities and random dispatch digests, not uid, audio or text. Content-free call IDs, close reasons, duration/byte/character counts, transcript sequence numbers, connection latency and first-audio/turn latency are logged; no token, provider response body, transcript or audio is logged.
+## Data and observability
 
-If exact required zero-retention coverage is unavailable, keep voice disabled. Options for a separate owner decision are an eligible enterprise agreement/region, a different audio provider with suitable coverage, or a revised explicit retention policy. Standard retention is not silently substituted.
+ElevenLabs receives live audio, bounded recent project conversation/current state, server instructions and restricted tool results. Recent chat can contain confidential/personal project data; consent discloses this sharing. Accepted work uses the same downstream task providers as text. No raw audio persists in LotusBuild; bounded memory buffers are discarded at call end and never replayed.
 
-## Proposed allowances for owner review only
+Final dialogue is retained as project chat after per-call consent under existing access/export/privacy-request/deletion mechanisms. Project deletion recursively removes session messages; account erasure uses the existing reviewed privacy workflow. Until deletion notes remain project chat, not a promise of automatic timed erasure. End call stops sharing; withhold consent/use text to avoid another call. Provider zero retention and training policy are distinct. Deployment flags are operator attestations, not proof of eligibility/compliance.
 
-None of these values is seeded, enabled or an existing plan promise. Using the [public API page](https://elevenlabs.io/pricing/api?price.section=speech_to_text) viewed on 1 November 2026, an illustrative rate is USD 0.39/hour for realtime STT and USD 0.04/1000 characters for Flash/Turbo speech. An enterprise zero-retention quote may differ. GBP rates must be approved from the actual contract and conservative FX/fee assumptions, not copied from this illustration.
+No sensitive transcript/debug logs. New logs contain random call ID, bounded event/tool names, connection/turn/tool latency, close reason, duration/bytes and replay indicators; no tokens, keys, signed URLs, prompts, transcripts, audio or raw provider error bodies. Ledgers hold quantities/allocation claims, not conversation content. Reconcile budgets with provider billing separately.
 
-| Existing LotusBuild plan | Proposed monthly audio input | Proposed monthly speech text | Proposed max call | Proposed concurrent calls | Illustrative audio-only variable cost at both full allowances |
-|---|---:|---:|---:|---:|---:|
-| Free | 5 minutes / 300 seconds | 1000 characters | 5 minutes | 1 | USD 0.0725 |
-| Pro | 120 minutes / 7200 seconds | 20000 characters | 15 minutes | 1 | USD 1.58 |
-| Business | 360 minutes / 21600 seconds | 60000 characters | 30 minutes | 2 | USD 4.74 |
+If exact required retention coverage is unavailable, report alternatives for owner decision: eligible enterprise agreement/region, another suitable provider, or a separately approved revised policy. Never silently enable standard retention.
 
-Formula: `(seconds / 3600 × STT hourly rate) + (characters / 1000 × TTS rate)`. This excludes enterprise subscription minimums, VAT, FX, network/storage/API overhead, existing task model tokens, sandbox time and retries charged by providers. Existing task meters still apply and may stop work before an audio allowance is exhausted. These are separate input and output caps, not a promise of uninterrupted conversation minutes. The owner must approve or replace every proposal and select a global budget before activation.
+## Verification and activation gates
 
-## Verification and remaining activation gates
+Native revision: backend typecheck/build and 139 targeted voice/task/approval/cancellation/recovery/history/storage/admission tests; frontend typecheck, 102 contracts and production build pass. Local real Fastify HTTP/WebSocket transport is tested with mocked provider/auth/datastore. The broad Windows run before three final regression cases had 800 tests, 691 passed, 108 failed, one skipped; the previously verified baseline also had 108 Windows failures. Linux CI must verify this revision; the Windows suite is not reported as green.
 
-Verified locally: backend typecheck/build; 72 targeted voice + existing session-control tests; real local HTTP/WebSocket transport with a mocked provider; frontend typecheck, contract suite and Next production build; static state previews at desktop and 390px without horizontal overflow; headless Chrome AudioWorklet capture from a synthetic WebAudio stream (6400-byte PCM chunks), mute/track cleanup, denied permission and backend authorization before microphone request. No physical microphone or provider was used.
+Mocks cover native tool submission, duplicates/concurrency/replay, exact speech, pending questions, approval/continuation refusal, API replacement, cancellation, auth/ownership/expiry denial, privacy/configuration rejection, outages, interruptions, bounded reconnect/no replay, call/idle limits and atomic allocations. Documented provider fixtures are not proof of account compatibility.
 
-Mocked tests cover voice-to-existing-command submission, duplicate transcript delivery, stable retry identity and steering, authentication/ownership/expiry, privacy warnings, provider disconnects, bounded reconnects with task refresh, approval refusal, stopping speech versus ending/cancelling work, call/idle limits, uncertain synthesis, and transactional shared cost/per-user caps. The Firestore transaction adapter and provider sockets are fakes. The distributed Redis Lua admission script has not been run against a real Redis in this local Windows run.
+Rendering/synthetic AudioWorklet checks use desktop headless Chrome and a 390px mobile viewport, not physical microphones. Live ElevenLabs/account privacy, Redis multi-replica runtime, authenticated production browser flow, billing reconciliation, real iOS/Android mic/echo/background/network handoff and end-to-end latency remain unverified. Run only after relevant approval; do not label this production-verified before those gates pass.
 
-The unchanged backend baseline has 780 tests: 671 pass, 108 fail, 1 skipped in this Windows environment. The final feature run has 794 tests: 685 pass, the same 108 failing test names, and 1 skipped; failures include missing POSIX commands and existing runner fixtures. Do not describe the entire backend suite as green. Linux CI remains necessary.
+## Official references verified 1 November 2026
 
-Before activation: approve allowances/rates/global cap/data policy; verify exact ZRM and downstream coverage with account evidence; configure least-privilege key and licensed voice/model; apply approved registry/plan values; run Linux CI, real Redis multi-instance/expiry tests, a bounded paid ElevenLabs end-to-end evaluation after approval, and real iOS Safari/Android microphone tests (interruption, permission revocation, backgrounding, network handoff, speaker echo/headphones). End-to-end latency, voice quality, provider billing reconciliation, live zero-retention enforcement and real-device behavior remain unverified. Merge/deployment is a separate approved step.
+- [Realtime models, pricing and ZRM compatibility](https://elevenlabs.io/docs/eleven-agents/customization/realtime-models)
+- [WebSocket protocol and client tools](https://elevenlabs.io/docs/eleven-agents/api-reference/eleven-agents/websocket)
+- [Single-use private access](https://elevenlabs.io/docs/api-reference/conversations/get-signed-url)
+- [Authentication](https://elevenlabs.io/docs/eleven-agents/customization/authentication)
+- [Zero Retention Mode](https://elevenlabs.io/docs/eleven-agents/customization/privacy/zrm)
+- [Data residency and isolated API/WebSocket environments](https://elevenlabs.io/docs/overview/administration/data-residency)
+- [Workspace settings and inherited callbacks](https://elevenlabs.io/docs/api-reference/workspace/get)

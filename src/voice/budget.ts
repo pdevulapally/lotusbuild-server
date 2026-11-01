@@ -11,7 +11,7 @@ export interface VoiceBudget {
   acquire(uid: string, callId: string, concurrent: number): Promise<boolean>;
   renew(uid: string, callId: string): Promise<boolean>;
   release(uid: string, callId: string): Promise<void>;
-  charge(uid: string, entitlements: UserEntitlements, kind: 'seconds' | 'characters', quantity: number, operation: string): Promise<void>;
+  charge(uid: string, entitlements: UserEntitlements, kind: 'call' | 'seconds', quantity: number, operation: string): Promise<void>;
 }
 
 /** Redis server time, atomic admission across API replicas, expiring abandoned calls. */
@@ -50,16 +50,17 @@ export class MeteredVoiceBudget implements VoiceBudget {
     const results = await this.redis.multi().zrem(this.#keys(uid)[0]!, callId).zrem(this.#keys(uid)[1]!, callId).exec();
     if (!results || results.some(([error]) => error)) throw new Error('Voice lease release failed.');
   }
-  async charge(uid: string, entitlements: UserEntitlements, kind: 'seconds' | 'characters', quantity: number, operation: string) {
+  async charge(uid: string, entitlements: UserEntitlements, kind: 'call' | 'seconds', quantity: number, operation: string) {
     if (!Number.isSafeInteger(quantity) || quantity < 1) throw new Error('Invalid voice charge.');
     const now = new Date();
-    const key = `voice.${kind}`;
+    const quantities = [{ meterKey: 'voice.seconds', quantity }, ...(kind === 'call' ? [{ meterKey: 'voice.cost.microgbp', quantity: this.config.maxCallMicroGbp }] : [])];
     const { registry } = await this.configuration.get();
-    const meter = registry.meters.get(key);
-    const limit = entitlements.meterLimits.get(key);
-    if (meter?.kind !== 'COUNTER' || meter.resetPeriod !== 'MONTHLY' || !limit || limit.overageEnabled) throw new Error('Voice requires explicit monthly hard-capped counters.');
-    const cost = Math.ceil(quantity * (kind === 'seconds' ? this.config.sttMicroGbpPerMinute / 60 : this.config.ttsMicroGbpPerThousandCharacters / 1000));
-    if (!Number.isSafeInteger(cost) || cost < 1) throw new Error('Invalid voice cost.');
+    for (const item of quantities) {
+      const meter = registry.meters.get(item.meterKey), limit = entitlements.meterLimits.get(item.meterKey);
+      if (meter?.kind !== 'COUNTER' || meter.resetPeriod !== 'MONTHLY' || !limit || limit.overageEnabled) throw new Error('Voice requires explicit monthly hard-capped counters.');
+    }
+    // Full approved worst-case allocation is committed BEFORE connecting. No assumed STT/TTS price equivalence.
+    const cost = kind === 'call' ? this.config.maxCallMicroGbp : 0;
     const aggregate = this.db.doc(`voice_spend/${now.toISOString().slice(0, 7)}`);
     const claim = aggregate.collection('dispatches').doc(createHash('sha256').update(operation).digest('hex'));
     await this.db.runTransaction(async tx => {
@@ -68,7 +69,7 @@ export class MeteredVoiceBudget implements VoiceBudget {
       const spent: unknown = total.exists ? total.data()?.['microGbpUpperBound'] : 0;
       if (!Number.isSafeInteger(spent) || (spent as number) < 0) throw new Error('Invalid voice cost ledger.');
       if ((spent as number) + cost > this.config.globalMonthlyMicroGbp) fail('voice/platform-limit', 'Voice capacity is unavailable. Continue in text.');
-      await this.metering.consumeIn(tx, { uid, entitlements, meterKey: key, quantity, now });
+      await this.metering.consumeManyIn(tx, { uid, entitlements, quantities, now });
       tx.set(aggregate, { microGbpUpperBound: (spent as number) + cost, updatedAt: FieldValue.serverTimestamp() });
       // No identity or conversation content. A claim fences uncertain provider outcomes.
       tx.create(claim, { kind, quantity, microGbpUpperBound: cost, createdAt: FieldValue.serverTimestamp() });
