@@ -836,6 +836,54 @@ async function routeApp(h: ReturnType<typeof harness>, append: SessionEvents['ap
 }
 const authHeaders = { authorization: 'Bearer fixture-token', 'idempotency-key': 'stable-test-command-1' };
 
+test('voice session creation is idle, empty, uncharged and idempotent across API replacement', async t => {
+  const h = harness(); const published: string[] = [];
+  let app = await routeApp(h, async (_id, type, data) => { published.push(type); return { id: '1-0', type, data }; });
+  t.after(() => app.close());
+  const request = { method: 'POST' as const, url: '/projects/project-1/sessions', headers: authHeaders,
+    payload: { entrypoint: 'voice', model: 'model-1', mode: 'plan' } };
+  const replies = await Promise.all([app.inject(request), app.inject(request)]);
+  assert.deepEqual(replies.map(reply => reply.statusCode), [201, 201]);
+  assert.deepEqual(replies[0]!.json(), replies[1]!.json());
+  const session = replies[0]!.json<{ id: string; status: string; messageCount: number; mode: string }>();
+  assert.equal(session.status, 'IDLE'); assert.equal(session.messageCount, 0); assert.equal(session.mode, 'plan');
+  assert.deepEqual(await h.sessions.listMessages('user-1', session.id, 100), []);
+  assert.equal(h.session(session.id)?.['claimableAt'], undefined);
+  assert.equal(h.project()?.['activeSessionId'], null); assert.equal(h.charges(), 0);
+  assert.equal(await h.sessions.claim('runner-1'), undefined);
+  assert.deepEqual(published, ['session.idle']);
+  await app.close(); app = await routeApp(h);
+  assert.deepEqual((await app.inject(request)).json(), session);
+  const conflict = await app.inject({ ...request, payload: { prompt: 'Build', model: 'model-1', mode: 'plan' } });
+  assert.equal(conflict.statusCode, 409); assert.equal(h.charges(), 0);
+});
+
+test('voice history alone does not start a runner; a real task request activates and charges once', async () => {
+  const h = harness();
+  const session = await h.sessions.create('user-1', 'project-1', { entrypoint: 'voice', model: 'model-1', mode: 'plan' });
+  await h.sessions.appendVoiceTurn('user-1', session.id, 'user', 'I want a booking website.', 'spoken-turn-operation-1');
+  assert.equal(h.charges(), 0); assert.equal(await h.sessions.claim('runner-1'), undefined);
+  await h.sessions.appendPrompt('user-1', session.id, 'I want a booking website.');
+  assert.equal(h.charges(), 1); assert.equal(h.project()?.['activeSessionId'], session.id);
+  assert.equal((await h.sessions.claim('runner-1'))?.id, session.id);
+});
+
+test('voice entry refuses mixed or missing inputs and keeps ownership and model checks', async t => {
+  const h = harness(); const app = await routeApp(h); t.after(() => app.close());
+  const before = JSON.stringify([...h.firestore.documents]);
+  for (const payload of [
+    { model: 'model-1' }, { entrypoint: 'voice', model: 'model-1', mode: 'plan', prompt: 'Invented prompt' },
+    { entrypoint: 'voice', model: 'model-1', mode: 'plan', attachments: [] }, { entrypoint: 'other', model: 'model-1' },
+    { entrypoint: 'voice', model: 'model-1' }, { entrypoint: 'voice', model: 'model-1', mode: 'build' },
+  ]) {
+    const response = await app.inject({ method: 'POST', url: '/projects/project-1/sessions', headers: authHeaders, payload });
+    assert.equal(response.statusCode, 400);
+  }
+  await assert.rejects(h.sessions.create('intruder', 'project-1', { entrypoint: 'voice', model: 'model-1', mode: 'plan' }), { code: 'project/not-found' });
+  await assert.rejects(h.sessions.create('user-1', 'project-1', { entrypoint: 'voice', model: 'unavailable-model', mode: 'plan' }));
+  assert.equal(JSON.stringify([...h.firestore.documents]), before); assert.equal(h.charges(), 0);
+});
+
 test('voice bridge runs the existing authenticated task route and durable retry ledger across API replacement', async t => {
   const h = harness(); const created = await h.sessions.create('user-1', 'project-1', { model: 'model-1', prompt: 'Initial' });
   await h.sessions.claim('runner-1'); const lease = authority(h, created.id);

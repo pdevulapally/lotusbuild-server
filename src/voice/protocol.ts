@@ -4,11 +4,12 @@ import type { SessionEvent } from '../sessions/events.ts';
 export const voicePrivacyNotice = 'Your live audio and recent project conversation are sent to your configured ElevenLabs realtime agent. LotusBuild saves final voice dialogue as project chat context, not audio. Submitted work uses the same task providers, tools and permissions as text. Voice requires verified provider and downstream privacy coverage. Approvals and task cancellation use the on-screen controls. End the call to stop audio sharing; accepted work continues.';
 
 /** Facts from durable state, without promising tool success or interpreting model-authored claims. */
-export function voiceTaskStatus(session: Pick<BuildSession, 'status' | 'pendingInput' | 'cancelRequested' | 'fallback'>): string {
+export function voiceTaskStatus(session: Pick<BuildSession, 'status' | 'pendingInput' | 'cancelRequested' | 'fallback'> & Partial<Pick<BuildSession, 'messageCount'>>): string {
   if (session.cancelRequested) return 'Cancellation was requested. Work may still be stopping. Actions already sent may have completed.';
   if (session.pendingInput?.kind === 'approval') return 'Your approval is needed. Review the exact action and use the on-screen Approve or Reject controls.';
   if (session.pendingInput?.kind === 'question') return session.pendingInput.prompt;
   if (session.fallback && session.fallback.status !== 'COMPLETED') return 'The task is paused or waiting for capacity. Review the continuation options on screen.';
+  if (session.status === 'IDLE' && session.messageCount === 0) return 'No task has been requested yet.';
   return { QUEUED: 'Your task is queued.', RUNNING: 'Your task is running. You can add a clarification while it works.',
     IDLE: 'This turn has stopped. Review the response and any checks in the chat.', FAILED: 'The task stopped with a problem. Review the details in the chat.' }[session.status];
 }

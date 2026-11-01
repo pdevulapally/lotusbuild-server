@@ -22,6 +22,7 @@ import {
   type SessionMessage,
   type SessionRepository,
   type MessageAcceptance,
+  type NewSession,
   promptMaxLength,
   sessionModes,
 } from './repository.ts';
@@ -182,7 +183,7 @@ export function registerSessionRoutes(
   };
 
   app.post<{ Params: { projectId: string }; Body: {
-    attachments?: AttachmentRef[]; prompt: string;
+    attachments?: AttachmentRef[]; prompt?: string; entrypoint?: 'voice';
     model: string;
     effort?: AiEffort;
     mode?: (typeof sessionModes)[number];
@@ -199,7 +200,11 @@ export function registerSessionRoutes(
         },
         body: {
           type: 'object',
-          required: ['prompt', 'model'],
+          required: ['model'],
+          oneOf: [
+            { required: ['prompt'], not: { required: ['entrypoint'] } },
+            { required: ['entrypoint', 'mode'], properties: { mode: { const: 'plan' } }, not: { anyOf: [{ required: ['prompt'] }, { required: ['attachments'] }] } },
+          ],
           additionalProperties: false,
           properties: {
             prompt: {
@@ -212,6 +217,7 @@ export function registerSessionRoutes(
             effort: { type: 'string', enum: [...aiEfforts] },
             mode: { type: 'string', enum: [...sessionModes] },
             attachments: attachmentsSchema,
+            entrypoint: { type: 'string', enum: ['voice'] },
           },
         },
       },
@@ -220,18 +226,20 @@ export function registerSessionRoutes(
       const user = authenticatedUser(request);
       const defaultEffort = await options.validateModel?.(user.uid, request.body.model, request.body.effort);
       const effort = request.body.effort ?? defaultEffort;
-      const input = {
-        prompt: request.body.prompt.trim(),
+      const selection = {
         model: request.body.model,
         ...(effort === undefined ? {} : { effort }),
-        ...(request.body.mode === undefined ? {} : { mode: request.body.mode }),
-        ...(request.body.attachments === undefined ? {} : { attachments: request.body.attachments }),
       };
+      const input: NewSession = request.body.entrypoint === 'voice'
+        ? { ...selection, entrypoint: 'voice', mode: 'plan' }
+        : { ...selection, prompt: request.body.prompt!.trim(),
+          ...(request.body.mode === undefined ? {} : { mode: request.body.mode }),
+          ...(request.body.attachments === undefined ? {} : { attachments: request.body.attachments }) };
       await options.attachments?.assertOwned(user.uid, input.attachments ?? []);
       const session = await sessions.create(user.uid, request.params.projectId, input, undefined,
         mutation<BuildSession>(user.uid, `POST /projects/${request.params.projectId}/sessions`,
           commandKey(request.headers['idempotency-key'], true), { ...input, effort: request.body.effort }, (value) => ({ statusCode: 201, body: toResponse(value) })));
-      if (!commandWasReplayed(session)) publish(request.log, session.id, 'session.queued', {
+      if (!commandWasReplayed(session)) publish(request.log, session.id, session.status === 'IDLE' ? 'session.idle' : 'session.queued', {
 
         status: session.status,
         model: session.model,
