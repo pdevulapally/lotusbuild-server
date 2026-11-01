@@ -10,10 +10,11 @@ import { type Firestore, Timestamp } from 'firebase-admin/firestore';
  * left `uncertain`, and nothing with the same action may run again until an
  * operator or a provider lookup reconciles it to `succeeded` or `failed`.
  *
- * Each claim carries a lease token. Only the worker holding the token may
- * record progress or settle, so a worker that lost its claim (restart, long
- * pause) cannot overwrite a later decision. Reconciling an uncertain
- * operation is a separate, explicitly attributed step without a token.
+ * Mutual exclusion per connection+action is a lock document read and written
+ * inside the claim transaction, so two concurrent claims cannot both commit.
+ * Each claim carries a lease token with an expiry: only the holder may record
+ * progress or settle; a claim whose lease lapsed (worker crash) is treated as
+ * uncertain — it never silently unblocks, and it can be reconciled.
  */
 export const operationStatuses = ['claimed', 'succeeded', 'failed', 'uncertain'] as const;
 export type OperationStatus = (typeof operationStatuses)[number];
@@ -54,71 +55,104 @@ export class ReconciliationRequiredError extends Error {
 }
 
 const collection = 'connection_operations';
+const locks = 'connection_action_locks';
+export const defaultLeaseMs = 10 * 60 * 1000;
 type ClaimInput = Omit<OperationRecord, 'status' | 'claimedAt' | 'settledAt' | 'outcome' | 'providerRef'>;
-export interface OperationClaim { readonly record: OperationRecord; readonly leaseToken: string; }
+export interface OperationClaim { readonly record: OperationRecord; readonly leaseToken: string; readonly leaseExpiresAt: Date; }
+type Snapshot = { exists: boolean; data(): Record<string, unknown> | undefined };
 
 export class OperationLedger {
   readonly #firestore: Firestore;
-  constructor(firestore: Firestore) { this.#firestore = firestore; }
+  readonly #leaseMs: number;
+  constructor(firestore: Firestore, leaseMs = defaultLeaseMs) { this.#firestore = firestore; this.#leaseMs = leaseMs; }
+
+  #lockRef(connectionId: string, action: string) {
+    return this.#firestore.collection(locks).doc(`${connectionId}__${action.replaceAll('/', '_')}`);
+  }
 
   /**
    * Claims `id` for `action` on a connection. Fails if the id is taken, or if
-   * any earlier operation for the same connection+action is still claimed or
-   * uncertain — the caller must reconcile first, never retry blind.
+   * the connection+action lock points at an operation that is still claimed
+   * (lease alive) or uncertain — the caller must reconcile first, never retry
+   * blind. A claimed operation whose lease has lapsed is flipped to
+   * `uncertain` here so it becomes reconcilable, and still blocks.
    */
-  async claim(input: ClaimInput): Promise<OperationClaim> {
+  async claim(input: ClaimInput, now = new Date()): Promise<OperationClaim> {
     const ref = this.#firestore.collection(collection).doc(input.id);
-    const claimedAt = new Date();
+    const lockRef = this.#lockRef(input.connectionId, input.action);
     const leaseToken = randomUUID();
-    return this.#firestore.runTransaction(async (transaction) => {
+    const leaseExpiresAt = new Date(now.getTime() + this.#leaseMs);
+    const outcome = await this.#firestore.runTransaction(async (transaction): Promise<OperationClaim | { blockedBy: string }> => {
       const existing = await transaction.get(ref);
       if (existing.exists) throw new OperationAlreadyClaimedError(input.id);
-      const unsettled = await transaction.get(this.#firestore.collection(collection)
-        .where('connectionId', '==', input.connectionId).where('action', '==', input.action)
-        .where('status', 'in', ['claimed', 'uncertain']).limit(1));
-      const blocker = unsettled.docs[0];
-      if (blocker !== undefined) throw new ReconciliationRequiredError(blocker.id);
-      const record: OperationRecord = { ...input, status: 'claimed', claimedAt };
-      transaction.create(ref, { ...record, leaseToken, claimedAt: Timestamp.fromDate(claimedAt) });
-      return { record, leaseToken };
+      const lock = await transaction.get(lockRef);
+      const activeId = (lock.data() ?? {})['activeOperationId'];
+      if (typeof activeId === 'string') {
+        const active = await transaction.get(this.#firestore.collection(collection).doc(activeId));
+        const data = active.data() ?? {};
+        if (data['status'] === 'claimed' && leaseLapsed(data, now)) {
+          // Committed even though the claim is refused: the stranded claim must become reconcilable.
+          transaction.update(active.ref, { status: 'uncertain', leaseToken: null, settledAt: Timestamp.fromDate(now), outcome: 'worker lease expired before the outcome was recorded' });
+          return { blockedBy: activeId };
+        }
+        if (data['status'] === 'claimed' || data['status'] === 'uncertain') return { blockedBy: activeId };
+      }
+      const record: OperationRecord = { ...input, status: 'claimed', claimedAt: now };
+      transaction.create(ref, { ...record, leaseToken, leaseExpiresAt: Timestamp.fromDate(leaseExpiresAt), claimedAt: Timestamp.fromDate(now) });
+      transaction.set(lockRef, { connectionId: input.connectionId, action: input.action, activeOperationId: input.id, updatedAt: Timestamp.fromDate(now) });
+      return { record, leaseToken, leaseExpiresAt };
     });
+    if ('blockedBy' in outcome) throw new ReconciliationRequiredError(outcome.blockedBy);
+    return outcome;
   }
 
   /** Records the provider's identifier as soon as it is known, before the outcome. */
-  async recordProviderRef(id: string, leaseToken: string, providerRef: string): Promise<void> {
+  async recordProviderRef(id: string, leaseToken: string, providerRef: string, now = new Date()): Promise<void> {
     const ref = this.#firestore.collection(collection).doc(id);
     await this.#firestore.runTransaction(async (transaction) => {
-      requireLease(await transaction.get(ref), id, leaseToken);
+      requireLease(await transaction.get(ref), id, leaseToken, now);
       transaction.update(ref, { providerRef });
     });
   }
 
   /** The claiming worker reports the outcome; `uncertain` releases the lease without resolving. */
-  async settle(id: string, leaseToken: string, status: Exclude<OperationStatus, 'claimed'>, outcome?: string): Promise<void> {
+  async settle(id: string, leaseToken: string, status: Exclude<OperationStatus, 'claimed'>, outcome?: string, now = new Date()): Promise<void> {
     const ref = this.#firestore.collection(collection).doc(id);
     await this.#firestore.runTransaction(async (transaction) => {
-      requireLease(await transaction.get(ref), id, leaseToken);
-      transaction.update(ref, { status, leaseToken: null, settledAt: Timestamp.now(), ...(outcome === undefined ? {} : { outcome }) });
+      const snapshot = await transaction.get(ref);
+      requireLease(snapshot, id, leaseToken, now);
+      const data = snapshot.data() ?? {};
+      const lockRef = this.#lockRef(data['connectionId'] as string, data['action'] as string);
+      const lock = await transaction.get(lockRef);
+      transaction.update(ref, { status, leaseToken: null, settledAt: Timestamp.fromDate(now), ...(outcome === undefined ? {} : { outcome }) });
+      if (status !== 'uncertain' && (lock.data() ?? {})['activeOperationId'] === id) transaction.update(lockRef, { activeOperationId: null, updatedAt: Timestamp.fromDate(now) });
     });
   }
 
   /**
-   * Resolves an uncertain operation from evidence: a provider lookup or an
-   * explicit operator decision. Nothing here re-runs the action.
+   * Resolves an uncertain operation (or a claimed one whose lease lapsed) from
+   * evidence: a provider lookup or an explicit operator decision. Nothing here
+   * re-runs the action.
    */
-  async reconcile(id: string, status: 'succeeded' | 'failed', input: { decidedBy: string; outcome: string; providerRef?: string }): Promise<void> {
+  async reconcile(id: string, status: 'succeeded' | 'failed', input: { decidedBy: string; outcome: string; providerRef?: string }, now = new Date()): Promise<void> {
     const ref = this.#firestore.collection(collection).doc(id);
     await this.#firestore.runTransaction(async (transaction) => {
       const snapshot = await transaction.get(ref);
       if (!snapshot.exists) throw new Error(`Operation ${id} was never claimed.`);
-      if ((snapshot.data() ?? {})['status'] !== 'uncertain') throw new Error(`Operation ${id} is not awaiting reconciliation.`);
+      const data = snapshot.data() ?? {};
+      const stranded = data['status'] === 'claimed' && leaseLapsed(data, now);
+      if (data['status'] !== 'uncertain' && !stranded) throw new Error(`Operation ${id} is not awaiting reconciliation.`);
+      const lockRef = this.#lockRef(data['connectionId'] as string, data['action'] as string);
+      const lock = await transaction.get(lockRef);
       transaction.update(ref, {
-        status, outcome: input.outcome, reconciledBy: input.decidedBy, settledAt: Timestamp.now(),
+        status, leaseToken: null, outcome: input.outcome, reconciledBy: input.decidedBy, settledAt: Timestamp.fromDate(now),
         ...(input.providerRef === undefined ? {} : { providerRef: input.providerRef }),
       });
+      if ((lock.data() ?? {})['activeOperationId'] === id) transaction.update(lockRef, { activeOperationId: null, updatedAt: Timestamp.fromDate(now) });
     });
   }
 
+  /** Operations awaiting reconciliation for a connection (composite index: connectionId asc, status asc). */
   async uncertain(connectionId: string): Promise<readonly OperationRecord[]> {
     const snapshot = await this.#firestore.collection(collection)
       .where('connectionId', '==', connectionId).where('status', '==', 'uncertain').get();
@@ -137,8 +171,13 @@ export class OperationLedger {
   }
 }
 
-function requireLease(snapshot: { exists: boolean; data(): Record<string, unknown> | undefined }, id: string, leaseToken: string): void {
+function leaseLapsed(data: Record<string, unknown>, now: Date): boolean {
+  const expires = data['leaseExpiresAt'];
+  return expires instanceof Timestamp && expires.toMillis() <= now.getTime();
+}
+
+function requireLease(snapshot: Snapshot, id: string, leaseToken: string, now: Date): void {
   if (!snapshot.exists) throw new Error(`Operation ${id} was never claimed.`);
   const data = snapshot.data() ?? {};
-  if (data['status'] !== 'claimed' || data['leaseToken'] !== leaseToken) throw new StaleOperationLeaseError(id);
+  if (data['status'] !== 'claimed' || data['leaseToken'] !== leaseToken || leaseLapsed(data, now)) throw new StaleOperationLeaseError(id);
 }

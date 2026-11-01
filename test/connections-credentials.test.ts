@@ -46,4 +46,12 @@ describe('CredentialKeyring', () => {
     assert.throws(() => keyringFromEnv({ CONNECTION_KEK_V1: 'short' }), /32 bytes/);
     assert.throws(() => new CredentialKeyring(new Map()), /At least one/);
   });
+
+  it('copies the supplied key material so a caller mutating its buffer cannot change the keyring', () => {
+    const key = randomBytes(32);
+    const ring = new CredentialKeyring(new Map([[1, key]]));
+    const sealed = ring.seal(Buffer.from('token'), 'connections/abc');
+    key.fill(0);
+    assert.equal(ring.open(sealed, 'connections/abc').toString(), 'token');
+  });
 });

@@ -54,6 +54,15 @@ export class AccountErasure {
         await this.#eraseFamilyLink(uid, link.ref);
       }
     }
+    // Provider credentials die with the account; the provider-side grant is the user's to revoke.
+    for (;;) {
+      const connections = await this.#db.collection('connections').where('ownerUid', '==', uid).limit(100).get();
+      if (connections.empty) break;
+      for (const connection of connections.docs) {
+        await this.#db.doc(`connection_credentials/${connection.id}`).delete();
+        await this.#db.recursiveDelete(connection.ref);
+      }
+    }
     await this.#db.recursiveDelete(this.#db.doc(`familyLinks/${uid}`));
     await this.#db.doc(`familyInvitations/${uid}`).delete();
     await this.#clearCaches(uid);
