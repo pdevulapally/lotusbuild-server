@@ -9,7 +9,7 @@ import type { Auth } from 'firebase-admin/auth';
 import { registerAuth } from '../src/auth/plugin.ts';
 import { registerErrorHandler } from '../src/http/errors.ts';
 import { VoiceRelay, registerVoiceRoutes, type VoiceDependencies } from '../src/voice/relay.ts';
-import { parseVoiceConfig, type VoiceConfig } from '../src/voice/config.ts';
+import { parseVoiceAgentReference, parseVoiceConfig, type VoiceConfig } from '../src/voice/config.ts';
 import { parseVoiceCommand, voiceTaskStatus, voiceProgress } from '../src/voice/protocol.ts';
 import { MeteredVoiceBudget } from '../src/voice/budget.ts';
 import { MeteringService } from '../src/metering/service.ts';
@@ -81,11 +81,30 @@ test('voice dialogue never becomes assistant execution evidence or an executable
 function providerFixture() {
   const tools = [config.statusToolId, config.submitToolId].map((id, index) => ({ id, tool_config: { name: index === 0 ? 'lotus_task_status' : 'lotus_submit_request', type: 'client', expects_response: true, pre_tool_speech: 'off', interruption_mode: 'allow', parameters: { type: 'object', properties: {}, required: [] } } }));
   const agent = { agent_id: config.agentId, version_id: config.agentVersionId, conversation_config: { realtime_model: 'eleven_realtime_v1_max',
-    conversation: { max_duration_seconds: 60, client_events: ['audio', 'interruption', 'user_transcript', 'agent_response', 'agent_response_correction', 'agent_response_complete', 'client_tool_call'] },
+    conversation: { max_duration_seconds: 60, client_events: ['audio', 'interruption', 'user_transcript', 'agent_response', 'agent_response_correction', 'agent_response_complete'] },
     agent: { prompt: { max_tokens: 1024, backup_llm_config: { preference: 'disabled' }, tool_ids: tools.map(tool => tool.id) } } },
     platform_settings: { auth: { enable_auth: true, allowlist: [] }, privacy: { zero_retention_mode: true, record_voice: false }, overrides: { conversation_config_override: { agent: { prompt: { prompt: true } } } } } };
   return { agent, tools, policy: { ...config, agentConfigSha256: voiceAgentDigest(agent, tools) } };
 }
+
+test('read-only reference needs no activation attestations and cannot prepare paid access', async () => {
+  const reference = { environment: config.environment, agentId: config.agentId, agentVersionId: config.agentVersionId,
+    statusToolId: config.statusToolId, submitToolId: config.submitToolId, maxCallSeconds: config.maxCallSeconds };
+  assert.deepEqual(parseVoiceAgentReference(JSON.stringify(reference)), reference);
+  for (const value of [{}, { ...reference, maxCallSeconds: 0 }, { ...reference, maxCallSeconds: 1801 },
+    { ...reference, environment: 'other' }, { ...reference, agentId: '../secret' },
+    { ...reference, submitToolId: reference.statusToolId }, { ...reference, zeroRetentionVerified: true }]) {
+    assert.throws(() => parseVoiceAgentReference(JSON.stringify(value)));
+  }
+  await assert.rejects(new ElevenLabsRealtime('unused', reference).prepare(new AbortController().signal), /not been audited/);
+});
+
+test('client tools do not require a selectable client_tool_call subscription; response completion still does', () => {
+  const f = providerFixture();
+  validateVoiceAgent(f.agent, f.tools, f.policy);
+  f.agent.conversation_config.conversation.client_events = f.agent.conversation_config.conversation.client_events.filter(event => event !== 'agent_response_complete');
+  assert.throws(() => validateVoiceAgent(f.agent, f.tools, { ...f.policy, agentConfigSha256: voiceAgentDigest(f.agent, f.tools) }), /Required realtime events/);
+});
 test('pinned native agent rejects public access, recordings, non-ZRM models, extra tools and config drift', () => {
   const f = providerFixture(); validateVoiceAgent(f.agent, f.tools, f.policy);
   const mutate = (change: (item: typeof f) => void) => { const item = structuredClone(f); change(item); assert.throws(() => validateVoiceAgent(item.agent, item.tools, item.policy)); };
@@ -100,6 +119,52 @@ test('pinned native agent rejects public access, recordings, non-ZRM models, ext
   mutate(item => { item.agent.version_id = 'wrong_version'; });
   mutate(item => { item.policy.agentConfigSha256 = 'b'.repeat(64); });
 });
+test('hydrated agent client tools must exactly match the separately fetched definitions, even with a matching digest', () => {
+  const f = providerFixture();
+  const check = (tools: unknown) => {
+    const agent = structuredClone(f.agent);
+    Object.assign(agent.conversation_config.agent.prompt, { tools });
+    validateVoiceAgent(agent, f.tools, { ...f.policy, agentConfigSha256: voiceAgentDigest(agent, f.tools) });
+  };
+  const definitions = f.tools.map(tool => tool.tool_config);
+  check(definitions); check([...definitions].reverse()); check([]);
+  for (const tools of [
+    {}, [definitions[0]], [definitions[0], definitions[0]], [...definitions, definitions[0]],
+    [definitions[0], { ...definitions[1], type: 'webhook' }],
+    [definitions[0], { ...definitions[1], description: 'Modified definition' }],
+    [definitions[0], { ...definitions[1], parameters: { type: 'object', properties: { command: { type: 'string' } } } }],
+  ]) assert.throws(() => check(tools), /Unapproved expanded tool definitions/);
+});
+
+test('provider null client-tool parameter schemas mean no arguments; malformed or nonempty schemas remain refused', () => {
+  const f = providerFixture();
+  const check = (parameters: unknown) => {
+    const tools = f.tools.map(tool => ({ ...tool, tool_config: { ...tool.tool_config, parameters } }));
+    validateVoiceAgent(f.agent, tools, { ...f.policy, agentConfigSha256: voiceAgentDigest(f.agent, tools) });
+  };
+  check(null); check(undefined); check({});
+  for (const parameters of [[], '', { type: 'array' }, { properties: { command: { type: 'string' } } }, { required: ['command'] }]) assert.throws(() => check(parameters));
+});
+
+test('blank-agent Start node is allowed, while executable or extended workflows remain refused even with a matching digest', () => {
+  const f = providerFixture();
+  const start = { type: 'start', position: { x: 0, y: 0 }, edge_order: [], parent_subgraph_id: null };
+  const blank = { edges: {}, nodes: { start_node: start }, subgraphs: {}, prevent_subagent_loops: false };
+  const check = (workflow: unknown) => {
+    const agent = { ...f.agent, workflow };
+    validateVoiceAgent(agent, f.tools, { ...f.policy, agentConfigSha256: voiceAgentDigest(agent, f.tools) });
+  };
+  check(blank); check({ ...blank, nodes: {} });
+  for (const workflow of [
+    { ...blank, nodes: { start_node: { ...start, type: 'tool' } } },
+    { ...blank, nodes: { start_node: { ...start, additional_tool_ids: ['tool_unapproved'] } } },
+    { ...blank, nodes: { start_node: { ...start, edge_order: ['edge'] } } },
+    { ...blank, edges: { edge: { source: 'start_node', target: 'tool' } } },
+    { ...blank, nodes: { start_node: start, second: start } },
+    { ...blank, subgraphs: { nested: {} } },
+    { ...blank, future_action: { tool_id: 'tool_unapproved' } },
+  ]) assert.throws(() => check(workflow), /Unapproved workflow/);
+});
 test('operator audit is GET-only and creates no signed access; prepare requires single-use private access', async t => {
   const f = providerFixture(), paths: string[] = [], hosts: string[] = []; const original = globalThis.fetch;
   globalThis.fetch = (async (input, init) => {
@@ -112,6 +177,9 @@ test('operator audit is GET-only and creates no signed access; prepare requires 
   const provider = new ElevenLabsRealtime('server-only-secret', f.policy);
   assert.deepEqual(await provider.audit(new AbortController().signal), { digest: f.policy.agentConfigSha256, matchesPinnedDigest: true });
   assert.equal(paths.length, 4); assert.equal(paths.some(path => path.includes('get-signed-url')), false);
+  const { agentConfigSha256: _pin, ...reference } = f.policy;
+  assert.deepEqual(await new ElevenLabsRealtime('server-only-secret', reference).audit(new AbortController().signal), { digest: f.policy.agentConfigSha256, matchesPinnedDigest: false });
+  assert.equal(paths.length, 8); assert.equal(paths.some(path => path.includes('get-signed-url')), false);
   await assert.rejects(provider.prepare(new AbortController().signal), /Invalid provider connection URL/);
   await new ElevenLabsRealtime('server-only-secret', { ...f.policy, environment: 'eu' }).audit(new AbortController().signal);
   assert.ok(hosts.slice(-4).every(host => host === 'api.eu.residency.elevenlabs.io'));

@@ -1,6 +1,6 @@
 # Native realtime voice for LotusBuild
 
-Disabled by default. The owner's agent remains unpublished. No provider configuration writes, paid calls, registry migration, merge or production deployment are authorized here. The earlier STT/TTS adapter and illustrative audio-only cost table are superseded.
+Voice requires explicit activation policy and provider secrets. The owner reports the private native agent published and has approved launch allowances for all three plans; those registry/plan allowances were applied and read back on 2026-11-01. API activation, provider cost/privacy verification and live voice verification remain outstanding. See `voice-activation-proposal.md` for the approved numerical limits and current operational status. The earlier STT/TTS adapter and illustrative audio-only cost table are superseded.
 
 ## Architecture
 
@@ -21,7 +21,7 @@ Pre-tool speech is disabled and audio is suppressed while a bridge tool runs. Ac
 
 Firebase tokens go only in the first WebSocket frame, not URLs/subprotocols. The server checks origins, payload/rate bounds, access, plans and leases; revocation/access/entitlements are rechecked every five seconds. Every task command independently traverses the existing HTTP authorization boundary. Speech recognition is never identity.
 
-Before paid connection, read-only agent/tool/workspace GETs validate the pinned version, audited SHA-256 configuration, private authentication, Zero Retention Mode, no recordings, native model, bounded duration/output and exactly two client tools. Agent and inherited workspace initiation/post-call webhooks are rejected; workspace settings are included in the reviewed digest. Use a suitably isolated workspace if other agents need those callbacks. Signed access uses `include_conversation_id=true`, documented as single use. Signed URLs, provider keys and persistent session tokens stay server-side; fixed TLS host/path and disabled redirects prevent destination substitution.
+Before paid connection, read-only agent/tool/workspace GETs validate the pinned version, audited SHA-256 configuration, private authentication, Zero Retention Mode, no recordings, native model, bounded duration/output and exactly two client tools. The live agent GET also expands these attached tool IDs into `prompt.tools`; expanded entries are accepted only as exact, unique copies of the separately fetched tool definitions. Unknown, modified or duplicate definitions remain refused even with a matching digest. Agent and inherited workspace initiation/post-call webhooks are rejected; workspace settings are included in the reviewed digest. Use a suitably isolated workspace if other agents need those callbacks. Signed access uses `include_conversation_id=true`, documented as single use. Signed URLs, provider keys and persistent session tokens stay server-side; fixed TLS host/path and disabled redirects prevent destination substitution.
 
 Provider tool events arrive only on the server-owned authenticated TLS socket. No incoming HTTP tool/webhook endpoint exists, so no invented webhook signature scheme is needed. Unknown tools, arguments, malformed frames and conflicting replay fail closed. Restrict provider administration: shared tool definitions must not be edited behind the reviewed configuration.
 
@@ -35,7 +35,7 @@ One task/conversation/user-event identity fences multiple tool calls for the sam
 
 ## Limits and costs
 
-Nothing is seeded. Activation requires explicit registry capabilities `voice.enabled` (boolean), `voice.concurrent` (integer 1–10), `voice.call.seconds` (positive integer). Call duration is the lower of plan and deployment ceilings.
+Activation requires explicit registry capabilities `voice.enabled` (boolean), `voice.concurrent` (integer 1–10), `voice.call.seconds` (positive integer). The approved voice-only migration adds these without re-seeding existing configuration. Call duration is the lower of plan and deployment ceilings.
 
 Add monthly COUNTER meters `voice.seconds` and `voice.cost.microgbp`, with explicit per-plan allowances/hard limits and **overage disabled**. Seconds are prepaid in up-to-ten-second windows, including silence. The full approved worst-case per-call cost allocation is consumed before each conversation, including reconnects. Existing metering batches both counters atomically with the Firestore global allocation/dispatch claim. Failed/uncertain dispatches conservatively retain allocation. These are budgets, not Stripe charges or exact invoices.
 
@@ -43,15 +43,15 @@ Add monthly COUNTER meters `voice.seconds` and `voice.cost.microgbp`, with expli
 
 Redis server-time leases enforce global/per-user concurrency, expire after 20 seconds and renew every five. Local audio authority expires within ten seconds without renewal. Hard call/idle/auth/provider-connect timeouts, turn/tool counts, buffer/byte bounds, realtime upload limits and control-rate limits bound abandoned/abusive sessions. Task work retains the runner's separate lifecycle.
 
-### Plan breakdown for separate approval
+### Approved initial plan allowances
 
-| Existing plan | Current voice allowance | Proposed policy |
+| Existing plan | Monthly voice allowance | Maximum call / concurrent calls per user |
 |---|---|---|
-| Free | Unset; disabled | Explicit monthly seconds/cost ceilings; no overage; approved call/concurrency limits |
-| Pro | Unset; disabled | Same counters; owner selects paid-plan allowance/cost envelope |
-| Business | Unset; disabled | Same counters; owner selects team/concurrency envelope |
+| Free | 5 minutes | 5 minutes / 1 |
+| Pro | 60 minutes | 10 minutes / 1 |
+| Business | 180 minutes | 10 minutes / 1 |
 
-For each plan approve monthly seconds `S`, allocated cost `B`, max-call seconds `D` and concurrency `N`. Estimate cost as `minutes × contracted agent rate + input tokens × input rate + cached tokens × cached rate + output tokens × output rate`, explicitly accounting for FX/tax/fees/subscription minimums. Task model/sandbox/MCP costs stay separate. Per-call allocation `C` also bounds admitted calls by `floor(B/C)` and remaining global allocation. No tier numbers or monetary quote are proposed without the required contract/owner limits.
+The owner approved a shared GBP 100 monthly application allocation cap, two concurrent calls globally and a 60-second inactivity timeout. Each plan's cost counter uses that same ceiling; it does not create a separate GBP 100 pool per user. No overage is enabled. These admission allocations are not a guaranteed provider invoice cap. Estimate actual cost as `minutes × contracted agent rate + input tokens × input rate + cached tokens × cached rate + output tokens × output rate`, explicitly accounting for FX/tax/fees/subscription minimums. Task model/sandbox/MCP costs stay separate. Per-call allocation `C` also bounds admitted calls by `floor(B/C)` and remaining global allocation. Provider rates, the conservative per-call allocation and acceptable account spending controls still require verification.
 
 ## ElevenLabs and VPS configuration
 
@@ -78,14 +78,14 @@ Prepare the current **unpublished** dashboard draft without publishing or Previe
 
 1. Name LotusBuild Voice; Voice mode **Realtime**; **Eleven Realtime v1 Max**; owner's licensed voice/language. Max supports ZRM in US/EU; Mini does not. Realtime manages ASR/LLM/TTS, so the old Custom LLM selector is not used. Set an AI-disclosing first message, for example: "Hi, I'm LotusBuild's AI assistant. What would you like to work on?"
 2. Require authentication; no public/shareable access. Enable per-agent Zero Retention Mode, disable recordings and backup LLM cascading. Verify account eligibility and exact audio/transcript/conversation-log/all downstream coverage. No recording/analytics/transcript webhooks.
-3. Output token limit 1024–4096; bounded duration; interruptible first message/turns; client events `audio`, `interruption`, `user_transcript`, `agent_response`, `agent_response_correction`, `agent_response_complete`, `client_tool_call`. Optional VAD events improve idle detection.
+3. Output token limit 1024–4096; bounded duration; interruptible first message/turns; client events `audio`, `interruption`, `user_transcript`, `agent_response`, `agent_response_correction`, `agent_response_complete`. Optional VAD events improve idle detection. The backend handles `client_tool_call` protocol messages; adding it to the selectable event list is not an audit prerequisite. The [client-tool guide](https://elevenlabs.io/docs/eleven-agents/customization/tools/client-tools) requires attached tools and handlers, while the [event guide](https://elevenlabs.io/docs/eleven-agents/customization/events/client-events) explicitly requires enabling response-completion events. Actual native tool delivery still requires an approved live test; mocked dispatch is not provider verification.
 4. Exactly two client tools: `lotus_task_status` and `lotus_submit_request`, expecting response, pre-tool speech **off**, interruption **allow**, empty object parameters/no properties or required arguments. Descriptions distinguish checked status from exact-current-utterance submission; neither approves/cancels.
 5. Enable system-prompt override. Server supplies safety instructions/current context at connection initiation. No browser prompt/identity override. Leave provider KB/workflows/procedures/language overrides/hosted MCP/built-in actions absent. Hosted MCP is unavailable with ZRM; existing LotusBuild MCP stays in its runner.
-6. After separate privacy/cost/publication approval, pin the resulting version and audit it. Provide a syntactically valid 64-character digest for initial strict-policy parsing, then explicitly review/pin the candidate; never auto-accept drift:
+6. Audit the published version read-only before preparing an activation policy. Put only `environment`, `agentId`, `agentVersionId`, `statusToolId`, `submitToolId`, `maxCallSeconds` in a non-secret JSON reference file. The duration here is the reviewed provider configuration ceiling, not approval of a plan allowance. No privacy/spending attestations or dummy digest are needed:
 
-   `node --experimental-strip-types src/voice/audit.ts`
+   `node --experimental-strip-types src/voice/audit.ts --reference-file <reference.json>`
 
-   Supply secrets through the approved process environment/secret store. This utility performs only agent/tool/workspace-settings GETs and prints digest/match boolean. It never requests signed access, opens a conversation, prints raw config or publishes anything. It has **not** been run against the owner's account.
+   Supply the existing `ELEVENLABS_API_KEY` through the approved process environment/secret store. This utility performs only agent/tool/workspace-settings GETs and prints digest/match boolean. Without a pin, `matchesPinnedDigest` is false by design. It never requests signed access, opens a conversation, prints raw config or publishes anything. It has **not** been run against the owner's account. After separate privacy/cost approval, explicitly review and pin the digest in the full activation policy; never auto-accept drift. The original no-argument mode audits an existing complete `ELEVENLABS_VOICE_CONFIG` policy.
 
 ## Data and observability
 
