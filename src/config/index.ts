@@ -11,6 +11,7 @@ import {
   loadEnv,
   asOptional,
 } from './env.ts';
+import { parseVoiceConfig } from '../voice/config.ts';
 
 export { EnvironmentError } from './env.ts';
 
@@ -63,6 +64,8 @@ const sharedSpec = {
 
 
 const apiSpec = {
+  ELEVENLABS_API_KEY: asOptional(asString('server-only ElevenLabs API key; voice remains disabled when absent', { minLength: 10 })),
+  ELEVENLABS_VOICE_CONFIG: { description: 'explicit voice policy JSON; absent keeps voice disabled', parse: parseVoiceConfig, optional: true },
   FAMILY_INVITATION_TTL_SECONDS: asInteger('lifetime of a one-use parent linking invitation', { min: 60, max: 86400 }),
   HOST: asString('interface to bind (127.0.0.1 behind a reverse proxy, 0.0.0.0 otherwise)'),
   PORT: asPort('TCP port to listen on'),
@@ -203,7 +206,9 @@ export function loadSharedConfig(
 }
 
 export function loadConfig(source: Readonly<Record<string, string | undefined>> = process.env) {
-  return loadEnv({ ...sharedSpec, ...apiSpec }, source);
+  const config = loadEnv({ ...sharedSpec, ...apiSpec }, source);
+  if ((config.ELEVENLABS_API_KEY === undefined) !== (config.ELEVENLABS_VOICE_CONFIG === undefined)) throw new EnvironmentError(['ELEVENLABS_API_KEY and ELEVENLABS_VOICE_CONFIG must be configured together.']);
+  return config;
 }
 
 export function loadRunnerConfig(

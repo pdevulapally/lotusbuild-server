@@ -1084,17 +1084,28 @@ test('steering survives Redis failure and is consumed once into durable history'
     await assert.rejects(h.sessions.queueSteerMessage('other-user', created.id, 'Intrusion'), { code: 'session/not-found' });
     await h.sessions.queueSteerMessage('user-1', created.id, 'Preserve all records');
     await assert.rejects(h.sessions.drainSteerMessage(created.id, { ...lease, token: 'stale' }));
-    assert.deepEqual(await h.sessions.drainSteerMessage(created.id, lease), { prompt: 'Preserve all records', attachments: [] });
+    assert.deepEqual(await h.sessions.drainSteerMessage(created.id, lease), { prompt: 'Preserve customer records\n\nPreserve all records', attachments: [] });
     assert.equal(await h.sessions.drainSteerMessage(created.id, lease), undefined);
     const messages = await h.sessions.listMessages('user-1', created.id, 100);
     assert.equal(messages.length, 2);
-    assert.equal(messages.at(-1)?.content, 'Preserve all records');
+    assert.equal(messages.at(-1)?.content, 'Preserve customer records\n\nPreserve all records');
     assert.equal(h.charges(), 1);
     await h.sessions.cancel('user-1', created.id);
     const rejected = await app.inject({ method: 'POST', url: `/sessions/${created.id}/messages`, headers: authHeaders,
       payload: { steer: true, prompt: 'Too late' } });
     assert.equal(rejected.statusCode, 409);
   } finally { await app.close(); }
+});
+
+test('a full steering buffer rejects the next clarification without losing accepted text', async () => {
+  const h = harness();
+  const created = await h.sessions.create('user-1', 'project-1', { model: 'model-1', prompt: 'Initial' });
+  await h.sessions.claim('runner-1');
+  const first = 'x'.repeat(8000);
+  await h.sessions.queueSteerMessage('user-1', created.id, first);
+  await assert.rejects(h.sessions.queueSteerMessage('user-1', created.id, 'Do not lose the first instruction'), { code: 'session/steer-full' });
+  assert.equal(h.session(created.id)?.['pendingSteer'], first);
+  assert.equal(h.charges(), 1);
 });
 
 test('steering accepted after the last step is scheduled without an additional build charge', async () => {

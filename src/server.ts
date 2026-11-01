@@ -38,6 +38,7 @@ import { registerRateLimiting } from './http/rate-limit.ts';
 import { redisKeyPrefixes } from './redis/client.ts';
 import { DesktopRelay, registerDesktopRoutes } from './desktop/relay.ts';
 import { DesktopTickets, redactDesktopTicket } from './desktop/tickets.ts';
+import { registerVoiceRoutes, type VoiceRelay } from './voice/relay.ts';
 
 /**
  * Everything the routes need, passed in rather than constructed here, so that
@@ -49,6 +50,7 @@ import { registerFamilyRoutes } from './family/routes.ts';
 import type { FamilyService } from './family/service.ts';
 
 export interface Dependencies {
+  readonly voice?: VoiceRelay;
   readonly privacyRequests: PrivacyRequests;
   readonly family: FamilyService;
   readonly firebaseAuth: Auth;
@@ -289,6 +291,7 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
         },
       ),
     });
+    registerVoiceRoutes(api, dependencies.voice, config.ELEVENLABS_VOICE_CONFIG);
     registerProjectRoutes(api, projects);
     // No connector has provider credentials on any server yet: the catalogue is
     // browsable, every start attempt reports configuration_required.

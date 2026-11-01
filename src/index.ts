@@ -24,6 +24,9 @@ import { BrevoEmailSender } from './email/brevo.ts';
 import { EmailVerificationService } from './auth/email-verification.ts';
 import { keyringFromEnv } from './connections/credentials.ts';
 import { ConnectionRepository } from './connections/service.ts';
+import { VoiceRelay } from './voice/relay.ts';
+import { ElevenLabsAudio } from './voice/provider.ts';
+import { MeteredVoiceBudget } from './voice/budget.ts';
 
 
 async function main(): Promise<void> {
@@ -95,7 +98,19 @@ async function main(): Promise<void> {
   try { await subscriber.connect(); }
   catch { throw new EnvironmentError(['REDIS_URL subscriber connection failed.']); }
 
+  const sessions = new SessionRepository(firebase.firestore, projects, entitlements, configuration, metering, config.SESSION_LEASE_SECONDS);
+  const sessionEvents = new SessionEvents(redis, subscriber, {
+    firestore: firebase.firestore, maxEventBytes: config.SESSION_EVENT_MAX_BYTES,
+    retentionSeconds: config.SESSION_EVENT_RETENTION_SECONDS, maxPerSession: config.SESSION_EVENT_MAX_PER_SESSION,
+    onListenerError: (error, sessionId) => { logError({ diagnostic: safeErrorDiagnostic(error), sessionId }, 'session event delivery failed'); },
+  });
   const app = buildServer(config, {
+    ...(config.ELEVENLABS_API_KEY === undefined || config.ELEVENLABS_VOICE_CONFIG === undefined ? {} : { voice: new VoiceRelay({
+      auth: firebase.auth, sessions, events: sessionEvents,
+      entitlements, budget: new MeteredVoiceBudget(firebase.firestore, redis, metering, configuration, config.ELEVENLABS_VOICE_CONFIG),
+      provider: new ElevenLabsAudio(config.ELEVENLABS_API_KEY, config.ELEVENLABS_VOICE_CONFIG), config: config.ELEVENLABS_VOICE_CONFIG,
+      allowedOrigins: new Set(config.CORS_ALLOWED_ORIGINS.map(url => url.origin)),
+    }) }),
     projectFiles: new ProjectFiles(snapshots),
     ...(connectionKeyring === undefined ? {} : { connections: new ConnectionRepository(firebase.firestore, connectionKeyring) }),
     attachments: new AttachmentStore(firebase.app, config.FIREBASE_STORAGE_BUCKET),
@@ -130,23 +145,8 @@ async function main(): Promise<void> {
       subscriptionCache,
       config.STRIPE_EVENT_REPLAY_WINDOW_SECONDS,
     ),
-    sessions: new SessionRepository(
-      firebase.firestore,
-      projects,
-      entitlements,
-      configuration,
-      metering,
-      config.SESSION_LEASE_SECONDS,
-    ),
-    sessionEvents: new SessionEvents(redis, subscriber, {
-      firestore: firebase.firestore,
-      maxEventBytes: config.SESSION_EVENT_MAX_BYTES,
-      retentionSeconds: config.SESSION_EVENT_RETENTION_SECONDS,
-      maxPerSession: config.SESSION_EVENT_MAX_PER_SESSION,
-      onListenerError: (error, sessionId) => {
-        logError({ diagnostic: safeErrorDiagnostic(error), sessionId }, 'session event delivery failed');
-      },
-    }),
+    sessions,
+    sessionEvents,
   });
   logError = (details, message) => {
     app.log.error(details, message);
