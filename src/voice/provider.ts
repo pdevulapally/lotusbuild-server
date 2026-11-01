@@ -25,6 +25,25 @@ function noWebhooks(scope: Record<string, unknown>): void {
   if (scope['webhooks'] !== undefined && scope['webhooks'] !== null && record(scope['webhooks'])['post_call_webhook_id']) throw new Error('Provider post-call webhooks are not permitted.');
 }
 
+/** Blank dashboard agents include a disconnected Start node, which performs no work. */
+function noExecutableWorkflow(value: unknown): void {
+  if (value === undefined || value === null) return;
+  const workflow = record(value);
+  if (Object.keys(workflow).some(key => !['nodes', 'edges', 'subgraphs', 'prevent_subagent_loops'].includes(key)) || Object.keys(record(workflow['edges'])).length ||
+      (workflow['subgraphs'] !== undefined && Object.keys(record(workflow['subgraphs'])).length)) throw new Error('Unapproved workflow.');
+  const nodes = Object.values(record(workflow['nodes']));
+  if (nodes.length > 1) throw new Error('Unapproved workflow.');
+  for (const value of nodes) {
+    const node = record(value);
+    if (node['type'] !== 'start' || Object.keys(node).some(key => !['type', 'position', 'edge_order', 'parent_subgraph_id'].includes(key)) ||
+        !Array.isArray(node['edge_order']) || node['edge_order'].length || (node['parent_subgraph_id'] !== null && node['parent_subgraph_id'] !== undefined)) throw new Error('Unapproved workflow.');
+    if (node['position'] !== undefined) {
+      const position = record(node['position']);
+      if (Object.keys(position).some(key => key !== 'x' && key !== 'y') || !Number.isFinite(position['x']) || !Number.isFinite(position['y'])) throw new Error('Invalid Start position.');
+    }
+  }
+}
+
 /** Fail before audio sharing if the pinned agent's privacy, tools or model drifted. */
 export function validateVoiceAgent(raw: unknown, tools: readonly unknown[], config: VoiceConfig, workspace: Record<string, unknown> = {}): void {
   const agent = record(raw), conversation = record(agent['conversation_config']), platform = record(agent['platform_settings']);
@@ -45,7 +64,8 @@ export function validateVoiceAgent(raw: unknown, tools: readonly unknown[], conf
   for (const field of ['tools', 'mcp_server_ids', 'native_mcp_server_ids', 'knowledge_base']) if (Array.isArray(prompt[field]) && (prompt[field] as unknown[]).length) throw new Error('Provider-side tools, MCP and knowledge bases are not permitted.');
   const builtins = prompt['built_in_tools'];
   if (builtins && Object.values(record(builtins)).some(value => value !== null && value !== undefined)) throw new Error('Unapproved built-in tools.');
-  if ((agent['workflow'] && Object.keys(record(record(agent['workflow'])['nodes'])).length) || (agent['procedures'] && Object.keys(record(agent['procedures'])).length)) throw new Error('Unapproved workflow or procedures.');
+  noExecutableWorkflow(agent['workflow']);
+  if (agent['procedures'] && Object.keys(record(agent['procedures'])).length) throw new Error('Unapproved procedures.');
   if (conversation['language_presets'] && Object.keys(record(conversation['language_presets'])).length) throw new Error('Unapproved language overrides.');
   const overrides = record(record(platform['overrides'])['conversation_config_override']);
   if (record(record(overrides['agent'])['prompt'])['prompt'] !== true) throw new Error('Server prompt override must be enabled.');

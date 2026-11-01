@@ -100,6 +100,25 @@ test('pinned native agent rejects public access, recordings, non-ZRM models, ext
   mutate(item => { item.agent.version_id = 'wrong_version'; });
   mutate(item => { item.policy.agentConfigSha256 = 'b'.repeat(64); });
 });
+test('blank-agent Start node is allowed, while executable or extended workflows remain refused even with a matching digest', () => {
+  const f = providerFixture();
+  const start = { type: 'start', position: { x: 0, y: 0 }, edge_order: [], parent_subgraph_id: null };
+  const blank = { edges: {}, nodes: { start_node: start }, subgraphs: {}, prevent_subagent_loops: false };
+  const check = (workflow: unknown) => {
+    const agent = { ...f.agent, workflow };
+    validateVoiceAgent(agent, f.tools, { ...f.policy, agentConfigSha256: voiceAgentDigest(agent, f.tools) });
+  };
+  check(blank); check({ ...blank, nodes: {} });
+  for (const workflow of [
+    { ...blank, nodes: { start_node: { ...start, type: 'tool' } } },
+    { ...blank, nodes: { start_node: { ...start, additional_tool_ids: ['tool_unapproved'] } } },
+    { ...blank, nodes: { start_node: { ...start, edge_order: ['edge'] } } },
+    { ...blank, edges: { edge: { source: 'start_node', target: 'tool' } } },
+    { ...blank, nodes: { start_node: start, second: start } },
+    { ...blank, subgraphs: { nested: {} } },
+    { ...blank, future_action: { tool_id: 'tool_unapproved' } },
+  ]) assert.throws(() => check(workflow), /Unapproved workflow/);
+});
 test('operator audit is GET-only and creates no signed access; prepare requires single-use private access', async t => {
   const f = providerFixture(), paths: string[] = [], hosts: string[] = []; const original = globalThis.fetch;
   globalThis.fetch = (async (input, init) => {
