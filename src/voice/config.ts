@@ -19,6 +19,22 @@ export interface VoiceConfig {
   providerSpendingLimitVerified: true;
 }
 
+/** Read-only provider inspection. Contains no activation or billing attestations. */
+export type VoiceAgentReference = Pick<VoiceConfig, 'environment' | 'agentId' | 'agentVersionId' | 'statusToolId' | 'submitToolId' | 'maxCallSeconds'>;
+
+export function parseVoiceAgentReference(raw: string): VoiceAgentReference {
+  const value: unknown = JSON.parse(raw);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Expected an agent reference.');
+  const reference = value as Record<string, unknown>;
+  const ids = ['agentId', 'agentVersionId', 'statusToolId', 'submitToolId'];
+  const keys = [...ids, 'environment', 'maxCallSeconds'];
+  if (Object.keys(reference).some(key => !keys.includes(key)) || keys.some(key => !Object.hasOwn(reference, key))) throw new Error('Agent reference has missing or unknown fields.');
+  if (!['global', 'eu'].includes(String(reference['environment']))) throw new Error('Invalid agent environment.');
+  for (const key of ids) if (typeof reference[key] !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(reference[key] as string)) throw new Error('Invalid agent identifier.');
+  if (!Number.isSafeInteger(reference['maxCallSeconds']) || (reference['maxCallSeconds'] as number) < 1 || (reference['maxCallSeconds'] as number) > 1800 || reference['statusToolId'] === reference['submitToolId']) throw new Error('Invalid audit duration or tool references.');
+  return reference as unknown as VoiceAgentReference;
+}
+
 export function parseVoiceConfig(raw: string): VoiceConfig {
   const value: unknown = JSON.parse(raw);
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Expected a voice policy object.');

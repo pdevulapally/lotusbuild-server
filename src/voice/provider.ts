@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { WebSocket } from 'ws';
-import type { VoiceConfig } from './config.ts';
+import type { VoiceAgentReference } from './config.ts';
 
 export interface VoiceProvider {
   /** Read-only validation; does not start a paid conversation. */
@@ -45,7 +45,7 @@ function noExecutableWorkflow(value: unknown): void {
 }
 
 /** Fail before audio sharing if the pinned agent's privacy, tools or model drifted. */
-export function validateVoiceAgent(raw: unknown, tools: readonly unknown[], config: VoiceConfig, workspace: Record<string, unknown> = {}): void {
+export function validateVoiceAgent(raw: unknown, tools: readonly unknown[], config: VoiceAgentReference & { agentConfigSha256: string }, workspace: Record<string, unknown> = {}): void {
   const agent = record(raw), conversation = record(agent['conversation_config']), platform = record(agent['platform_settings']);
   if (agent['agent_id'] !== config.agentId || agent['version_id'] !== config.agentVersionId || conversation['realtime_model'] !== 'eleven_realtime_v1_max') throw new Error('Wrong agent version or non-approved realtime model.');
   const auth = record(platform['auth']), privacy = record(platform['privacy']);
@@ -54,7 +54,9 @@ export function validateVoiceAgent(raw: unknown, tools: readonly unknown[], conf
   if (auth['enable_auth'] !== true || (Array.isArray(auth['allowlist']) && auth['allowlist'].length) || auth['shareable_token'] || privacy['zero_retention_mode'] !== true || privacy['record_voice'] !== false) throw new Error('Private zero-retention agent required.');
   const settings = record(conversation['conversation']);
   if (!Number.isSafeInteger(settings['max_duration_seconds']) || (settings['max_duration_seconds'] as number) < 1 || (settings['max_duration_seconds'] as number) > config.maxCallSeconds) throw new Error('Agent call duration is not bounded by policy.');
-  const requiredEvents = ['audio', 'interruption', 'user_transcript', 'agent_response', 'agent_response_correction', 'agent_response_complete', 'client_tool_call'];
+  // Tool calls are handled as protocol messages. The client-tool guide does not
+  // require adding client_tool_call to this configurable subscription list.
+  const requiredEvents = ['audio', 'interruption', 'user_transcript', 'agent_response', 'agent_response_correction', 'agent_response_complete'];
   if (!Array.isArray(settings['client_events']) || requiredEvents.some(type => !(settings['client_events'] as unknown[]).includes(type))) throw new Error('Required realtime events are missing.');
   if (record(conversation['agent'])['disable_first_message_interruptions'] === true) throw new Error('Voice must remain interruptible.');
   const prompt = record(record(conversation['agent'])['prompt']);
@@ -83,9 +85,9 @@ export function validateVoiceAgent(raw: unknown, tools: readonly unknown[], conf
 /** Server-owned TLS connection; signed URLs are single-use and never exposed to a browser. */
 export class ElevenLabsRealtime implements VoiceProvider {
   private readonly key: string;
-  private readonly config: VoiceConfig;
+  private readonly config: VoiceAgentReference & { agentConfigSha256?: string };
   private get host() { return this.config.environment === 'eu' ? 'api.eu.residency.elevenlabs.io' : 'api.elevenlabs.io'; }
-  constructor(key: string, config: VoiceConfig) { this.key = key; this.config = config; }
+  constructor(key: string, config: VoiceAgentReference & { agentConfigSha256?: string }) { this.key = key; this.config = config; }
   async #get(path: string, signal: AbortSignal): Promise<unknown> {
     const response = await fetch(`https://${this.host}${path}`, { headers: { 'xi-api-key': this.key }, signal, redirect: 'error' });
     if (!response.ok || !response.body) { await response.body?.cancel(); throw new Error('ElevenLabs configuration is unavailable.'); }
@@ -108,6 +110,7 @@ export class ElevenLabsRealtime implements VoiceProvider {
   }
   async prepare(signal: AbortSignal): Promise<() => WebSocket> {
     const cfg = this.config;
+    if (!cfg.agentConfigSha256 || !/^[a-f0-9]{64}$/.test(cfg.agentConfigSha256)) throw new Error('The agent configuration has not been audited.');
     if (!(await this.audit(signal)).matchesPinnedDigest) throw new Error('The agent configuration has not been audited.');
     const result = record(await this.#get(`/v1/convai/conversation/get-signed-url?${new URLSearchParams({ agent_id: cfg.agentId, version_id: cfg.agentVersionId, include_conversation_id: 'true' })}`, signal));
     if (typeof result['signed_url'] !== 'string') throw new Error('Missing authenticated provider URL.');
