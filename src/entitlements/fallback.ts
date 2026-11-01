@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { aiEfforts, type AiEffort } from './build-admission.ts';
 import type { MeterDefinition } from './schema.ts';
 import { DocumentShapeError, enumField, integerField, stringArrayField, stringField, type Fields } from '../support/documents.ts';
+import { modelIdentifierPattern } from '../models/provider.ts';
 
 export interface FallbackPolicy {
   readonly provider: ModelProviderKey;
@@ -33,7 +34,7 @@ export function parseFallbackPolicy(value: unknown, where: string, meters: Reado
     maxCheckpointBytes: integerField(fields, 'maxCheckpointBytes', where, { min: 1, max: continuationProtocolMaxBytes }),
     maxOutputTokens: integerField(fields, 'maxOutputTokens', where, { min: 1 }),
   };
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(policy.model) || policy.eligiblePlanKeys.length === 0 || new Set(policy.eligiblePlanKeys).size !== policy.eligiblePlanKeys.length) {
+  if (!new RegExp(modelIdentifierPattern).test(policy.model) || policy.eligiblePlanKeys.length === 0 || new Set(policy.eligiblePlanKeys).size !== policy.eligiblePlanKeys.length) {
     throw new DocumentShapeError(`${where}: an exact model and distinct eligible plans are required.`);
   }
   if (policy.inputTokenMeterKey === policy.outputTokenMeterKey) throw new DocumentShapeError(`${where}: fallback meters must be distinct.`);

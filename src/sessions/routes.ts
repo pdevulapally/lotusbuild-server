@@ -1,4 +1,5 @@
-import { startTiming } from '../diagnostics/timing.ts';
+import {
+  startTiming } from '../diagnostics/timing.ts';
 import { commandKey, commandWasReplayed } from './commands.ts';
 import type { OutgoingHttpHeaders } from 'node:http';
 
@@ -24,6 +25,7 @@ import {
   promptMaxLength,
   sessionModes,
 } from './repository.ts';
+import { modelIdentifierPattern } from '../models/provider.ts';
 
 
 /** Same constraints as the project routes: ids reach a document path. */
@@ -477,7 +479,7 @@ export function registerSessionRoutes(
         params: { type: 'object', required: ['sessionId'], additionalProperties: false, properties: { sessionId: { type: 'string', pattern: documentId } } },
         body: { type: 'object', required: ['checkpointId', 'lane', 'model', 'effort'], additionalProperties: false, properties: {
           checkpointId: { type: 'string', pattern: documentId }, lane: { type: 'string', enum: ['premium', 'fallback'] },
-          model: { type: 'string', pattern: modelIdentifier }, effort: { type: 'string', enum: [...aiEfforts] },
+          model: { type: 'string', pattern: modelIdentifierPattern }, effort: { type: 'string', enum: [...aiEfforts] },
         } },
       },
     }, async (request, reply) => {

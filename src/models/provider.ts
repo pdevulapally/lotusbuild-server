@@ -90,7 +90,9 @@ export class AnthropicProvider implements ModelProvider {
   }
 }
 
-const identifier = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+/** Model identifiers across providers: OpenRouter's carry a vendor prefix and a variant suffix (`google/gemma-4-31b-it:free`). */
+export const modelIdentifierPattern = '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$';
+const identifier = new RegExp(modelIdentifierPattern);
 const openRouterCatalogKey = 'ai:openrouter-catalog';
 const maximumRows = 2048;
 /** Conservative text estimate: real tokenisers average about four bytes per token; three overstates, so the hold is never short. */
