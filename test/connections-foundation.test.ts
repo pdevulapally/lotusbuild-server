@@ -24,7 +24,8 @@ describe('OperationLedger', () => {
   });
 
   it('blocks the same action while an earlier operation is claimed or uncertain, until reconciled', async () => {
-    const ops = new OperationLedger(ledger().db);
+    const store = ledger();
+    const ops = new OperationLedger(store.db);
     const { leaseToken } = await ops.claim({ ...base, id: 'op-1' });
     await assert.rejects(ops.claim({ ...base, id: 'op-2' }), ReconciliationRequiredError);
     await ops.recordProviderRef('op-1', leaseToken, 'dpl_123');
@@ -35,6 +36,7 @@ describe('OperationLedger', () => {
     assert.equal(pending?.providerRef, 'dpl_123');
     assert.equal(pending?.destination, 'site-abc');
     await assert.rejects(ops.settle('op-1', leaseToken, 'succeeded'), StaleOperationLeaseError);
+    assert.equal(store.data.get('connection_action_locks/conn-1__deploy')?.['activeOperationId'], 'op-1');
     await ops.reconcile('op-1', 'succeeded', { decidedBy: 'operator:preetham', outcome: 'found deployment dpl_123 READY' });
     await assert.rejects(ops.reconcile('op-1', 'failed', { decidedBy: 'operator:preetham', outcome: 'x' }), /not awaiting reconciliation/);
     const next = await ops.claim({ ...base, id: 'op-2' });
@@ -53,6 +55,31 @@ describe('OperationLedger', () => {
     await assert.rejects(ops.reconcile('op-1', 'succeeded', { decidedBy: 'operator', outcome: 'x' }), /not awaiting reconciliation/);
     const second = await ops.claim({ ...base, id: 'op-2' });
     assert.notEqual(second.leaseToken, first.leaseToken);
+  });
+
+  it('turns a crashed worker\'s lapsed claim into an uncertain operation that can be reconciled, never silently unblocked', async () => {
+    const store = ledger();
+    const ops = new OperationLedger(store.db, 1000);
+    const t0 = new Date('2026-10-31T20:00:00Z');
+    const first = await ops.claim({ ...base, id: 'op-1' }, t0);
+    const later = new Date(t0.getTime() + 1001);
+    await assert.rejects(ops.settle('op-1', first.leaseToken, 'succeeded', undefined, later), StaleOperationLeaseError);
+    await assert.rejects(ops.claim({ ...base, id: 'op-2' }, later), (e: unknown) => e instanceof ReconciliationRequiredError && e.operationId === 'op-1');
+    assert.equal(store.data.get('connection_operations/op-1')?.['status'], 'uncertain');
+    const [pending] = await ops.uncertain('conn-1');
+    assert.match(pending?.outcome ?? '', /lease expired/);
+    await ops.reconcile('op-1', 'failed', { decidedBy: 'provider-lookup', outcome: 'no deployment found' }, later);
+    const next = await ops.claim({ ...base, id: 'op-2' }, later);
+    assert.equal(next.record.id, 'op-2');
+  });
+
+  it('never lets two concurrent claims for the same action both commit', async () => {
+    const store = ledger();
+    const ops = new OperationLedger(store.db);
+    const results = await Promise.allSettled([ops.claim({ ...base, id: 'op-a' }), ops.claim({ ...base, id: 'op-b' })]);
+    assert.deepEqual(results.map((r) => r.status).sort(), ['fulfilled', 'rejected']);
+    const rejected = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+    assert.ok(rejected?.reason instanceof ReconciliationRequiredError);
   });
 });
 

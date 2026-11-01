@@ -149,7 +149,7 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     // Identity travels in the Authorization header, never a cookie, so the
     // browser never needs to attach credentials to a cross-origin request.
     credentials: false,
-    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
     allowedHeaders: ['Authorization', 'Content-Type', 'Last-Event-ID', 'Idempotency-Key'],
     // Without this a cross-origin caller cannot read the retry hint off a 429,
     // because Retry-After is not one of the headers browsers reveal by default.

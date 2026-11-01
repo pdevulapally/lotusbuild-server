@@ -26,7 +26,7 @@ export class CredentialKeyring {
       if (!Number.isInteger(version) || version < 1) throw new Error(`Invalid key version ${version}.`);
       if (key.length !== 32) throw new Error(`Key version ${version} must be 32 bytes.`);
     }
-    this.#keks = keks;
+    this.#keks = new Map([...keks].map(([version, key]) => [version, Buffer.from(key)]));
     this.#current = Math.max(...keks.keys());
   }
 
