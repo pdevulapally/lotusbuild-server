@@ -15,7 +15,6 @@ export interface VoiceConfig {
   privacyVersion: string;
   zeroRetentionVerified: true;
   downstreamZeroRetentionVerified: true;
-  trainingOptOutVerified: true;
   providerSpendingLimitVerified: true;
 }
 
@@ -41,7 +40,7 @@ export function parseVoiceConfig(raw: string): VoiceConfig {
   const config = value as Record<string, unknown>;
   const strings = ['agentId', 'agentVersionId', 'statusToolId', 'submitToolId', 'privacyVersion'];
   const numbers = ['maxCallSeconds', 'idleSeconds', 'maxConnections', 'maxTurns', 'maxCallMicroGbp', 'globalMonthlyMicroGbp'];
-  const flags = ['zeroRetentionVerified', 'downstreamZeroRetentionVerified', 'trainingOptOutVerified', 'providerSpendingLimitVerified'];
+  const flags = ['zeroRetentionVerified', 'downstreamZeroRetentionVerified', 'providerSpendingLimitVerified'];
   const keys = [...strings, ...numbers, ...flags, 'agentConfigSha256', 'environment'];
   if (Object.keys(config).some(key => !keys.includes(key)) || keys.some(key => !Object.hasOwn(config, key))) throw new Error('Voice policy has missing or unknown fields.');
   if (!['global', 'eu'].includes(String(config['environment']))) throw new Error('Voice requires an approved global or EU environment.');
