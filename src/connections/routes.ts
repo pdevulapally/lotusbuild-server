@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { authenticatedUser } from '../auth/plugin.ts';
 import { AppError } from '../http/errors.ts';
 import { type ConnectorKey, connectors, isConnectorKey } from './registry.ts';
-import { type Connection, ConnectionNotFoundError, type ConnectionRepository } from './service.ts';
+import { type Connection, ConnectionInactiveError, ConnectionNotFoundError, type ConnectionRepository } from './service.ts';
 
 export interface ConnectionRouteDependencies {
   /** Undefined until CONNECTION_KEK_V<n> is configured; every route then reports configuration_required. */
@@ -25,8 +25,11 @@ type GrantsBody = { projectIds: string[] };
 export function publicConnection(connection: Connection, grantedProjectIds?: readonly string[]) {
   return {
     id: connection.id, connector: connection.connector, status: connection.status, scopes: connection.scopes,
-    ...(connection.account === undefined ? {} : { account: connection.account }),
-    ...(connection.health === undefined ? {} : { health: { ...connection.health, checkedAt: connection.health.checkedAt.toISOString() } }),
+    ...(connection.account === undefined ? {} : { account: {
+      id: connection.account.id, name: connection.account.name,
+      ...(connection.account.team === undefined ? {} : { team: connection.account.team }),
+    } }),
+    ...(connection.health === undefined ? {} : { health: { ok: connection.health.ok, checkedAt: connection.health.checkedAt.toISOString() } }),
     createdAt: connection.createdAt.toISOString(), updatedAt: connection.updatedAt.toISOString(),
     ...(grantedProjectIds === undefined ? {} : { grantedProjectIds }),
   };
@@ -34,7 +37,7 @@ export function publicConnection(connection: Connection, grantedProjectIds?: rea
 
 export function registerConnectionRoutes(api: FastifyInstance, dependencies: ConnectionRouteDependencies): void {
   const read = [api.requireAuth, api.enforceRateLimit('read')];
-  const write = [api.requireAuth, api.enforceRateLimit('write')];
+  const write = [api.requireAuth, api.requireVerifiedEmail, api.enforceRateLimit('write')];
 
   const repository = () => {
     if (dependencies.connections === undefined) throw new AppError({
@@ -45,6 +48,7 @@ export function registerConnectionRoutes(api: FastifyInstance, dependencies: Con
   };
   const notFound = (error: unknown) => {
     if (error instanceof ConnectionNotFoundError) throw new AppError({ code: 'connections/not-found', statusCode: 404, message: 'Connection not found.' });
+    if (error instanceof ConnectionInactiveError) throw new AppError({ code: 'connections/inactive', statusCode: 409, message: 'This connection is not active.' });
     throw error;
   };
 
@@ -99,5 +103,17 @@ export function registerConnectionRoutes(api: FastifyInstance, dependencies: Con
       message: `${connectors[connector].name} is not set up on this server yet.`, details: { connector },
     });
     throw new AppError({ code: 'connections/not-implemented', statusCode: 501, message: `${connectors[connector].name} connections are not available yet.` });
+  });
+
+  // Reserved at the actual API root. No token exchange or state write until
+  // an adapter supplies secure browser binding and verified account discovery.
+  api.get<{ Params: ConnectorParams }>('/connections/:connector/callback', {
+    schema: { params: connectorParams }, logLevel: 'silent',
+  }, async (request, reply) => {
+    reply.header('Cache-Control', 'no-store').header('Referrer-Policy', 'no-referrer');
+    if (!['netlify', 'vercel', 'slack'].includes(request.params.connector)) {
+      throw new AppError({ code: 'connections/unknown-connector', statusCode: 404, message: 'Unknown OAuth connector.' });
+    }
+    return reply.code(503).send({ error: { code: 'connections/configuration-required', message: 'This integration is not available yet.' } });
   });
 }

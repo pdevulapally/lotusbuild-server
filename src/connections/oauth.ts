@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { type Firestore, Timestamp } from 'firebase-admin/firestore';
 
 import type { ConnectorKey } from './registry.ts';
+import { requireProject } from './access.ts';
 
 /**
  * One-time OAuth state, bound to the LotusBuild user who started the flow,
@@ -40,15 +41,21 @@ export class OAuthStateStore {
   readonly #ttlMs: number;
   constructor(firestore: Firestore, ttlMs = defaultOAuthStateTtlMs) { this.#firestore = firestore; this.#ttlMs = ttlMs; }
 
+  /** Every project to be granted must belong to the starting user; nothing is granted by default. */
   async begin(record: Omit<OAuthStateRecord, 'codeVerifier'>, now = new Date()): Promise<OAuthStart> {
+    if (record.projectIds.length > 200) throw new Error('Too many project grants.');
+    const projectIds = [...new Set(record.projectIds)];
     const state = randomBytes(32).toString('base64url');
     const codeVerifier = randomBytes(48).toString('base64url');
     const expiresAt = new Date(now.getTime() + this.#ttlMs);
     const ref = this.#firestore.collection(collection).doc(state);
-    await this.#firestore.runTransaction(async (transaction) => transaction.create(ref, {
-      ...record, projectIds: [...record.projectIds], codeVerifier,
-      createdAt: Timestamp.fromDate(now), expiresAt: Timestamp.fromDate(expiresAt), usedAt: null,
-    }));
+    await this.#firestore.runTransaction(async (transaction) => {
+      for (const projectId of projectIds) await requireProject(transaction, this.#firestore, record.ownerUid, projectId);
+      transaction.create(ref, {
+        ...record, projectIds, codeVerifier,
+        createdAt: Timestamp.fromDate(now), expiresAt: Timestamp.fromDate(expiresAt), usedAt: null,
+      });
+    });
     return { state, codeVerifier, codeChallenge: pkceChallenge(codeVerifier), expiresAt };
   }
 

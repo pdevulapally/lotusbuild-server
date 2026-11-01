@@ -8,6 +8,7 @@ import { ledger } from './support/ledger.ts';
 
 const setup = () => {
   const store = ledger();
+  for (const id of ['p1', 'p2', 'p3']) store.data.set(`projects/${id}`, { ownerUid: 'alice', status: 'draft' });
   const repository = new ConnectionRepository(store.db, new CredentialKeyring(new Map([[1, randomBytes(32)]])));
   return { store, repository };
 };
@@ -49,5 +50,27 @@ describe('ConnectionRepository', () => {
     assert.equal(store.data.has('connection_credentials/c1'), false);
     await assert.rejects(repository.openCredential({ id: 'c1', ownerUid: 'alice', projectId: 'p2' }), ConnectionInactiveError);
     await assert.rejects(repository.disconnect('c1', 'mallory'), ConnectionNotFoundError);
+  });
+
+  it('grants only projects the user owns, and stops honouring a grant once the project is gone', async () => {
+    const store = ledger();
+    for (const id of ['p1', 'p2']) store.data.set(`projects/${id}`, { ownerUid: 'alice', status: 'draft' });
+    store.data.set('projects/bobs', { ownerUid: 'bob', status: 'draft' });
+    const repository = new ConnectionRepository(store.db, new CredentialKeyring(new Map([[1, randomBytes(32)]])));
+    await repository.begin({ id: 'c1', ownerUid: 'alice', connector: 'netlify' });
+    await assert.rejects(repository.activate({ id: 'c1', ownerUid: 'alice', account, scopes: [], secret: Buffer.from('tok'), projectIds: ['p1', 'bobs'] }), /No accessible project/);
+    assert.equal(store.data.has('connection_credentials/c1'), false);
+    await repository.activate({ id: 'c1', ownerUid: 'alice', account, scopes: [], secret: Buffer.from('tok'), projectIds: ['p1'] });
+    await assert.rejects(repository.setGrants('c1', 'alice', ['p1', 'bobs']), /No accessible project/);
+    await assert.rejects(repository.setGrants('c1', 'alice', ['p1', 'missing']), /No accessible project/);
+    assert.deepEqual([...(await repository.grantedProjects('c1', 'alice'))], ['p1']);
+    await assert.rejects(repository.openCredential({ id: 'c1', ownerUid: 'alice', projectId: 'bobs' }), /No accessible project/);
+    const opened = await repository.openCredential({ id: 'c1', ownerUid: 'alice', projectId: 'p1' });
+    assert.equal(opened.secret.toString(), 'tok');
+    store.data.set('projects/p1', { ownerUid: 'alice', status: 'deleting' });
+    await assert.rejects(repository.openCredential({ id: 'c1', ownerUid: 'alice', projectId: 'p1' }), /No accessible project/);
+    store.data.set('projects/p1', { ownerUid: 'alice', status: 'draft' });
+    store.data.set('accountErasures/alice', { requestedAt: 1 });
+    await assert.rejects(repository.openCredential({ id: 'c1', ownerUid: 'alice', projectId: 'p1' }), /No accessible project/);
   });
 });

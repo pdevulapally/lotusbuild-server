@@ -1,6 +1,7 @@
 import { type Firestore, Timestamp, type Transaction } from 'firebase-admin/firestore';
 
 import type { CredentialKeyring, SealedCredential } from './credentials.ts';
+import { documentId, requireProject } from './access.ts';
 import { type ConnectionStatus, type ConnectorKey, connectionStatuses, isConnectorKey } from './registry.ts';
 
 /**
@@ -77,6 +78,9 @@ export class ConnectionRepository {
     const sealed = this.#keyring.seal(input.secret, credentialAad(input.id, input.ownerUid));
     return this.#firestore.runTransaction(async (transaction) => {
       const current = await this.#requireOwned(transaction, input.id, input.ownerUid);
+      if (current.status !== 'connecting') throw new ConnectionInactiveError(current.status);
+      if (input.projectIds.length > 200) throw new Error('Too many project grants.');
+      for (const projectId of input.projectIds) await requireProject(transaction, this.#firestore, input.ownerUid, projectId);
       const next: Connection = { ...current, status: 'active', account: input.account, scopes: [...input.scopes], health: { checkedAt: now, ok: true }, updatedAt: now };
       transaction.set(ref, serialise(next));
       transaction.set(this.#firestore.collection(credentials).doc(input.id), { ownerUid: input.ownerUid, ...sealed, updatedAt: Timestamp.fromDate(now) });
@@ -89,6 +93,7 @@ export class ConnectionRepository {
     const ref = this.#firestore.collection(connections).doc(id);
     return this.#firestore.runTransaction(async (transaction) => {
       const current = await this.#requireOwned(transaction, id, ownerUid);
+      if (current.status === 'revoked') throw new ConnectionInactiveError(current.status);
       const next: Connection = { ...current, status, health: { checkedAt: now, ok: false, ...(detail === undefined ? {} : { detail }) }, updatedAt: now };
       transaction.set(ref, serialise(next));
       return next;
@@ -130,10 +135,13 @@ export class ConnectionRepository {
   }
 
   async setGrants(id: string, ownerUid: string, projectIds: readonly string[], now = new Date()): Promise<void> {
+    if (projectIds.length > 200) throw new Error('Too many project grants.');
     const ref = this.#firestore.collection(connections).doc(id);
     await this.#firestore.runTransaction(async (transaction) => {
-      await this.#requireOwned(transaction, id, ownerUid);
+      const connection = await this.#requireOwned(transaction, id, ownerUid);
+      if (connection.status !== 'active') throw new ConnectionInactiveError(connection.status);
       const existing = await transaction.get(ref.collection(grants));
+      for (const projectId of projectIds) await requireProject(transaction, this.#firestore, ownerUid, projectId);
       for (const doc of existing.docs) if (!projectIds.includes(doc.id)) transaction.delete(doc.ref);
       for (const projectId of projectIds) transaction.set(ref.collection(grants).doc(projectId), { projectId, grantedAt: Timestamp.fromDate(now) });
     });
@@ -145,13 +153,13 @@ export class ConnectionRepository {
    * use, not just at connect time.
    */
   async openCredential(input: { id: string; ownerUid: string; projectId: string }): Promise<{ connection: Connection; secret: Buffer }> {
-    const connection = await this.read(input.id, input.ownerUid);
-    if (connection.status !== 'active') throw new ConnectionInactiveError(connection.status);
-    const grant = await this.#firestore.collection(connections).doc(input.id).collection(grants).doc(input.projectId).get();
-    if (!grant.exists) throw new ConnectionNotGrantedError(input.projectId);
-    const sealedSnapshot = await this.#firestore.collection(credentials).doc(input.id).get();
-    const sealed = sealedSnapshot.data();
-    if (!sealedSnapshot.exists || sealed === undefined) throw new ConnectionInactiveError('revoked');
+    const { connection, sealed } = await this.#firestore.runTransaction(async (transaction) => {
+      const connection = await this.requireAccess(transaction, input);
+      const snapshot = await transaction.get(this.#firestore.collection(credentials).doc(input.id));
+      const sealed = snapshot.data();
+      if (!snapshot.exists || sealed === undefined || sealed['ownerUid'] !== input.ownerUid) throw new ConnectionInactiveError('revoked');
+      return { connection, sealed };
+    });
     const secret = this.#keyring.open(
       { keyVersion: sealed['keyVersion'] as number, wrappedKey: sealed['wrappedKey'] as string, ciphertext: sealed['ciphertext'] as string } satisfies SealedCredential,
       credentialAad(input.id, input.ownerUid),
@@ -159,8 +167,17 @@ export class ConnectionRepository {
     return { connection, secret };
   }
 
+  async requireAccess(transaction: Transaction, input: { id: string; ownerUid: string; projectId: string }): Promise<Connection> {
+    const connection = await this.#requireOwned(transaction, input.id, input.ownerUid);
+    if (connection.status !== 'active') throw new ConnectionInactiveError(connection.status);
+    await requireProject(transaction, this.#firestore, input.ownerUid, input.projectId);
+    const grant = await transaction.get(this.#firestore.collection(connections).doc(input.id).collection(grants).doc(input.projectId));
+    if (!grant.exists) throw new ConnectionNotGrantedError(input.projectId);
+    return connection;
+  }
+
   async #requireOwned(transaction: Transaction, id: string, ownerUid: string): Promise<Connection> {
-    const snapshot = await transaction.get(this.#firestore.collection(connections).doc(id));
+    const snapshot = await transaction.get(this.#firestore.collection(connections).doc(documentId(id)));
     const data = snapshot.data();
     if (!snapshot.exists || data === undefined || data['ownerUid'] !== ownerUid) throw new ConnectionNotFoundError(id);
     return parse(id, data);

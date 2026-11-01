@@ -10,6 +10,8 @@ import { type Firestore, Timestamp } from 'firebase-admin/firestore';
 export interface ActionDescriptor {
   readonly tool: string;
   readonly connectionId: string;
+  /** The LotusBuild project the action runs for; the grant is checked against it. */
+  readonly projectId: string;
   readonly destination: string;
   readonly inputs: Readonly<Record<string, unknown>>;
 }
@@ -17,7 +19,7 @@ export interface ActionDescriptor {
 export const hashAction = (action: ActionDescriptor): string =>
   createHash('sha256').update(canonical(action)).digest('hex');
 
-export type ApprovalRejection = 'missing' | 'consumed' | 'expired' | 'mismatch' | 'wrong-session';
+export type ApprovalRejection = 'missing' | 'consumed' | 'expired' | 'mismatch' | 'wrong-session' | 'wrong-user';
 export class ApprovalRejectedError extends Error {
   readonly reason: ApprovalRejection;
   constructor(reason: ApprovalRejection) { super(`Approval cannot be used: ${reason}.`); this.reason = reason; }
@@ -38,20 +40,26 @@ export class ActionApprovals {
     const ref = this.#firestore.collection(collection).doc(input.id);
     await this.#firestore.runTransaction(async (transaction) => transaction.create(ref, {
       sessionId: input.sessionId, ownerUid: input.ownerUid, actionHash,
-      tool: input.action.tool, connectionId: input.action.connectionId, destination: input.action.destination,
+      tool: input.action.tool, connectionId: input.action.connectionId, projectId: input.action.projectId,
+      destination: input.action.destination,
       issuedAt: Timestamp.fromDate(now), expiresAt: Timestamp.fromDate(expiresAt), consumedAt: null,
     }));
     return { actionHash, expiresAt };
   }
 
-  /** Atomically marks the approval used; the action may run only after this resolves. */
-  async consume(input: { id: string; sessionId: string; action: ActionDescriptor; now?: Date }): Promise<void> {
+  /**
+   * Atomically marks the approval used; the action may run only after this
+   * resolves. The caller's identity is checked independently of the action
+   * hash, so a leaked approval id is useless to another user or session.
+   */
+  async consume(input: { id: string; sessionId: string; ownerUid: string; action: ActionDescriptor; now?: Date }): Promise<void> {
     const ref = this.#firestore.collection(collection).doc(input.id);
     const now = input.now ?? new Date();
     await this.#firestore.runTransaction(async (transaction) => {
       const snapshot = await transaction.get(ref);
       if (!snapshot.exists) throw new ApprovalRejectedError('missing');
       const data = snapshot.data() ?? {};
+      if (data['ownerUid'] !== input.ownerUid) throw new ApprovalRejectedError('wrong-user');
       if (data['sessionId'] !== input.sessionId) throw new ApprovalRejectedError('wrong-session');
       if (data['consumedAt'] !== null) throw new ApprovalRejectedError('consumed');
       if ((data['expiresAt'] as Timestamp).toMillis() <= now.getTime()) throw new ApprovalRejectedError('expired');

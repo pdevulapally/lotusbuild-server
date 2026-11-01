@@ -14,6 +14,7 @@ import { ledger } from './support/ledger.ts';
 
 function harness(configuredKeyring = true) {
   const store = ledger();
+  for (const id of ['p1', 'p2', 'p3']) store.data.set(`projects/${id}`, { ownerUid: 'alice', status: 'draft' });
   const repository = new ConnectionRepository(store.db, new CredentialKeyring(new Map([[1, randomBytes(32)]])));
   let uid = 'alice';
   const app = Fastify({ logger: false });
@@ -73,6 +74,29 @@ describe('connection routes', () => {
     assert.deepEqual(gone.json(), { ...gone.json(), providerRevoked: false });
     assert.equal((gone.json() as { connection: { status: string } }).connection.status, 'revoked');
     assert.equal(h.store.data.has('connection_credentials/c1'), false);
+  });
+
+  it('refuses grants to projects the caller does not own, and reserves the callback paths at the API root', async (t) => {
+    const h = harness();
+    t.after(() => h.app.close());
+    h.store.data.set('projects/bobs', { ownerUid: 'bob', status: 'draft' });
+    const account = { id: 'acct', name: 'Alice' };
+    await h.repository.begin({ id: 'c1', ownerUid: 'alice', connector: 'netlify' });
+    await h.repository.activate({ id: 'c1', ownerUid: 'alice', account, scopes: [], secret: Buffer.from('tok'), projectIds: ['p1'] });
+    const foreign = await h.app.inject({ method: 'PUT', url: '/connections/c1/grants', headers, payload: { projectIds: ['p1', 'bobs'] } });
+    assert.equal(foreign.statusCode, 404);
+    assert.equal((foreign.json() as { error: { code: string } }).error.code, 'project/not-found');
+    const unchanged = await h.app.inject({ method: 'GET', url: '/connections/c1', headers });
+    assert.deepEqual((unchanged.json() as { connection: { grantedProjectIds: string[] } }).connection.grantedProjectIds, ['p1']);
+    for (const connector of ['netlify', 'vercel', 'slack']) {
+      const callback = await h.app.inject({ method: 'GET', url: `/connections/${connector}/callback?code=x&state=y` });
+      assert.equal(callback.statusCode, 503, connector);
+      assert.equal(callback.headers['cache-control'], 'no-store');
+      assert.equal((callback.json() as { error: { code: string } }).error.code, 'connections/configuration-required');
+    }
+    const aws = await h.app.inject({ method: 'GET', url: '/connections/aws/callback' });
+    assert.equal(aws.statusCode, 404);
+    assert.ok([...h.store.data.keys()].every((key) => !key.startsWith('oauth_states/')), 'callback must not create state');
   });
 
   it('reports configuration_required everywhere while no key-encryption key is set', async (t) => {
