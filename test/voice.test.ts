@@ -115,7 +115,11 @@ test('operator audit is GET-only and creates no signed access; prepare requires 
   await assert.rejects(provider.prepare(new AbortController().signal), /Invalid provider connection URL/);
   await new ElevenLabsRealtime('server-only-secret', { ...f.policy, environment: 'eu' }).audit(new AbortController().signal);
   assert.ok(hosts.slice(-4).every(host => host === 'api.eu.residency.elevenlabs.io'));
-  globalThis.fetch = (async () => Response.json({ conversation_initiation_client_data_webhook: { url: 'https://external.example' } })) as typeof fetch;
+  globalThis.fetch = (async input => {
+    const path = new URL(String(input)).pathname;
+    return Response.json(path.endsWith('/settings') ? { conversation_initiation_client_data_webhook: { url: 'https://external.example' } }
+      : path.includes('/agents/') ? f.agent : path.endsWith(config.statusToolId) ? f.tools[0] : f.tools[1]);
+  }) as typeof fetch;
   await assert.rejects(provider.audit(new AbortController().signal), /webhooks are not permitted/);
 });
 test('native realtime forwards audio, not an STT task pipeline; dialogue has no execution authority', async () => {
