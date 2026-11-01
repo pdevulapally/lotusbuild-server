@@ -1,6 +1,6 @@
 # lotusbuild-server security model
 
-Repository: `pdevulapally/lotusbuild-server` (Fastify 5 / TypeScript API + AI runner). Infrastructure lives in the same repo (`deploy/`, `Dockerfile`, `.github/workflows/ci.yml`, `firestore.rules`, `storage.rules`); there is no separate infrastructure repository. No `SECURITY_MODEL.md` existed; prior hardening notes are in `docs/security-remediation.md` and `docs/staging-security-checklist.md`.
+Repository: `pdevulapally/lotusbuild-server` (Fastify 5 / TypeScript API + AI runner). Infrastructure lives in the same repo (`deploy/`, `Dockerfile`, `.github/workflows/ci.yml`, `firestore.rules`, `storage.rules`); there is no separate infrastructure repository. Prior hardening notes are in `docs/security-remediation.md` and `docs/staging-security-checklist.md`.
 
 ## System overview and trust boundaries
 
