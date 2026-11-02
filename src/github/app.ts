@@ -18,7 +18,62 @@ export interface InstallationToken {
  * What a 404 means for a given call. GitHub reuses it for "your credentials are
  * wrong" and "that installation is gone", which need opposite responses.
  */
-type NotFoundMeaning = 'credentials' | 'installation';
+type NotFoundMeaning = 'credentials' | 'installation' | 'repository';
+
+export interface Installation {
+  readonly id: number;
+  readonly account: { readonly login: string; readonly id: number; readonly type: 'User' | 'Organization' };
+  /** Permission names GitHub granted, e.g. `contents`, `pull_requests`. */
+  readonly permissions: readonly string[];
+}
+
+export interface Repository {
+  readonly id: number;
+  readonly fullName: string;
+  readonly name: string;
+  readonly owner: string;
+  readonly private: boolean;
+  readonly defaultBranch: string;
+  readonly htmlUrl: string;
+  readonly pushedAt: Date | undefined;
+}
+
+export const repositoryFullName = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
+const repositoryPageSize = 100;
+const maxRepositoryPages = 5;
+
+function assertInstallationId(installationId: number): void {
+  if (!Number.isInteger(installationId) || installationId <= 0) {
+    throw new AppError({
+      code: 'github/installation-invalid',
+      statusCode: 400,
+      message: 'An installation id must be a positive integer.',
+    });
+  }
+}
+
+const unexpected = (what: string): AppError =>
+  new AppError({ code: 'github/unexpected-response', statusCode: 502, message: `GitHub returned ${what}.` });
+
+function parseRepository(item: unknown): Repository {
+  if (typeof item !== 'object' || item === null) throw unexpected('a repository this service cannot read');
+  const fields = item as Record<string, unknown>;
+  const owner = fields['owner'];
+  const login = typeof owner === 'object' && owner !== null ? (owner as Record<string, unknown>)['login'] : undefined;
+  if (
+    typeof fields['id'] !== 'number' || typeof fields['full_name'] !== 'string' || typeof fields['name'] !== 'string'
+    || typeof login !== 'string' || typeof fields['private'] !== 'boolean' || typeof fields['default_branch'] !== 'string'
+    || typeof fields['html_url'] !== 'string'
+  ) {
+    throw unexpected('a repository this service cannot read');
+  }
+  const pushedAt = typeof fields['pushed_at'] === 'string' ? new Date(fields['pushed_at']) : undefined;
+  return {
+    id: fields['id'], fullName: fields['full_name'], name: fields['name'], owner: login, private: fields['private'],
+    defaultBranch: fields['default_branch'], htmlUrl: fields['html_url'],
+    pushedAt: pushedAt !== undefined && !Number.isNaN(pushedAt.getTime()) ? pushedAt : undefined,
+  };
+}
 
 /** What the App itself is, as GitHub reports it. Read at startup to prove the key. */
 export interface AppIdentity {
@@ -96,13 +151,7 @@ export class GitHubApp {
    * needs it.
    */
   async installationToken(installationId: number): Promise<InstallationToken> {
-    if (!Number.isInteger(installationId) || installationId <= 0) {
-      throw new AppError({
-        code: 'github/installation-invalid',
-        statusCode: 400,
-        message: 'An installation id must be a positive integer.',
-      });
-    }
+    assertInstallationId(installationId);
 
     const body = await this.#request(
       'POST',
@@ -131,6 +180,51 @@ export class GitHubApp {
     }
 
     return { token, expiresAt: expiry };
+  }
+
+  /**
+   * The installation as GitHub sees it. A 404 here means the user removed the
+   * app, which is the one answer the connect flow must not take on faith from
+   * a query parameter.
+   */
+  async installation(installationId: number): Promise<Installation> {
+    assertInstallationId(installationId);
+    const body = await this.#request('GET', `/app/installations/${installationId}`, this.#jwt(), 'installation');
+    const account = body['account'];
+    const permissions = body['permissions'];
+    if (
+      typeof account !== 'object' || account === null || typeof (account as Record<string, unknown>)['login'] !== 'string'
+      || typeof (account as Record<string, unknown>)['id'] !== 'number' || typeof (account as Record<string, unknown>)['type'] !== 'string'
+    ) {
+      throw unexpected('an installation this service cannot read');
+    }
+    const { login, id, type } = account as { login: string; id: number; type: string };
+    return {
+      id: installationId,
+      account: { login, id, type: type === 'Organization' ? 'Organization' : 'User' },
+      permissions: typeof permissions === 'object' && permissions !== null ? Object.keys(permissions).sort() : [],
+    };
+  }
+
+  /** Every repository the installation may reach, newest push first as GitHub orders them. */
+  async listRepositories(token: InstallationToken): Promise<readonly Repository[]> {
+    const repositories: Repository[] = [];
+    for (let page = 1; page <= maxRepositoryPages; page += 1) {
+      const body = await this.#request('GET', `/installation/repositories?per_page=${repositoryPageSize}&page=${page}`, token.token, 'installation');
+      const items = body['repositories'];
+      if (!Array.isArray(items)) throw unexpected('a repository list this service cannot read');
+      for (const item of items) repositories.push(parseRepository(item));
+      if (items.length < repositoryPageSize) break;
+    }
+    return repositories;
+  }
+
+  /** One repository by `owner/name`; a 404 means the installation cannot reach it. */
+  async repository(token: InstallationToken, fullName: string): Promise<Repository> {
+    if (!repositoryFullName.test(fullName)) {
+      throw new AppError({ code: 'github/repository-invalid', statusCode: 400, message: 'A repository is named owner/name.' });
+    }
+    return parseRepository(await this.#request('GET', `/repos/${fullName}`, token.token, 'repository'));
   }
 
   /**
@@ -228,6 +322,13 @@ export class GitHubApp {
         statusCode: 500,
         message: 'GitHub rejected this service’s App credentials.',
         details: { status },
+      });
+    }
+    if (status === 404 && notFound === 'repository') {
+      return new AppError({
+        code: 'github/repository-not-accessible',
+        statusCode: 404,
+        message: 'That repository is not one this installation can reach.',
       });
     }
     if (status === 404) {

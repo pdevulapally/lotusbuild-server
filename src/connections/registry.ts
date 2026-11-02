@@ -4,11 +4,11 @@
  * listed as `configured: false` renders as "configuration required" until its
  * app credentials exist on the server.
  */
-export const connectorKeys = ['netlify', 'vercel', 'slack', 'aws', 'mcp'] as const;
+export const connectorKeys = ['github', 'netlify', 'vercel', 'slack', 'aws', 'mcp'] as const;
 export type ConnectorKey = (typeof connectorKeys)[number];
 
 /** How a user grants LotusBuild access. OAuth grants access; tools are a separate concern. */
-export type ConnectorAuthKind = 'oauth2' | 'slack-install' | 'aws-role' | 'mcp-remote';
+export type ConnectorAuthKind = 'github-app' | 'oauth2' | 'slack-install' | 'aws-role' | 'mcp-remote';
 
 export const connectionStatuses = [
   'connecting', 'active', 'expired', 'revoked', 'insufficient_permissions', 'provider_unavailable', 'configuration_required',
@@ -34,6 +34,22 @@ export interface ConnectorDefinition {
 }
 
 export const connectors: Readonly<Record<ConnectorKey, ConnectorDefinition>> = {
+  github: {
+    key: 'github', name: 'GitHub', auth: 'github-app',
+    summary: 'Work on your repositories: clone, branch, commit, and open pull requests.',
+    capabilities: [
+      { key: 'repos.read', title: 'List repositories', description: 'See the repositories you chose when installing the app.', requiresApproval: false },
+      { key: 'repo.clone', title: 'Work in a repository', description: 'Clone a repository granted to the project into the workspace.', requiresApproval: false },
+      { key: 'git.push', title: 'Push a branch', description: 'Push the agent’s branch to GitHub, with your approval each time.', requiresApproval: true },
+      { key: 'pulls.create', title: 'Open a pull request', description: 'Open a pull request from that branch, with your approval each time.', requiresApproval: true },
+      { key: 'repos.create', title: 'Create a repository', description: 'Create a repository under your account, with your approval each time.', requiresApproval: true },
+    ],
+    limits: [
+      'Works only in repositories you grant to a project.',
+      'Never pushes to a repository’s default branch; every change arrives as a pull request.',
+      'Creates repositories under your own account only.',
+    ],
+  },
   netlify: {
     key: 'netlify', name: 'Netlify', auth: 'oauth2',
     summary: 'Deploy projects to sites in your Netlify account.',

@@ -2,7 +2,7 @@ import { commandTransaction, reconciledCommand } from '../sessions/commands.ts';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 
 
-import { FieldValue, type Firestore, type Transaction } from 'firebase-admin/firestore';
+import { FieldValue, type Firestore, type Transaction, Timestamp } from 'firebase-admin/firestore';
 
 import type { ConfigurationStore } from '../entitlements/store.ts';
 import type { EntitlementService } from '../entitlements/service.ts';
@@ -62,7 +62,17 @@ export interface Project {
    * migrated before session activation can safely continue.
    */
   readonly activeSessionId: string | null | undefined;
+  readonly source?: ProjectSource;
   readonly createdAt: Date;
+}
+
+/** The repository a project is bound to; the connection is what reaches it. */
+export interface ProjectSource {
+  readonly kind: 'github';
+  readonly connectionId: string;
+  readonly fullName: string;
+  readonly defaultBranch: string;
+  readonly boundAt: Date;
 }
 
 export interface NewProject {
@@ -132,8 +142,25 @@ function parseProject(id: string, fields: Fields, where: string): Project {
     snapshot: storedSnapshot(fields, where, snapshotBytes),
     ...(typeof fields['snapshotUploadId'] === 'string' ? { snapshotUploadId: fields['snapshotUploadId'] } : {}),
     activeSessionId: activeSessionIdField(fields, where),
+    ...(sourceField(fields, where) ?? {}),
     createdAt: timestampField(fields, 'createdAt', where),
   };
+}
+
+function sourceField(fields: Fields, where: string): { source: ProjectSource } | undefined {
+  const value = fields['source'];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object') throw new DocumentShapeError(`${where}: field "source" must be a map.`);
+  const source = value as Fields;
+  if (source['kind'] !== 'github') throw new DocumentShapeError(`${where}: field "source.kind" is not a known source.`);
+  const nested = `${where}.source`;
+  return { source: {
+    kind: 'github',
+    connectionId: stringField(source, 'connectionId', nested),
+    fullName: stringField(source, 'fullName', nested),
+    defaultBranch: stringField(source, 'defaultBranch', nested),
+    boundAt: timestampField(source, 'boundAt', nested),
+  } };
 }
 
 export function projectSessionActiveError(): AppError {
@@ -265,6 +292,27 @@ export class ProjectRepository {
   /**
    * Updates an existing project's name and/or description.
    */
+  /** Binding replaces any earlier source; the owner may re-bind, and the next session re-clones. */
+  async bindSource(ownerUid: string, projectId: string, source: ProjectSource): Promise<Project> {
+    const existing = await this.readOwned(ownerUid, projectId);
+    await this.refFor(projectId).update({
+      source: {
+        kind: source.kind, connectionId: source.connectionId, fullName: source.fullName,
+        defaultBranch: source.defaultBranch, boundAt: Timestamp.fromDate(source.boundAt),
+      },
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+    return { ...existing, source };
+  }
+
+  async unbindSource(ownerUid: string, projectId: string): Promise<Project> {
+    const existing = await this.readOwned(ownerUid, projectId);
+    if (existing.source === undefined) return existing;
+    await this.refFor(projectId).update({ source: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() });
+    const { source: _source, ...rest } = existing;
+    return rest;
+  }
+
   async update(ownerUid: string, projectId: string, input: UpdateProject): Promise<Project> {
     if (input.name !== undefined) this.#validateName(input.name);
     const existing = await this.readOwned(ownerUid, projectId);

@@ -167,6 +167,25 @@ export class ConnectionRepository {
     return { connection, secret };
   }
 
+  /**
+   * The owner reading their own connection outside any project — listing what
+   * it can reach before granting it anywhere. Nothing a task runs in gets this.
+   */
+  async openOwnedCredential(input: { id: string; ownerUid: string }): Promise<Buffer> {
+    const sealed = await this.#firestore.runTransaction(async (transaction) => {
+      const connection = await this.#requireOwned(transaction, input.id, input.ownerUid);
+      if (connection.status !== 'active') throw new ConnectionInactiveError(connection.status);
+      const snapshot = await transaction.get(this.#firestore.collection(credentials).doc(input.id));
+      const sealed = snapshot.data();
+      if (!snapshot.exists || sealed === undefined || sealed['ownerUid'] !== input.ownerUid) throw new ConnectionInactiveError('revoked');
+      return sealed;
+    });
+    return this.#keyring.open(
+      { keyVersion: sealed['keyVersion'] as number, wrappedKey: sealed['wrappedKey'] as string, ciphertext: sealed['ciphertext'] as string } satisfies SealedCredential,
+      credentialAad(input.id, input.ownerUid),
+    );
+  }
+
   async requireAccess(transaction: Transaction, input: { id: string; ownerUid: string; projectId: string }): Promise<Connection> {
     const connection = await this.#requireOwned(transaction, input.id, input.ownerUid);
     if (connection.status !== 'active') throw new ConnectionInactiveError(connection.status);

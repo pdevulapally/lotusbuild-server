@@ -23,7 +23,10 @@ import { releaseRevision } from './release.ts';
 import { BrevoEmailSender } from './email/brevo.ts';
 import { EmailVerificationService } from './auth/email-verification.ts';
 import { keyringFromEnv } from './connections/credentials.ts';
+import { GitHubInstallations } from './connections/github.ts';
+import { OAuthStateStore } from './connections/oauth.ts';
 import { ConnectionRepository } from './connections/service.ts';
+import { GitHubApp } from './github/app.ts';
 import { VoiceRelay } from './voice/relay.ts';
 import { ElevenLabsRealtime } from './voice/provider.ts';
 import { MeteredVoiceBudget } from './voice/budget.ts';
@@ -77,6 +80,17 @@ async function main(): Promise<void> {
   // Integrations stay dormant (503 configuration_required) until at least one
   // CONNECTION_KEK_V<n> is present; the key values are never logged.
   const connectionKeyring = keyringFromEnv(process.env);
+  const connections = connectionKeyring === undefined ? undefined : new ConnectionRepository(firebase.firestore, connectionKeyring);
+  const github = connections === undefined || config.GITHUB_APP_ID === undefined || config.GITHUB_APP_PRIVATE_KEY === undefined || config.GITHUB_APP_SLUG === undefined
+    ? undefined
+    : new GitHubInstallations({
+      app: new GitHubApp({
+        appId: config.GITHUB_APP_ID, privateKey: config.GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n'),
+        apiBaseUrl: new URL('https://api.github.com'), requestTimeoutMs: 15_000,
+      }),
+      slug: config.GITHUB_APP_SLUG, states: new OAuthStateStore(firebase.firestore), connections,
+      allowedOrigins: config.CORS_ALLOWED_ORIGINS.map((origin) => origin.origin),
+    });
   const metering = new MeteringService(firebase.firestore, configuration);
   const projects = new ProjectRepository(
     firebase.firestore,
@@ -112,7 +126,8 @@ async function main(): Promise<void> {
       allowedOrigins: new Set(config.CORS_ALLOWED_ORIGINS.map(url => url.origin)),
     }) }),
     projectFiles: new ProjectFiles(snapshots),
-    ...(connectionKeyring === undefined ? {} : { connections: new ConnectionRepository(firebase.firestore, connectionKeyring) }),
+    ...(connections === undefined ? {} : { connections }),
+    ...(github === undefined ? {} : { github }),
     attachments: new AttachmentStore(firebase.app, config.FIREBASE_STORAGE_BUCKET),
     skills: new SkillRepository(firebase.firestore, entitlements),
     privacyRequests: new PrivacyRequests(firebase.firestore),

@@ -8,8 +8,7 @@ import {
   type Project,
   type ProjectRepository,
   projectDescriptionMaxLength,
-  projectNameMaxLength,
-} from './repository.ts';
+  projectNameMaxLength, type ProjectSource } from './repository.ts';
 
 /**
  * Rejects control characters — including the newlines and NULs that turn a
@@ -50,7 +49,15 @@ function toResponse(project: Project) {
     status: project.status,
     publicPreviewEnabled: project.publicPreviewEnabled === true,
     visibility: project.visibility,
+    ...(project.source === undefined ? {} : { source: projectSourceResponse(project.source) } ),
     createdAt: project.createdAt.toISOString(),
+  };
+}
+
+export function projectSourceResponse(source: ProjectSource) {
+  return {
+    kind: source.kind, connectionId: source.connectionId, fullName: source.fullName,
+    defaultBranch: source.defaultBranch, boundAt: source.boundAt.toISOString(),
   };
 }
 
