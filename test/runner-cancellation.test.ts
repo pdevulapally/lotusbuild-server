@@ -345,6 +345,21 @@ for (const mode of ['model', 'command', 'queue', 'save-failure'] as const) {
 }
 
 
+test('a queued-work wake ends the idle wait instead of the next poll', async () => {
+  let claims = 0; let onWake: (() => void) | undefined;
+  const controller = new AbortController();
+  const runner = { start: async () => { claims += 1; if (claims === 2) controller.abort(); return undefined; } } as unknown as SessionRunner;
+  const log = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
+  const loop = runUntilStopped(runner, { signal: controller.signal, shouldContinue: () => true, idlePollSeconds: 3600, log,
+    wake: async (listener) => { onWake = listener; return () => { onWake = undefined; }; } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(claims, 1, 'first claim found nothing and the loop is idling');
+  onWake!();
+  await loop;
+  assert.equal(claims, 2, 'the wake produced a claim long before the hour-long poll');
+  assert.equal(onWake, undefined, 'the wake subscription is released on exit');
+});
+
 test('a message that needs no tool is answered without starting a sandbox or a desktop', async () => {
   const h = runnerFixture('reply');
   await h.runner.runOnce();

@@ -84,7 +84,7 @@ async function fixture(uid = 'alice') {
     enqueueMessage: async (...args: unknown[]) => { calls.push({ method: 'enqueueMessage', args }); return { id: 'q1', sessionId: 'owned', prompt: args[2], attachments: args[4] ?? [], createdAt: new Date(0) }; },
   } as unknown as SessionRepository;
   const owner = (args: unknown[]) => String(args[0]);
-  registerSessionRoutes(app, sessions, { subscribe: async () => () => {}, replay: async function* () {}, append: async () => {} } as unknown as SessionEvents,
+  registerSessionRoutes(app, sessions, { subscribe: async () => () => {}, replay: async function* () {}, append: async () => {}, notifyQueued: async () => {} } as unknown as SessionEvents,
     { heartbeatSeconds: 1, maxConnections: 1, maxConnectionsPerUser: 1, maxBufferedBytes: 1024, reauthenticate: async () => {}, attachments: store });
   const address = await app.listen({ host: '127.0.0.1', port: 0 });
   return { app, address, saved, calls, counters };
