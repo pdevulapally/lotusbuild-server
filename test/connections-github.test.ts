@@ -61,7 +61,7 @@ type ErrorBody = { error: { code: string } };
 async function connect(h: ReturnType<typeof harness>, projectIds: string[] = ['p1']) {
   const start = await h.server.inject({ method: 'POST', url: '/connections/github/start', headers, payload: { returnTo, projectIds } });
   assert.equal(start.statusCode, 200, start.body);
-  const url = new URL((start.json() as { url: string }).url);
+  const url = new URL((start.json() as { authorizeUrl: string }).authorizeUrl);
   assert.equal(url.origin + url.pathname, 'https://github.com/apps/lotusbuild/installations/new');
   const state = url.searchParams.get('state')!;
   const complete = await h.server.inject({ method: 'POST', url: '/connections/github/complete', headers, payload: { state, installationId: 9001, returnTo } });
@@ -98,7 +98,7 @@ describe('GitHub installations', () => {
     assert.equal((replay.json() as ErrorBody).error.code, 'connections/state-rejected');
 
     const start = await h.server.inject({ method: 'POST', url: '/connections/github/start', headers, payload: { returnTo, projectIds: [] } });
-    const other = new URL((start.json() as { url: string }).url).searchParams.get('state')!;
+    const other = new URL((start.json() as { authorizeUrl: string }).authorizeUrl).searchParams.get('state')!;
     h.as('mallory');
     const stolen = await h.server.inject({ method: 'POST', url: '/connections/github/complete', headers, payload: { state: other, installationId: 9001, returnTo } });
     assert.equal(stolen.statusCode, 400);

@@ -150,7 +150,7 @@ export function registerConnectionRoutes(api: FastifyInstance, dependencies: Con
   api.post<{ Body: StartBody }>('/connections/github/start', { preHandler: write, schema: { body: startBody } }, async (request) => {
     const { uid } = authenticatedUser(request);
     const started = await github().start({ ownerUid: uid, projectIds: request.body.projectIds ?? [], returnTo: request.body.returnTo });
-    return { url: started.url, expiresAt: started.expiresAt.toISOString() };
+    return { authorizeUrl: started.url, expiresAt: started.expiresAt.toISOString() };
   });
 
   // GitHub sends the browser back to the App's setup URL, a signed-in frontend
