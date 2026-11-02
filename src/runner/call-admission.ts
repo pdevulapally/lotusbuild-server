@@ -60,7 +60,19 @@ export function createCallAdmission(deps: {
         for (const hold of holds) {
           const actual = usage[hold.kind];
           if (actual === undefined) {
-            deps.onProblem(new Error('Authoritative usage is unavailable; the hold remains open.'), 'model usage reconciliation required');
+            const reason: unknown = input.signal.aborted ? input.signal.reason : undefined;
+            if (!(reason instanceof AppError && reason.code === 'session/cancelled')) {
+              deps.onProblem(new Error('Authoritative usage is unavailable; the hold remains open.'), 'model usage reconciliation required');
+              continue;
+            }
+            // The user stopped this call before the provider reported usage. It
+            // never will now, so the hold settles at what it reserved: bounded,
+            // never under-charged, and the session can finish instead of waiting
+            // forever for a reconciliation that cannot come.
+            try {
+              await deps.metering.settleUnobserved(deps.uid, hold.id);
+              await deps.reservations.forget(hold.id);
+            } catch (error) { failures.push(error); }
             continue;
           }
           try {

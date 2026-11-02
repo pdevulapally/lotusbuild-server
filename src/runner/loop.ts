@@ -20,6 +20,8 @@ import type { MeteringService } from '../metering/service.ts';
 import type { ProjectPersistence, RestoreOutcome } from '../projects/persistence.ts';
 import type { Project, ProjectRepository } from '../projects/repository.ts';
 import type { AcquiredSandbox, SandboxService } from '../sandboxes/service.ts';
+import type { RunningSandbox } from '../sandboxes/provider.ts';
+import type { SandboxProvider } from '../entitlements/schema.ts';
 import type { SessionEvents } from '../sessions/events.ts';
 import type {
   ClaimedSession,
@@ -439,6 +441,7 @@ export class SessionRunner {
     let restored: RestoreOutcome | undefined;
     let desktopAbort: AbortController | undefined;
     let desktopStart: Promise<boolean> | undefined;
+    let sandboxProvider: SandboxProvider | undefined;
     // A desktop still starting when the session is over is withdrawn, never
     // announced: the user must not be shown a screen for work that has ended.
     const settleDesktop = async (): Promise<void> => {
@@ -602,65 +605,76 @@ export class SessionRunner {
       });
 
       signal.throwIfAborted();
-      acquired = await sandboxes.acquire({
-        publicPreviewEnabled: project.publicPreviewEnabled === true,
-        uid: session.ownerUid,
-        entitlements,
-        platform: project.platform,
-        sessionId: session.id,
-        now: new Date(),
-        reservations: tokenReservations,
-        signal,
-      });
-      // Recorded before the agent touches it: the window that matters is the one
-      // where this runner dies with a machine running and holds outstanding.
-      await sessions.attachSandbox(session.id, authority, {
-        sandboxId: acquired.running.externalId,
-        reservationIds: acquired.reservations.map((reservation) => reservation.id),
-      });
-      signal.throwIfAborted();
-      await publish('sandbox.started', {
-        provider: acquired.provider.provider,
-        template: acquired.provider.template,
-        platform: acquired.provider.platform,
-      });
-      desktopAbort = new AbortController();
-      desktopStart = this.#startDesktop(session, acquired, publish, signal, desktopAbort.signal);
-      void desktopStart.catch(() => {});
-
-      let messages: readonly ConversationMessage[];
-      try {
-        // Only a plan that pays for it gets its work back. For everyone else the
-        // sandbox is genuinely disposable, which is the difference being sold.
-        if (persists) {
-          restored = await this.#deps.persistence.restore(
-            acquired.running,
-            acquired.provider,
-            project,
-          );
-          await publish('project.restored', { outcome: restored });
-        }
-
-        messages = await this.#withImages(session.ownerUid, await sessions.listMessages(
-          session.ownerUid,
-          session.id,
-          this.#deps.messageHistoryLimit,
-        ));
-      } catch (error) {
-        desktopAbort.abort(error);
-        await desktopStart.catch(() => {});
-        throw error;
-      }
+      sandboxProvider = await sandboxes.providerFor(project.platform);
+      const messages = await this.#withImages(session.ownerUid, await sessions.listMessages(
+        session.ownerUid,
+        session.id,
+        this.#deps.messageHistoryLimit,
+      ));
+      // A machine is started the first time the agent reaches for a tool, not
+      // before it has read the message. A greeting or a question is answered
+      // from the transcript alone and never pays for a sandbox or a desktop;
+      // the first tool call provisions everything the old eager path did, in
+      // the same order, and every later call reuses it.
+      let provisioning: Promise<AcquiredSandbox> | undefined;
+      const provision = (): Promise<AcquiredSandbox> => {
+        provisioning ??= (async () => {
+          signal.throwIfAborted();
+          const machine = await sandboxes.acquire({
+            publicPreviewEnabled: project!.publicPreviewEnabled === true,
+            uid: session.ownerUid,
+            entitlements: entitlements!,
+            platform: project!.platform,
+            sessionId: session.id,
+            now: new Date(),
+            reservations: tokenReservations,
+            signal,
+          });
+          acquired = machine;
+          // Recorded before the agent touches it: the window that matters is the one
+          // where this runner dies with a machine running and holds outstanding.
+          await sessions.attachSandbox(session.id, authority, {
+            sandboxId: machine.running.externalId,
+            reservationIds: machine.reservations.map((reservation) => reservation.id),
+          });
+          signal.throwIfAborted();
+          await publish('sandbox.started', {
+            provider: machine.provider.provider,
+            template: machine.provider.template,
+            platform: machine.provider.platform,
+          });
+          desktopAbort = new AbortController();
+          desktopStart = this.#startDesktop(session, machine, publish, signal, desktopAbort.signal);
+          void desktopStart.catch(() => {});
+          try {
+            // Only a plan that pays for it gets its work back. For everyone else the
+            // sandbox is genuinely disposable, which is the difference being sold.
+            if (persists) {
+              restored = await this.#deps.persistence.restore(machine.running, machine.provider, project!);
+              await publish('project.restored', { outcome: restored });
+            }
+          } catch (error) {
+            desktopAbort.abort(error);
+            await desktopStart.catch(() => {});
+            throw error;
+          }
+          void desktopStart.then((ready) => { desktopUp = ready; }, () => {});
+          await settleWithin(desktopStart, this.#deps.desktopStartGraceMs ?? DEFAULT_DESKTOP_START_GRACE_MS, false);
+          return machine;
+        })();
+        return provisioning;
+      };
       let desktopUp = false;
-      void desktopStart.then((ready) => { desktopUp = ready; }, () => {});
-      const desktopReady = await settleWithin(
-        desktopStart,
-        this.#deps.desktopStartGraceMs ?? DEFAULT_DESKTOP_START_GRACE_MS,
-        false,
-      );
+      const sandbox = lazySandbox(provision);
+      // Optimistic by configuration: a desktop that then fails to start surfaces
+      // as a failed screen action, which the agent sees, not as a silent downgrade.
+      const desktopReady = sandboxProvider.desktop !== undefined;
       const toolCall = async (name: string, input: Record<string, unknown>, callId?: string) => {
         await sessions.assertPersistenceLease(authority);
         signal.throwIfAborted();
+        // Only a tool that touches the workspace needs a machine; the ledger's
+        // own tools (notes, outcomes, consultations) never start one.
+        if (workspaceTools.has(name)) await provision();
 
         if (persists && workspaceTools.has(name) && !readOnlyTools.has(name)) {
           await sessions.requireWorkspaceSalvage(authority, acquired!.running.externalId);
@@ -672,10 +686,10 @@ export class SessionRunner {
       const withValidationSandbox: NonNullable<import('./tools.ts').ToolContext['withValidationSandbox']> = async (run) => {
         await sessions.assertPersistenceLease(authority);
         signal.throwIfAborted();
-        if (acquired === undefined) throw new Error('The primary sandbox is unavailable.');
+        const primary = await provision();
         const copy = await sandboxes.acquire({ uid: session.ownerUid, sessionId: session.id,
           platform: project!.platform, entitlements: await this.#deps.entitlements.forUser(session.ownerUid, new Date(), true),
-          now: new Date(), reservations: tokenReservations, source: acquired.running, signal });
+          now: new Date(), reservations: tokenReservations, source: primary.running, signal });
         let outcome;
         let failure: unknown;
         try { outcome = await run(copy.running); } catch (cause) { failure = cause; }
@@ -702,8 +716,8 @@ export class SessionRunner {
         anthropic: activeClient,
         session: activeSession,
         project,
-        provider: acquired.provider,
-        sandbox: acquired.running,
+        provider: sandboxProvider,
+        sandbox,
         messages,
         entitlements,
         registry: executionRegistry,
@@ -788,8 +802,8 @@ export class SessionRunner {
           anthropic: activeClient,
           session,
           project,
-          provider: acquired.provider,
-          sandbox: acquired.running,
+          provider: sandboxProvider,
+          sandbox,
           messages: chainMessages,
           entitlements,
           registry,
@@ -848,19 +862,12 @@ export class SessionRunner {
 
       await settleDesktop();
       saveAttempted = true;
-      await this.#save(
-        session,
-        authority,
-        project,
-        entitlements,
-        acquired,
-        persists,
-        restored,
-        publish,
-      );
-      saveCompleted = true;
-      await this.#letGo(session, acquired);
-      acquired = undefined;
+      if (acquired !== undefined) {
+        await this.#save(session, authority, project, entitlements, acquired, persists, restored, publish);
+        saveCompleted = true;
+        await this.#letGo(session, acquired);
+        acquired = undefined;
+      } else saveCompleted = true;
 
       const status = await sessions.finish(session.id, authority, { status: 'IDLE' });
       await publish(status === 'QUEUED' ? 'session.queued' : 'session.idle', { steps: run.steps, stopReason: run.stopReason });
@@ -868,7 +875,7 @@ export class SessionRunner {
     } catch (error) {
       if (error instanceof RunnerWorkError) throw error;
       if (error instanceof ContinuationPause) {
-        if (acquired === undefined || project === undefined || entitlements === undefined || sourceRegistry?.fallback === undefined) throw new RunnerWorkError(error, 'fallback/checkpoint-context-missing');
+        if (project === undefined || entitlements === undefined || sandboxProvider === undefined || sourceRegistry?.fallback === undefined) throw new RunnerWorkError(error, 'fallback/checkpoint-context-missing');
         const policy = sourceRegistry.fallback;
         let state: FallbackState;
         let retryAt: Date | undefined;
@@ -880,7 +887,7 @@ export class SessionRunner {
         } else {
           try {
             requireFallbackPolicy(sourceRegistry, entitlements);
-            const offer = await verifyFallbackModel(this.#providers().get(policy.provider), policy, error.checkpoint, acquired.provider, session.effort, this.#deps.limits.maxOutputTokens, signal);
+            const offer = await verifyFallbackModel(this.#providers().get(policy.provider), policy, error.checkpoint, sandboxProvider, session.effort, this.#deps.limits.maxOutputTokens, signal);
             const inputLimit = entitlements.meterLimits.get(policy.inputTokenMeterKey);
             const outputLimit = entitlements.meterLimits.get(policy.outputTokenMeterKey);
             if (inputLimit === undefined || outputLimit === undefined || offer.inputTokens > inputLimit.hardLimit || offer.maxOutputTokens > outputLimit.hardLimit) throw new AppError({ code: 'fallback/allowance-too-small', statusCode: 409, message: 'The configured fallback allowance cannot accommodate this task.' });
@@ -897,8 +904,10 @@ export class SessionRunner {
               : capacityFailure(verificationError) ? 'Fallback verification is temporarily unavailable at the provider. Your checkpoint is preserved; no fallback was started.' : 'A compatible fallback model could not be verified. Your safe checkpoint is preserved; wait for premium allowance to reset or upgrade.', ...quotaDescription(error.reason) };
           }
         }
-        await this.#save(session, authority, project, entitlements, acquired, persists, restored, publish, true);
-        await this.#letGo(session, acquired); acquired = undefined;
+        if (acquired !== undefined) {
+          await this.#save(session, authority, project, entitlements, acquired, persists, restored, publish, true);
+          await this.#letGo(session, acquired); acquired = undefined;
+        }
         await sessions.pauseContinuation(authority, error.checkpoint, state, retryAt);
         await publish(retryAt === undefined ? 'session.idle' : 'session.queued', { fallback: state.status });
         return;
@@ -981,7 +990,7 @@ export class SessionRunner {
       } catch (cause) {
         // Only reachable when the lease is already gone, in which case another
         // runner owns the session and gets to decide its status.
-        log.warn({ sessionId: session.id }, 'could not mark the session failed');
+        log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(cause) }, 'could not mark the session failed');
         throw new RunnerWorkError(error, 'session/finalization-failed');
       }
     } finally {
@@ -1232,4 +1241,55 @@ export async function withDrainDeadline(signal: AbortSignal, timeoutMs: number, 
   });
   try { await Promise.race([work(), deadline]); }
   finally { clearTimeout(timer); signal.removeEventListener('abort', start); }
+}
+
+/**
+ * A sandbox that exists from the agent's point of view before a machine does.
+ * Every operation first provisions (once) and then delegates, so the first tool
+ * call pays for the machine and a turn that never calls a tool never starts one.
+ *
+ * Optional capabilities are reported truthfully: absent until the machine
+ * exists, then exactly what it offers, so a tool that checks for the fast path
+ * takes the universal one on its first call and the real one afterwards.
+ * `readBytes` is the exception because the screen tools are chosen before the
+ * first step from its presence; every adapter in use implements it, and a
+ * machine that does not makes that one call fail loudly rather than silently
+ * downgrading the whole turn.
+ */
+export function lazySandbox(provision: () => Promise<AcquiredSandbox>): RunningSandbox {
+  let real: RunningSandbox | undefined;
+  const ready = async (): Promise<RunningSandbox> => { real ??= (await provision()).running; return real; };
+  type Optional = 'projectFileOperation' | 'readFileRange' | 'forkForValidation' | 'stopCommands' | 'lifetime';
+  const bound = <K extends Optional>(name: K): RunningSandbox[K] | undefined => {
+    const method = real?.[name];
+    return method === undefined ? undefined : (method.bind(real) as RunningSandbox[K]);
+  };
+  // The getters below yield `undefined` until the machine exists, which is what
+  // an absent optional method looks like to every caller; the cast only bridges
+  // that to the interface's optional-property spelling.
+  const facade: Omit<RunningSandbox, Optional> & { readonly [K in Optional]: RunningSandbox[K] | undefined } = {
+    get externalId(): string {
+      if (real === undefined) throw new Error('No sandbox has been started for this turn yet.');
+      return real.externalId;
+    },
+    runCommand: async (...args) => (await ready()).runCommand(...args),
+    writeFile: async (...args) => (await ready()).writeFile(...args),
+    readFile: async (...args) => (await ready()).readFile(...args),
+    readBytes: async (...args) => {
+      const target = await ready();
+      if (target.readBytes === undefined) throw new Error('This sandbox cannot return raw bytes.');
+      return target.readBytes(...args);
+    },
+    previewUrl: (port) => {
+      if (real === undefined) throw new Error('A preview needs a running server first.');
+      return real.previewUrl(port);
+    },
+    stop: async () => { if (real !== undefined) await real.stop(); },
+    get projectFileOperation() { return bound('projectFileOperation'); },
+    get readFileRange() { return bound('readFileRange'); },
+    get forkForValidation() { return bound('forkForValidation'); },
+    get stopCommands() { return bound('stopCommands'); },
+    get lifetime() { return bound('lifetime'); },
+  };
+  return facade as RunningSandbox;
 }

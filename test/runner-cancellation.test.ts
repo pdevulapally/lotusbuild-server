@@ -160,7 +160,7 @@ test('completed drain returns immediately without waiting for its deadline', asy
   await withDrainDeadline(AbortSignal.abort(), 90000, async () => {}, log);
 });
 
-function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'validation') {
+function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'validation' | 'reply') {
   const { db, data } = ledger();
   const plans = new Map(planDocuments.map((doc) => [doc.key, parsePlan(doc, doc.key, registry)]));
   const plan = plans.get('business')!;
@@ -176,7 +176,9 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
   let leaseValid = true; let cancelled = false;
   const running = { externalId: 'vm-fixture', lifetime: async () => ({ startedAt: new Date(Date.now() - 1000), endAt: new Date(Date.now() + 59000) }),
     stopCommands: async () => { events.push('stop-commands'); },
-    runCommand: async (_command: string, options: { signal?: AbortSignal }) => {
+    runCommand: async (command: string, options: { signal?: AbortSignal }) => {
+      // Only the scripted mutation blocks; anything else (a read-only listing) completes at once.
+      if (command !== 'mutate') return { exitCode: 0, stdout: '', stderr: '' };
       activeSignal = options.signal; events.push('mutation'); entered.resolve();
       await new Promise((_resolve, reject) => options.signal!.addEventListener('abort', () => reject(new Error('Command stopped')), { once: true }));
     },
@@ -184,12 +186,18 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
   const adapter: SandboxAdapter = { connect: async () => running, start: async (_provider, context) => {
     await context.lifecycle!.beforeCreate(); await context.lifecycle!.created(running); return running;
   }, terminate: async () => { events.push('terminate'); return true; } };
-  let calls = 0;
+  let calls = 0; let totalCalls = 0;
   const anthropic = { messages: {
     countTokens: async () => ({ input_tokens: 2 }),
     stream: (_params: unknown, options: { signal: AbortSignal }) => {
-      activeSignal = options.signal; calls++;
+      activeSignal = options.signal;
+      // A build's first step reaches for a (read-only) tool, which is what starts the machine.
+      // `calls` counts the generations that then run against it, as before.
+      const preamble = ++totalCalls === 1 && !['command', 'validation', 'reply'].includes(mode);
+      if (!preamble) calls++;
       return { on: () => {}, finalMessage: async () => {
+        if (preamble) return { content: [{ type: 'tool_use', id: 'look', name: 'list_files', input: {} }],
+          usage: { input_tokens: 2, output_tokens: 1 }, stop_reason: 'tool_use' };
         if (mode === 'model' || mode === 'save-failure') {
           entered.resolve();
           await new Promise((_resolve, reject) => options.signal.addEventListener('abort', () => reject(new Error('Model stopped')), { once: true }));
@@ -200,13 +208,17 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
           : mode === 'validation' && calls === 2
             ? [{ type: 'tool_use', id: 'validate', name: 'run_validation', input: { operation: [...provider.validationProfiles.keys()][0] } }]
           : mode === 'command' ? [{ type: 'tool_use', id: 'tool-1', name: 'run_command', input: { command: 'mutate' } }]
-          : [{ type: 'text', text: 'Complete' }], usage: { input_tokens: 2, output_tokens: 1 }, stop_reason: 'end_turn' };
+          : mode === 'reply' && calls === 1 ? [{ type: 'text', text: 'Hello! What would you like to build?' }]
+          : mode === 'reply' ? [{ type: 'tool_use', id: 'answered', name: 'finish_task', input: { outcome: 'answered', summary: 'Greeted the user.', evidence: [] } }]
+          : [{ type: 'tool_use', id: 'done', name: 'finish_task', input: { outcome: 'blocked', summary: 'Fixture turn complete.', evidence: [] } }],
+          usage: { input_tokens: 2, output_tokens: 1 }, stop_reason: mode === 'reply' && calls === 1 ? 'end_turn' : 'tool_use' };
       } };
     },
   } } as unknown as Anthropic;
   const session = { id: 's', projectId: 'p', ownerUid: 'u', model: entitlements.capabilities.stringList('ai.model.allowlist')[0],
     effort: 'low', mode: 'build', leaseToken: 'lease', reservationIds: [], specialistReservationIds: [] };
   const sessions = {
+    saveTaskContext: async () => {},
     requireWorkspaceSalvage: async () => { events.push('salvage-required'); },
     claim: async () => session, heartbeat: async () => { if (!leaseValid) throw new Error('Lease authority lost'); }, assertPersistenceLease: async () => { if (cancelled) throw new AppError({ code: 'session/cancelled', statusCode: 409, message: 'Cancelled by user' }); }, markExecutionStarted: async () => {}, attachSandbox: async () => {},
     detachSandbox: async () => { events.push('detach'); }, drainSteerMessage: async () => undefined,
@@ -332,6 +344,27 @@ for (const mode of ['model', 'command', 'queue', 'save-failure'] as const) {
   });
 }
 
+
+test('a message that needs no tool is answered without starting a sandbox or a desktop', async () => {
+  const h = runnerFixture('reply');
+  await h.runner.runOnce();
+  // The reply itself, then the explicit answered outcome the ledger asks for: two cheap model calls, no machine.
+  assert.equal(h.calls(), 2);
+  assert.deepEqual(h.events.filter((event) => ['mutation', 'terminate', 'stop-commands', 'save', 'detach'].includes(event)), []);
+  assert.ok(h.events.includes('finish'));
+  assert.equal([...h.data.values()].some((fields) => fields['meterKey'] === provider.concurrencyMeterKey), false, 'no sandbox capacity was ever held');
+});
+
+test('cancelling a stream before the provider reported usage closes its holds at what they reserved', async () => {
+  const h = runnerFixture('model');
+  const work = h.runner.runOnce();
+  await h.entered.promise; h.cancel(); await work;
+  const open = [...h.data.values()].filter((fields) => fields['status'] === 'OPEN');
+  assert.deepEqual(open, [], 'nothing is left in flight for a reconciliation that can never come');
+  const estimated = [...h.data.values()].filter((fields) => fields['usageEvidence'] === 'provider-usage-unavailable');
+  assert.ok(estimated.length > 0 && estimated.every((fields) => fields['status'] === 'SETTLED' && fields['settledQuantity'] === fields['estimatedQuantity']));
+  assert.ok(h.events.includes('finish'));
+});
 
 test('a restarted worker never replays a turn whose execution already began', async () => {
   const h = runnerFixture('command');

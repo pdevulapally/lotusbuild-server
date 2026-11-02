@@ -886,6 +886,30 @@ export class MeteringService {
     });
   }
 
+  /**
+   * Closes a model-token hold whose call this runner itself cut off (the user
+   * pressed Stop) before the provider reported usage. The provider will never
+   * report it now, so the hold settles at the amount it reserved: the user is
+   * never under-charged, the amount is bounded by what admission approved, and
+   * the session can finish instead of waiting forever. Only the caller that
+   * did the cutting may decide this; recovery still closes recorded usage only.
+   * Resource holds and holds on any other meter are refused.
+   */
+  async settleUnobserved(uid: string, id: string, now: Date = new Date()): Promise<boolean> {
+    const fields = await this.reservationRecord(uid, id);
+    if (fields['status'] !== 'OPEN') return false;
+    if (fields['inFlight'] !== true || typeof fields['observedQuantity'] === 'number') return false;
+    const { registry } = await this.#configuration.get();
+    const tokenMeters = new Set([registry.inputTokenMeterKey, registry.outputTokenMeterKey,
+      ...(registry.fallback === undefined ? [] : [registry.fallback.inputTokenMeterKey, registry.fallback.outputTokenMeterKey])]);
+    if (fields['sandboxExternalId'] !== undefined || !tokenMeters.has(fields['meterKey'] as string)) {
+      throw new Error(`Reservation ${id} is not a model-token hold and cannot settle at its estimate.`);
+    }
+    const estimated = integerField(fields, 'estimatedQuantity', `reservation ${id}`, { min: 1 });
+    await this.recordObservedUsage(uid, id, estimated, 'provider-usage-unavailable');
+    return this.settle({ uid, reservationId: id, actualQuantity: estimated, now });
+  }
+
   /** Recovery closes recorded usage, never guessed usage. */
   async reconcile(uid: string, id: string, now: Date = new Date()): Promise<boolean> {
     const fields = await this.reservationRecord(uid, id);
