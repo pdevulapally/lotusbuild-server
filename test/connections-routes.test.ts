@@ -38,7 +38,8 @@ describe('connection routes', () => {
     const start = await h.app.inject({ method: 'POST', url: '/connections/netlify/start', headers });
     assert.equal(start.statusCode, 503);
     assert.equal((start.json() as { error: { code: string } }).error.code, 'connections/configuration-required');
-    assert.equal((await h.app.inject({ method: 'POST', url: '/connections/github/start', headers })).statusCode, 404);
+    assert.equal((await h.app.inject({ method: 'POST', url: '/connections/github/start', headers, payload: { returnTo: 'https://app.test/integrations' } })).statusCode, 503);
+    assert.equal((await h.app.inject({ method: 'POST', url: '/connections/gitlab/start', headers })).statusCode, 404);
     assert.equal((await h.app.inject({ method: 'GET', url: '/connections' })).statusCode, 401);
   });
 

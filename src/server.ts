@@ -17,6 +17,8 @@ import type { EmailVerificationService } from './auth/email-verification.ts';
 import type { BillingRepository } from './billing/repository.ts';
 import { registerBillingRoutes } from './billing/routes.ts';
 import { registerConnectionRoutes } from './connections/routes.ts';
+import type { GitHubInstallations } from './connections/github.ts';
+import type { ConnectorKey } from './connections/registry.ts';
 import type { ConnectionRepository } from './connections/service.ts';
 import type { Config } from './config/index.ts';
 import type { EntitlementService } from './entitlements/service.ts';
@@ -63,6 +65,8 @@ export interface Dependencies {
   readonly projectFiles: ProjectFiles;
   /** Absent until CONNECTION_KEK_V<n> is configured; the integrations routes then answer 503 configuration_required. */
   readonly connections?: ConnectionRepository;
+  /** Absent until GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY and GITHUB_APP_SLUG are configured with the keyring. */
+  readonly github?: GitHubInstallations;
   readonly attachments: AttachmentStore;
   readonly skills: SkillRepository;
   readonly sessions: SessionRepository;
@@ -293,9 +297,14 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     });
     registerVoiceRoutes(api, dependencies.voice, config.ELEVENLABS_VOICE_CONFIG);
     registerProjectRoutes(api, projects);
-    // No connector has provider credentials on any server yet: the catalogue is
-    // browsable, every start attempt reports configuration_required.
-    registerConnectionRoutes(api, { connections: dependencies.connections, configured: new Set() });
+    // A connector is configured when its provider app credentials exist on this
+    // server; the rest of the catalogue is browsable and reports configuration_required.
+    registerConnectionRoutes(api, {
+      connections: dependencies.connections,
+      configured: new Set<ConnectorKey>(dependencies.github === undefined ? [] : ['github']),
+      ...(dependencies.github === undefined ? {} : { github: dependencies.github }),
+      projects,
+    });
     registerProjectContentRoutes(api, projects, dependencies.projectFiles, sessions);
     registerPrivacyRoutes(api, dependencies.privacyRequests);
     registerFamilyRoutes(api, dependencies.family, projects, sessions);

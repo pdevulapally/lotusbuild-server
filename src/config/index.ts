@@ -67,6 +67,9 @@ const apiSpec = {
   ELEVENLABS_API_KEY: asOptional(asString('server-only ElevenLabs API key; voice remains disabled when absent', { minLength: 10 })),
   ELEVENLABS_VOICE_CONFIG: { description: 'explicit voice policy JSON; absent keeps voice disabled', parse: parseVoiceConfig, optional: true },
   FAMILY_INVITATION_TTL_SECONDS: asInteger('lifetime of a one-use parent linking invitation', { min: 60, max: 86400 }),
+  GITHUB_APP_ID: asOptional(asString('id of the LotusBuild GitHub App; GitHub connections stay configuration_required when absent')),
+  GITHUB_APP_PRIVATE_KEY: asOptional(asString('PEM private key of that App, newlines escaped as \\n', { minLength: 64 })),
+  GITHUB_APP_SLUG: asOptional(asString('URL slug of that App, as in github.com/apps/<slug>')),
   HOST: asString('interface to bind (127.0.0.1 behind a reverse proxy, 0.0.0.0 otherwise)'),
   PORT: asPort('TCP port to listen on'),
   PUBLIC_API_URL: asUrl('externally reachable base URL of this API', {
