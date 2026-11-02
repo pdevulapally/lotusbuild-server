@@ -240,7 +240,8 @@ test('the real worker pauses at quota, releases resources, and a replacement wor
   await new SessionRunner({ ...dependencies, runnerId: 'replacement-worker' } as unknown as RunnerDependencies).runOnce();
   const finished = await h.sessions.readOwned('u', session.id);
   assert.equal(finished.status, 'IDLE'); assert.equal(finished.fallback?.status, 'COMPLETED');
-  assert.equal(reads, 1); assert.equal(starts, 2); assert.equal(generations.length, 2); assert.equal(generations[1], policy.model);
+  // The replacement finishes from the saved tool result without touching a file, so it never starts a second machine.
+  assert.equal(reads, 1); assert.equal(starts, 1); assert.equal(generations.length, 2); assert.equal(generations[1], policy.model);
   assert.equal(h.data.get(`users/u/usage/${h.registry.buildMeterKey}`)?.['consumed'], 1);
   assert.equal(h.data.get(`users/u/usage/${h.registry.inputTokenMeterKey}`)?.['consumed'], 5);
   assert.equal(h.data.get(`users/u/usage/${policy.inputTokenMeterKey}`)?.['consumed'], 5);

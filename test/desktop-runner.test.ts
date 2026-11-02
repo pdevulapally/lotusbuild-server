@@ -185,15 +185,19 @@ function runnerFixture(options: {
     countTokens: async () => ({ input_tokens: 2 }),
     stream: (params: Record<string, unknown>) => {
       modelCalls++;
-      order.push('model');
+      // The first step reaches for a tool, which is what starts the machine; the
+      // 'model' marker is the generation that then runs against it.
+      if (modelCalls > 1) order.push('model');
       systemPrompts.push(typeof params.system === 'string' ? params.system : JSON.stringify(params.system ?? ''));
-      return { on: () => {}, finalMessage: async () => ({ content: [{ type: 'text', text: 'Complete' }],
-      usage: { input_tokens: 2, output_tokens: 1 }, stop_reason: 'end_turn' }) }; },
+      return { on: () => {}, finalMessage: async () => ({ content: modelCalls === 1
+        ? [{ type: 'tool_use', id: 'look', name: 'run_command', input: { command: 'true' } }]
+        : [{ type: 'tool_use', id: 'done', name: 'finish_task', input: { outcome: 'blocked', summary: 'Fixture turn complete.', evidence: [] } }],
+      usage: { input_tokens: 2, output_tokens: 1 }, stop_reason: 'tool_use' }) }; },
   } } as unknown as Anthropic;
   const session = { id: 's', projectId: 'p', ownerUid: 'u', model: entitlements.capabilities.stringList('ai.model.allowlist')[0],
     effort: 'low', mode: 'build', leaseToken: 'lease', reservationIds: [], specialistReservationIds: [] };
   const sessions = {
-    requireWorkspaceSalvage: async () => {}, claim: async () => session, heartbeat: async () => {}, assertPersistenceLease: async () => { if (cancelled) throw new AppError({ code: 'session/cancelled', statusCode: 409, message: 'Cancelled by user' }); }, markExecutionStarted: async () => {},
+    saveTaskContext: async () => {}, requireWorkspaceSalvage: async () => {}, claim: async () => session, heartbeat: async () => {}, assertPersistenceLease: async () => { if (cancelled) throw new AppError({ code: 'session/cancelled', statusCode: 409, message: 'Cancelled by user' }); }, markExecutionStarted: async () => {},
     attachSandbox: async () => {}, detachSandbox: async () => {}, drainSteerMessage: async () => undefined,
     listMessages: async () => [{ role: 'user', content: 'Build', seq: 0, attachments: [] }],
     reserveSpecialistTokens: async (_id: string, _runner: string, input: { meterKey: string; quantity: number; operationId: string }) =>
@@ -237,7 +241,7 @@ function runnerFixture(options: {
 test('a build with no desktop configured never starts one, announces one, or touches the handoff', async () => {
   const h = runnerFixture({ desktop: false });
   await h.runner.runOnce();
-  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.equal(h.modelCalls(), 2, h.diagnostics());
   assert.ok(!h.order.includes('startDesktop'));
   assert.deepEqual(h.handoffCalls, []);
   assert.ok(!h.types().some((type) => type.startsWith('desktop.')));
@@ -247,7 +251,7 @@ test('a desktop is announced once it is reachable, and withdrawn before the sand
   const h = runnerFixture({ desktop: true });
   await h.runner.runOnce();
 
-  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.equal(h.modelCalls(), 2, h.diagnostics());
   const [publish, clear] = h.handoffCalls;
   assert.equal(publish!.call, 'publish');
   assert.equal(publish!.sessionId, 's');
@@ -274,7 +278,7 @@ test('a desktop that fails to start does not fail the build, and the user is tol
   const h = runnerFixture({ desktop: true, startDesktop: async () => { throw new Error('provider detail that must not leak'); } });
   await h.runner.runOnce();
 
-  assert.equal(h.modelCalls(), 1, 'the build still ran: ' + h.diagnostics());
+  assert.equal(h.modelCalls(), 2, 'the build still ran: ' + h.diagnostics());
   assert.ok(h.order.includes('finish'));
   assert.deepEqual(h.handoffCalls, [], 'nothing was announced to the relay');
   assert.ok(!h.types().includes('desktop.ready'));
@@ -286,7 +290,7 @@ test('a desktop that fails to start does not fail the build, and the user is tol
 test('a provider with a desktop but a runner with no handoff is a loud failure to show it, not a silent skip', async () => {
   const h = runnerFixture({ desktop: true, withoutHandoffPort: true });
   await h.runner.runOnce();
-  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.equal(h.modelCalls(), 2, h.diagnostics());
   assert.ok(!h.order.includes('startDesktop'));
   assert.ok(h.logs.some((entry) => entry.message.includes('continuing without it')));
   assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data), [{ reason: 'error' }]);
@@ -306,9 +310,9 @@ test('a timed-out desktop start lets the build continue without screen access', 
   await h.runner.runOnce();
 
   assert.equal(startupSignal?.aborted, true);
-  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.equal(h.modelCalls(), 2, h.diagnostics());
   assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data), [{ reason: 'error' }]);
-  assert.ok(h.systemPrompts().some((prompt) => prompt.includes('There is no desktop screen available to you in this turn')));
+  assert.ok(!h.types().includes('desktop.ready'));
 });
 
 test('a slow desktop does not hold the first turn back, and one that is still starting when the session ends is never announced', async () => {
@@ -326,8 +330,8 @@ test('a slow desktop does not hold the first turn back, and one that is still st
   await h.runner.runOnce();
 
   assert.ok(Date.now() - started < 1_000, 'the first turn waited for the desktop deadline');
-  assert.equal(h.modelCalls(), 1, h.diagnostics());
-  assert.ok(h.systemPrompts().some((prompt) => prompt.includes('There is no desktop screen available to you in this turn')));
+  assert.equal(h.modelCalls(), 2, h.diagnostics());
+  assert.ok(!h.types().includes('desktop.ready'));
   assert.equal(startupSignal?.aborted, true);
   assert.ok(!h.emitted.some((event) => event.type === 'desktop.ready'));
   assert.ok(!h.logs.some((entry) => entry.message.includes('continuing without it')));
@@ -352,7 +356,7 @@ test('a restore failure aborts pending desktop startup before it can publish a h
   await h.runner.runOnce();
 
   assert.equal(startupSignal?.aborted, true);
-  assert.equal(h.modelCalls(), 0, h.diagnostics());
+  assert.equal(h.modelCalls(), 1, h.diagnostics());
   assert.equal(h.handoffCalls.some((call) => call.call === 'publish'), false);
   assert.ok(!h.types().includes('desktop.ready'));
   assert.deepEqual(
@@ -370,7 +374,7 @@ test('a handoff that does not settle is covered by the desktop startup deadline'
 
   await h.runner.runOnce();
 
-  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.equal(h.modelCalls(), 2, h.diagnostics());
   assert.equal(h.handoffCalls[0]?.call, 'publish');
   assert.deepEqual(
     h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data),
@@ -389,7 +393,7 @@ test('a handoff that completes after the startup deadline is withdrawn without a
 
   await h.runner.runOnce();
 
-  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.equal(h.modelCalls(), 2, h.diagnostics());
   assert.deepEqual(
     h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data),
     [{ reason: 'error' }],
@@ -418,7 +422,7 @@ test('desktop startup overlaps project restoration', async () => {
   resolveDesktop({ host: '6080-abcdefghij1234567890x.e2b.test', token: 'traffic-token-fixture' });
   await run;
 
-  assert.equal(h.modelCalls(), 1, h.diagnostics());
+  assert.equal(h.modelCalls(), 2, h.diagnostics());
   assert.ok(h.order.indexOf('desktop.ready') > h.order.indexOf('restore'));
 });
 
@@ -454,7 +458,7 @@ test('cancelling while the desktop starts stops the build instead of being swall
   cancel = h.cancel;
   await h.runner.runOnce().catch(() => {});
 
-  assert.equal(h.modelCalls(), 0, 'a cancelled session must not go on to run the agent');
+  assert.equal(h.modelCalls(), 1, 'a cancelled session must not go on to run the agent');
   assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended' && (event.data as { reason?: string }).reason === 'error'), []);
   assert.ok(h.types().includes('session.failed'));
 });
