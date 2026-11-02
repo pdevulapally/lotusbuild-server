@@ -8,7 +8,8 @@ import { mentionedSkills } from '../skills/prompt.ts';
 import type { SkillSource } from '../skills/repository.ts';
 import type { ModelResolver } from '../models/catalog.ts';
 import { AnthropicProvider, ModelProviders, type ModelProvider } from '../models/provider.ts';
-import { readOnlyTools, workspaceTools } from './tools.ts';
+import { readOnlyTools, workspaceTools, type RepositoryContext } from './tools.ts';
+import type { RepositoryWorkspaces } from '../github/workspace.ts';
 import { assertBuildAllowed, resolveAiEffort } from '../entitlements/build-admission.ts';
 import type Anthropic from '@anthropic-ai/sdk';
 
@@ -120,6 +121,8 @@ export interface RunnerDependencies {
   readonly metering: MeteringService;
   readonly sandboxes: SandboxService;
   readonly persistence: ProjectPersistence;
+  /** Clones and syncs linked GitHub repositories; absent when the GitHub App is not configured. */
+  readonly repositories?: RepositoryWorkspaces;
   readonly events: SessionEvents;
   readonly limits: AgentLimits;
   readonly heartbeatSeconds: number;
@@ -439,6 +442,7 @@ export class SessionRunner {
     // snapshot the user still owns — which is exactly what a failed restore
     // leaves behind, and what a failure before restore never had.
     let restored: RestoreOutcome | undefined;
+    let repository: RepositoryContext | undefined;
     let desktopAbort: AbortController | undefined;
     let desktopStart: Promise<boolean> | undefined;
     let sandboxProvider: SandboxProvider | undefined;
@@ -653,6 +657,18 @@ export class SessionRunner {
               restored = await this.#deps.persistence.restore(machine.running, machine.provider, project!);
               await publish('project.restored', { outcome: restored });
             }
+            const source = project!.source;
+            if (source !== undefined) {
+              const repositories = this.#deps.repositories;
+              if (repositories === undefined) throw new AppError({ code: 'repository/unconfigured', statusCode: 503, message: 'GitHub repositories are not available on this runner.' });
+              const checkout = await repositories.prepare({ sandbox: machine.running, provider: machine.provider, project: project!, source, gitEnv: this.#deps.persistence.gitEnv() });
+              const context: RepositoryContext = {
+                fullName: checkout.fullName, defaultBranch: checkout.defaultBranch, branch: checkout.taskBranch, coauthor: checkout.coauthor,
+                onBranch: async (branch) => { await repositories.recordBranch(project!, branch); context.branch = branch; },
+              };
+              repository = context;
+              await publish('repository.ready', { fullName: checkout.fullName, branch: checkout.branch, outcome: checkout.outcome });
+            }
           } catch (error) {
             desktopAbort.abort(error);
             await desktopStart.catch(() => {});
@@ -713,6 +729,7 @@ export class SessionRunner {
         ...(resumed === undefined ? {} : { resume: resumed }),
           withValidationSandbox,
           admission,
+          ...(repository === undefined ? {} : { repository }),
         anthropic: activeClient,
         session: activeSession,
         project,
@@ -799,6 +816,7 @@ export class SessionRunner {
           saveTaskContext: (context) => sessions.saveTaskContext(authority, context),
           withValidationSandbox,
           admission,
+          ...(repository === undefined ? {} : { repository }),
           anthropic: activeClient,
           session,
           project,

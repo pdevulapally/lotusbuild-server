@@ -24,6 +24,10 @@ import { SessionRepository } from '../sessions/repository.ts';
 import { SnapshotStore } from '../storage/snapshots.ts';
 import { SnapshotMaintenance } from '../storage/maintenance.ts';
 import { UserRepository } from '../users/repository.ts';
+import { keyringFromEnv } from '../connections/credentials.ts';
+import { ConnectionRepository } from '../connections/service.ts';
+import { GitHubApp } from '../github/app.ts';
+import { RepositoryWorkspaces } from '../github/workspace.ts';
 import { SessionRunner, runUntilStopped, withDrainDeadline } from './loop.ts';
 import { ProviderModels } from '../models/catalog.ts';
 import { AnthropicProvider, ModelProviders, OpenRouterProvider } from '../models/provider.ts';
@@ -75,6 +79,20 @@ async function main(): Promise<void> {
   );
   const users = new UserRepository(firebase.firestore);
   const projects = new ProjectRepository(firebase.firestore, users, entitlements);
+  // Same gate as the API: without the App and the keyring, a linked project
+  // fails to provision with a clear error instead of cloning without credentials.
+  const connectionKeyring = keyringFromEnv(process.env);
+  const repositories = connectionKeyring === undefined || config.GITHUB_APP_ID === undefined || config.GITHUB_APP_PRIVATE_KEY === undefined
+    ? undefined
+    : new RepositoryWorkspaces({
+      app: new GitHubApp({
+        appId: config.GITHUB_APP_ID, privateKey: config.GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n'),
+        apiBaseUrl: new URL('https://api.github.com'), requestTimeoutMs: 15_000,
+      }),
+      connections: new ConnectionRepository(firebase.firestore, connectionKeyring),
+      projects, users,
+      commandTimeoutMs: config.AGENT_COMMAND_TIMEOUT_SECONDS * 1000,
+    });
   const metering = new MeteringService(firebase.firestore, configuration);
   const sessions = new SessionRepository(
     firebase.firestore,
@@ -158,6 +176,7 @@ async function main(): Promise<void> {
       { name: config.GIT_AUTHOR_NAME, email: config.GIT_AUTHOR_EMAIL },
       config.AGENT_COMMAND_TIMEOUT_SECONDS * 1000,
     ),
+    ...(repositories === undefined ? {} : { repositories }),
     events,
     limits: {
       maxSteps: config.AGENT_MAX_STEPS,

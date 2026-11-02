@@ -60,15 +60,15 @@ const sharedSpec = {
     'how long a signed upload or download URL for a project snapshot stays valid',
     { min: 60, max: 3600 },
   ),
+  // Both processes: the API verifies installations, the runner clones from them.
+  GITHUB_APP_ID: asOptional(asString('id of the LotusBuild GitHub App; GitHub connections stay configuration_required when absent')),
+  GITHUB_APP_PRIVATE_KEY: asOptional(asString('PEM private key of that App, newlines escaped as \\n', { minLength: 64 })),
 } as const;
-
 
 const apiSpec = {
   ELEVENLABS_API_KEY: asOptional(asString('server-only ElevenLabs API key; voice remains disabled when absent', { minLength: 10 })),
   ELEVENLABS_VOICE_CONFIG: { description: 'explicit voice policy JSON; absent keeps voice disabled', parse: parseVoiceConfig, optional: true },
   FAMILY_INVITATION_TTL_SECONDS: asInteger('lifetime of a one-use parent linking invitation', { min: 60, max: 86400 }),
-  GITHUB_APP_ID: asOptional(asString('id of the LotusBuild GitHub App; GitHub connections stay configuration_required when absent')),
-  GITHUB_APP_PRIVATE_KEY: asOptional(asString('PEM private key of that App, newlines escaped as \\n', { minLength: 64 })),
   GITHUB_APP_SLUG: asOptional(asString('URL slug of that App, as in github.com/apps/<slug>')),
   GITHUB_APP_CLIENT_ID: asOptional(asString('OAuth client id of that App, used to confirm who installed it')),
   GITHUB_APP_CLIENT_SECRET: asOptional(asString('OAuth client secret of that App', { minLength: 20 })),

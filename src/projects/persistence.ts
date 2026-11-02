@@ -111,6 +111,11 @@ export class ProjectPersistence {
     return outcome.stdout;
   }
 
+  /** The identity the agent commits under, for any other git work in the sandbox. */
+  gitEnv(): Record<string, string> {
+    return this.#gitEnv();
+  }
+
   #gitEnv(): Record<string, string> {
     // Git takes an identity from the environment, which spares us writing a
     // config file and spares the shell ever seeing these values.

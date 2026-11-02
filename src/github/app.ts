@@ -102,7 +102,7 @@ export interface AppIdentity {
 export class GitHubApp {
   readonly #appId: string;
   readonly #privateKey: string;
-  readonly #client: { readonly id: string; readonly secret: string };
+  readonly #client: { readonly id: string; readonly secret: string } | undefined;
   readonly #apiBaseUrl: URL;
   readonly #webBaseUrl: URL;
   readonly #requestTimeoutMs: number;
@@ -110,17 +110,17 @@ export class GitHubApp {
   constructor(args: {
     readonly appId: string;
     readonly privateKey: string;
-    /** The App's OAuth client, used only to learn who installed it. */
-    readonly client: { readonly id: string; readonly secret: string };
+    /** The App's OAuth client, used only to learn who installed it; the runner, which only mints installation tokens, goes without. */
+    readonly client?: { readonly id: string; readonly secret: string };
     readonly apiBaseUrl: URL;
-    readonly webBaseUrl: URL;
+    readonly webBaseUrl?: URL;
     readonly requestTimeoutMs: number;
   }) {
     this.#appId = args.appId;
     this.#privateKey = args.privateKey;
     this.#client = args.client;
     this.#apiBaseUrl = args.apiBaseUrl;
-    this.#webBaseUrl = args.webBaseUrl;
+    this.#webBaseUrl = args.webBaseUrl ?? new URL('https://github.com');
     this.#requestTimeoutMs = args.requestTimeoutMs;
   }
 
@@ -159,6 +159,7 @@ export class GitHubApp {
   }
 
   async #exchangeCode(code: string, redirectUri: string): Promise<string> {
+    if (this.#client === undefined) throw new Error('This GitHub App client has no OAuth client and cannot identify users.');
     let response: Response;
     try {
       response = await fetch(new URL('/login/oauth/access_token', this.#webBaseUrl), {
@@ -187,6 +188,7 @@ export class GitHubApp {
 
   /** Best effort: the token expires on its own within hours and is never kept. */
   async #revokeUserToken(userToken: string): Promise<void> {
+    if (this.#client === undefined) return;
     const basic = Buffer.from(`${this.#client.id}:${this.#client.secret}`, 'utf8').toString('base64');
     await fetch(new URL(`/applications/${encodeURIComponent(this.#client.id)}/token`, this.#apiBaseUrl), {
       method: 'DELETE',

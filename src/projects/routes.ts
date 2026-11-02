@@ -58,6 +58,7 @@ export function projectSourceResponse(source: ProjectSource) {
   return {
     kind: source.kind, connectionId: source.connectionId, fullName: source.fullName,
     defaultBranch: source.defaultBranch, boundAt: source.boundAt.toISOString(),
+    ...(source.branch === undefined ? {} : { branch: source.branch }),
   };
 }
 

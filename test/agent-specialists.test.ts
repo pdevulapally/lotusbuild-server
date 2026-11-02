@@ -663,6 +663,9 @@ test('a specialist receives read-only tools and cannot delegate further', async 
   const specialistCall = scripted.calls[1];
   assert.ok(specialistCall !== undefined);
   assert.deepEqual([...specialistCall.toolNames].sort(), [
+    'git_diff',
+    'git_log',
+    'git_status',
     'list_files',
     'read_file',
     'search_files',
@@ -2479,7 +2482,7 @@ const okTesting = [
   () => call('submit_review', review('ok', 'Validation passes.', [])),
 ];
 
-test('the Testing specialist is offered and receives exactly its four tools', async () => {
+test('the Testing specialist is offered and receives exactly its read-only tools plus validation and review', async () => {
   const { scripted } = await turn({
     specialists: [architecture, security, testing],
     sandbox: new ValidationSandbox(),
@@ -2496,6 +2499,9 @@ test('the Testing specialist is offered and receives exactly its four tools', as
   const testingCall = scripted.calls.find((c) => c.system.includes(testing.instructions));
   assert.ok(testingCall !== undefined);
   assert.deepEqual([...testingCall.toolNames].sort(), [
+    'git_diff',
+    'git_log',
+    'git_status',
     'list_files',
     'read_file',
     'run_validation',
@@ -3001,6 +3007,9 @@ test('plan mode is enforced with read-only tools and no computer control', async
   assert.deepEqual([...invocation.toolNames].sort(), [
     'consult_specialist',
     'finish_task',
+    'git_diff',
+    'git_log',
+    'git_status',
     'list_files',
     'read_file',
     'search_files',
