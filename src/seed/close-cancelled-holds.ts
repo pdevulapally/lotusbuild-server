@@ -53,7 +53,7 @@ async function main(): Promise<void> {
       const snapshot = await firestore.doc(`users/${ownerUid}/${reservationsCollectionName}/${id}`).get();
       reservations.set(id, snapshot.exists ? snapshot.data() : undefined);
     }
-    const plan = planCancelledHoldClosure({ sessionId, session, reservations, tokenMeterKeys, now: new Date() });
+    const plan = planCancelledHoldClosure({ sessionId, session, reservations, tokenMeterKeys, leaseSeconds: config.SESSION_LEASE_SECONDS, now: new Date() });
 
     process.stdout.write(`  session ${sessionId} (owner ${plan.ownerUid}):\n`);
     if (plan.holds.length === 0) process.stdout.write('    no reservations recorded.\n');
