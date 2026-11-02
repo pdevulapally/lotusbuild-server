@@ -12,8 +12,9 @@ import type { Connection, ConnectionRepository } from './service.ts';
  * installation id and the `state` the install was started with. The frontend,
  * signed in, posts both back here, so the installation is bound to the user who
  * started it by the same single-use state the OAuth connectors use, and the
- * installation id is never trusted from a query string: GitHub is asked what
- * it is before anything is written.
+ * installation id is never trusted from a query string: the install also
+ * authorises the user, and the `code` that produces proves to GitHub which
+ * installations that person can reach before anything is written.
  *
  * The sealed credential is the installation id. The secret that reaches
  * repositories is minted from it per use (`GitHubApp.installationToken`) and
@@ -52,7 +53,7 @@ export class GitHubInstallations {
     return { url: url.toString(), expiresAt: started.expiresAt };
   }
 
-  async complete(input: { ownerUid: string; state: string; installationId: number; returnTo: string; now?: Date }): Promise<Connection> {
+  async complete(input: { ownerUid: string; state: string; code: string; installationId: number; returnTo: string; now?: Date }): Promise<Connection> {
     const returnTo = this.#returnTo(input.returnTo);
     let record;
     try {
@@ -66,6 +67,13 @@ export class GitHubInstallations {
         });
       }
       throw error;
+    }
+    const authorised = await this.#app.installationsAuthorisedBy(input.code, returnTo);
+    if (!authorised.includes(input.installationId)) {
+      throw new AppError({
+        code: 'connections/installation-not-yours', statusCode: 403,
+        message: 'That GitHub installation is not one you can reach. Start again from Integrations.',
+      });
     }
     const installation = await this.#app.installation(input.installationId);
     const id = randomBytes(16).toString('base64url');

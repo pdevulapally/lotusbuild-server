@@ -70,6 +70,8 @@ const apiSpec = {
   GITHUB_APP_ID: asOptional(asString('id of the LotusBuild GitHub App; GitHub connections stay configuration_required when absent')),
   GITHUB_APP_PRIVATE_KEY: asOptional(asString('PEM private key of that App, newlines escaped as \\n', { minLength: 64 })),
   GITHUB_APP_SLUG: asOptional(asString('URL slug of that App, as in github.com/apps/<slug>')),
+  GITHUB_APP_CLIENT_ID: asOptional(asString('OAuth client id of that App, used to confirm who installed it')),
+  GITHUB_APP_CLIENT_SECRET: asOptional(asString('OAuth client secret of that App', { minLength: 20 })),
   HOST: asString('interface to bind (127.0.0.1 behind a reverse proxy, 0.0.0.0 otherwise)'),
   PORT: asPort('TCP port to listen on'),
   PUBLIC_API_URL: asUrl('externally reachable base URL of this API', {

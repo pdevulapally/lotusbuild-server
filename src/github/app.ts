@@ -102,19 +102,98 @@ export interface AppIdentity {
 export class GitHubApp {
   readonly #appId: string;
   readonly #privateKey: string;
+  readonly #client: { readonly id: string; readonly secret: string };
   readonly #apiBaseUrl: URL;
+  readonly #webBaseUrl: URL;
   readonly #requestTimeoutMs: number;
 
   constructor(args: {
     readonly appId: string;
     readonly privateKey: string;
+    /** The App's OAuth client, used only to learn who installed it. */
+    readonly client: { readonly id: string; readonly secret: string };
     readonly apiBaseUrl: URL;
+    readonly webBaseUrl: URL;
     readonly requestTimeoutMs: number;
   }) {
     this.#appId = args.appId;
     this.#privateKey = args.privateKey;
+    this.#client = args.client;
     this.#apiBaseUrl = args.apiBaseUrl;
+    this.#webBaseUrl = args.webBaseUrl;
     this.#requestTimeoutMs = args.requestTimeoutMs;
+  }
+
+  /**
+   * Which installations the person who just authorised us can reach.
+   *
+   * GitHub warns that the `installation_id` it appends to the setup redirect can
+   * be typed by anyone, so the install flow asks for user authorisation and the
+   * one-time `code` that produces is exchanged here for a user token whose only
+   * job is this one question. The token is revoked before returning and is never
+   * stored, logged or handed on: the installation token is the credential this
+   * service works with, and it is minted separately.
+   */
+  async installationsAuthorisedBy(code: string, redirectUri: string): Promise<readonly number[]> {
+    if (!/^[A-Za-z0-9_-]{1,255}$/.test(code)) {
+      throw new AppError({ code: 'github/code-invalid', statusCode: 400, message: 'GitHub’s authorisation code is unreadable.' });
+    }
+    const userToken = await this.#exchangeCode(code, redirectUri);
+    try {
+      const ids: number[] = [];
+      for (let page = 1; page <= maxRepositoryPages; page += 1) {
+        const body = await this.#request('GET', `/user/installations?per_page=${repositoryPageSize}&page=${page}`, userToken, 'credentials');
+        const items = body['installations'];
+        if (!Array.isArray(items)) throw unexpected('an installation list this service cannot read');
+        for (const item of items) {
+          const id = typeof item === 'object' && item !== null ? (item as Record<string, unknown>)['id'] : undefined;
+          if (typeof id !== 'number') throw unexpected('an installation list this service cannot read');
+          ids.push(id);
+        }
+        if (items.length < repositoryPageSize) break;
+      }
+      return ids;
+    } finally {
+      await this.#revokeUserToken(userToken);
+    }
+  }
+
+  async #exchangeCode(code: string, redirectUri: string): Promise<string> {
+    let response: Response;
+    try {
+      response = await fetch(new URL('/login/oauth/access_token', this.#webBaseUrl), {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ client_id: this.#client.id, client_secret: this.#client.secret, code, redirect_uri: redirectUri }),
+        signal: AbortSignal.timeout(this.#requestTimeoutMs),
+      });
+    } catch (cause) {
+      throw new AppError({ code: 'github/unreachable', statusCode: 502, message: 'GitHub could not be reached.', cause });
+    }
+    const body: unknown = response.ok ? await response.json().catch(() => undefined) : undefined;
+    const fields = typeof body === 'object' && body !== null ? (body as Record<string, unknown>) : {};
+    const token = fields['access_token'];
+    if (typeof token === 'string' && token !== '') return token;
+    // GitHub answers 200 with an `error` field for a used, expired or foreign code.
+    const reason = typeof fields['error'] === 'string' ? fields['error'] : `status ${response.status}`;
+    if (reason === 'incorrect_client_credentials') {
+      throw new AppError({ code: 'github/credentials-rejected', statusCode: 500, message: 'GitHub rejected this service’s App credentials.', details: { reason } });
+    }
+    throw new AppError({
+      code: 'github/authorization-rejected', statusCode: 400,
+      message: 'GitHub did not accept this authorisation. Start again from Integrations.', details: { reason },
+    });
+  }
+
+  /** Best effort: the token expires on its own within hours and is never kept. */
+  async #revokeUserToken(userToken: string): Promise<void> {
+    const basic = Buffer.from(`${this.#client.id}:${this.#client.secret}`, 'utf8').toString('base64');
+    await fetch(new URL(`/applications/${encodeURIComponent(this.#client.id)}/token`, this.#apiBaseUrl), {
+      method: 'DELETE',
+      headers: { authorization: `Basic ${basic}`, accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', 'content-type': 'application/json' },
+      body: JSON.stringify({ access_token: userToken }),
+      signal: AbortSignal.timeout(this.#requestTimeoutMs),
+    }).catch(() => undefined);
   }
 
   /**
