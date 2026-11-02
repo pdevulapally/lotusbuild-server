@@ -65,7 +65,7 @@ export interface Dependencies {
   readonly projectFiles: ProjectFiles;
   /** Absent until CONNECTION_KEK_V<n> is configured; the integrations routes then answer 503 configuration_required. */
   readonly connections?: ConnectionRepository;
-  /** Absent until GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY and GITHUB_APP_SLUG are configured with the keyring. */
+  /** Absent until GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY, GITHUB_APP_SLUG and the App's OAuth client are configured with the keyring. */
   readonly github?: GitHubInstallations;
   readonly attachments: AttachmentStore;
   readonly skills: SkillRepository;

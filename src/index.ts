@@ -82,11 +82,13 @@ async function main(): Promise<void> {
   const connectionKeyring = keyringFromEnv(process.env);
   const connections = connectionKeyring === undefined ? undefined : new ConnectionRepository(firebase.firestore, connectionKeyring);
   const github = connections === undefined || config.GITHUB_APP_ID === undefined || config.GITHUB_APP_PRIVATE_KEY === undefined || config.GITHUB_APP_SLUG === undefined
+    || config.GITHUB_APP_CLIENT_ID === undefined || config.GITHUB_APP_CLIENT_SECRET === undefined
     ? undefined
     : new GitHubInstallations({
       app: new GitHubApp({
         appId: config.GITHUB_APP_ID, privateKey: config.GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n'),
-        apiBaseUrl: new URL('https://api.github.com'), requestTimeoutMs: 15_000,
+        client: { id: config.GITHUB_APP_CLIENT_ID, secret: config.GITHUB_APP_CLIENT_SECRET },
+        apiBaseUrl: new URL('https://api.github.com'), webBaseUrl: new URL('https://github.com'), requestTimeoutMs: 15_000,
       }),
       slug: config.GITHUB_APP_SLUG, states: new OAuthStateStore(firebase.firestore), connections,
       allowedOrigins: config.CORS_ALLOWED_ORIGINS.map((origin) => origin.origin),

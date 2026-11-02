@@ -20,7 +20,7 @@ const repo = (fullName: string, defaultBranch = 'main'): Repository => ({
   defaultBranch, htmlUrl: `https://github.com/${fullName}`, pushedAt: new Date('2026-01-01T00:00:00Z'),
 });
 
-function harness(options: { installationExists?: boolean } = {}) {
+function harness(options: { installationExists?: boolean; authorised?: number[] } = {}) {
   const store = ledger();
   for (const id of ['p1', 'p2']) store.data.set(`projects/${id}`, { ownerUid: 'alice', status: 'draft' });
   const repository = new ConnectionRepository(store.db, new CredentialKeyring(new Map([[1, randomBytes(32)]])));
@@ -31,6 +31,11 @@ function harness(options: { installationExists?: boolean } = {}) {
       calls.push(`installation:${id}`);
       if (options.installationExists === false) throw new Error('gone');
       return { id, account: { login: 'alice-gh', id: 42, type: 'User' as const }, permissions: ['contents', 'pull_requests'] };
+    },
+    installationsAuthorisedBy: async (code: string, redirectUri: string) => {
+      calls.push(`authorised:${code}:${redirectUri}`);
+      if (code !== 'gh_code') throw Object.assign(new Error('rejected'), { statusCode: 400 });
+      return options.authorised ?? [9001];
     },
     installationToken: async (id: number) => { calls.push(`token:${id}`); return token; },
     listRepositories: async (t: InstallationToken) => { calls.push(`list:${t.token}`); return [repo('alice-gh/site'), repo('alice-gh/api', 'develop')]; },
@@ -64,7 +69,7 @@ async function connect(h: ReturnType<typeof harness>, projectIds: string[] = ['p
   const url = new URL((start.json() as { authorizeUrl: string }).authorizeUrl);
   assert.equal(url.origin + url.pathname, 'https://github.com/apps/lotusbuild/installations/new');
   const state = url.searchParams.get('state')!;
-  const complete = await h.server.inject({ method: 'POST', url: '/connections/github/complete', headers, payload: { state, installationId: 9001, returnTo } });
+  const complete = await h.server.inject({ method: 'POST', url: '/connections/github/complete', headers, payload: { state, code: 'gh_code', installationId: 9001, returnTo } });
   return { state, complete };
 }
 
@@ -79,7 +84,7 @@ describe('GitHub installations', () => {
     assert.equal(connection.status, 'active');
     assert.equal(connection.account.name, 'alice-gh');
     assert.deepEqual(connection.scopes, ['contents', 'pull_requests']);
-    assert.deepEqual(h.calls, ['installation:9001']);
+    assert.deepEqual(h.calls, [`authorised:gh_code:${returnTo}`, 'installation:9001']);
     assert.deepEqual(await h.repository.grantedProjects(connection.id, 'alice'), ['p1']);
     assert.equal(complete.body.includes('9001'), false, 'the installation id is sealed, not served');
   });
@@ -93,16 +98,26 @@ describe('GitHub installations', () => {
 
     const { state, complete } = await connect(h);
     assert.equal(complete.statusCode, 200);
-    const replay = await h.server.inject({ method: 'POST', url: '/connections/github/complete', headers, payload: { state, installationId: 9001, returnTo } });
+    const replay = await h.server.inject({ method: 'POST', url: '/connections/github/complete', headers, payload: { state, code: 'gh_code', installationId: 9001, returnTo } });
     assert.equal(replay.statusCode, 400);
     assert.equal((replay.json() as ErrorBody).error.code, 'connections/state-rejected');
 
     const start = await h.server.inject({ method: 'POST', url: '/connections/github/start', headers, payload: { returnTo, projectIds: [] } });
     const other = new URL((start.json() as { authorizeUrl: string }).authorizeUrl).searchParams.get('state')!;
     h.as('mallory');
-    const stolen = await h.server.inject({ method: 'POST', url: '/connections/github/complete', headers, payload: { state: other, installationId: 9001, returnTo } });
+    const stolen = await h.server.inject({ method: 'POST', url: '/connections/github/complete', headers, payload: { state: other, code: 'gh_code', installationId: 9001, returnTo } });
     assert.equal(stolen.statusCode, 400);
-    assert.equal(h.calls.filter((c) => c.startsWith('installation:')).length, 1, 'GitHub is only asked after the state is accepted');
+    assert.equal(h.calls.filter((c) => c.startsWith('authorised:') || c.startsWith('installation:')).length, 2, 'GitHub is only asked after the state is accepted');
+  });
+
+  it('refuses an installation the authorising user cannot reach, and writes nothing', async (t) => {
+    const h = harness({ authorised: [4242] });
+    t.after(() => h.server.close());
+    const { complete } = await connect(h);
+    assert.equal(complete.statusCode, 403, complete.body);
+    assert.equal((complete.json() as ErrorBody).error.code, 'connections/installation-not-yours');
+    assert.equal(h.calls.some((c) => c.startsWith('installation:')), false, 'the spoofed id is never looked up as the App');
+    assert.equal([...h.store.data.keys()].some((key) => key.startsWith('connections/')), false);
   });
 
   it('writes nothing when GitHub does not know the installation', async (t) => {

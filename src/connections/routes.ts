@@ -28,8 +28,8 @@ const grantsBody = { type: 'object', required: ['projectIds'], additionalPropert
 const returnTo = { type: 'string', minLength: 8, maxLength: 2048 } as const;
 const startBody = { type: 'object', required: ['returnTo'], additionalProperties: false,
   properties: { returnTo, projectIds: { type: 'array', maxItems: 200, items: { type: 'string', pattern: documentId } } } } as const;
-const completeBody = { type: 'object', required: ['state', 'installationId', 'returnTo'], additionalProperties: false,
-  properties: { state: { type: 'string', minLength: 16, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' }, installationId: { type: 'integer', minimum: 1 }, returnTo } } as const;
+const completeBody = { type: 'object', required: ['state', 'code', 'installationId', 'returnTo'], additionalProperties: false,
+  properties: { state: { type: 'string', minLength: 16, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' }, code: { type: 'string', minLength: 1, maxLength: 255, pattern: '^[A-Za-z0-9_-]+$' }, installationId: { type: 'integer', minimum: 1 }, returnTo } } as const;
 const projectParams = { type: 'object', required: ['projectId'], additionalProperties: false, properties: { projectId: { type: 'string', pattern: documentId } } } as const;
 const sourceBody = { type: 'object', required: ['connectionId', 'fullName'], additionalProperties: false,
   properties: { connectionId: { type: 'string', pattern: documentId }, fullName: { type: 'string', minLength: 3, maxLength: 140, pattern: repositoryFullName.source } } } as const;
@@ -37,7 +37,7 @@ type IdParams = { id: string };
 type ConnectorParams = { connector: string };
 type GrantsBody = { projectIds: string[] };
 type StartBody = { returnTo: string; projectIds?: string[] };
-type CompleteBody = { state: string; installationId: number; returnTo: string };
+type CompleteBody = { state: string; code: string; installationId: number; returnTo: string };
 type ProjectParams = { projectId: string };
 type SourceBody = { connectionId: string; fullName: string };
 
@@ -153,9 +153,10 @@ export function registerConnectionRoutes(api: FastifyInstance, dependencies: Con
     return { authorizeUrl: started.url, expiresAt: started.expiresAt.toISOString() };
   });
 
-  // GitHub sends the browser back to the App's setup URL, a signed-in frontend
-  // page, which posts the installation and the state here. The state binds it to
-  // the user who started the install; the installation is verified with GitHub.
+  // GitHub sends the browser back to the App's callback URL, a signed-in
+  // frontend page, which posts the installation, the state and the user
+  // authorisation code here. The state binds it to the user who started the
+  // install; the code proves to GitHub that the installation is theirs.
   api.post<{ Body: CompleteBody }>('/connections/github/complete', { preHandler: write, schema: { body: completeBody } }, async (request) => {
     const { uid } = authenticatedUser(request);
     const connection = await github().complete({ ownerUid: uid, ...request.body });
