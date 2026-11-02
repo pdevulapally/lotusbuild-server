@@ -80,6 +80,7 @@ export class SessionEvents {
   readonly #onListenerError: SessionEventsOptions['onListenerError'];
   readonly #appendTails = new Map<string, Promise<unknown>>();
   readonly #listeners = new Map<string, Set<SessionEventListener>>();
+  readonly #queueListeners = new Set<() => void>();
 
   constructor(redis: Redis, subscriber: Redis, options: SessionEventsOptions) {
     if (!Number.isSafeInteger(options.maxEventBytes) || options.maxEventBytes <= 0) throw new Error('Invalid event byte budget.');
@@ -103,6 +104,33 @@ export class SessionEvents {
 
   #key(sessionId: string): string {
     return `${redisKeyPrefixes.sessionEvents}${sessionId}`;
+  }
+
+  /** Not a session's channel: a tilde can never be part of a session id. */
+  static readonly queueChannel = `${redisKeyPrefixes.sessionEvents}~queued`;
+
+  /**
+   * Tells idle runners that a session just became claimable so they claim it
+   * now instead of on their next poll. A hint only: a runner that misses it
+   * still finds the work on its poll, exactly as before.
+   */
+  async notifyQueued(): Promise<void> {
+    await this.#redis.publish(SessionEvents.queueChannel, '1');
+  }
+
+  /** Runs `listener` whenever any session becomes claimable; returns the release function. */
+  async onQueued(listener: () => void): Promise<() => void> {
+    await this.#subscriber.subscribe(SessionEvents.queueChannel);
+    this.#queueListeners.add(listener);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#queueListeners.delete(listener);
+      if (this.#queueListeners.size === 0) {
+        void this.#subscriber.unsubscribe(SessionEvents.queueChannel).catch((cause: unknown) => this.#onListenerError(cause instanceof Error ? cause : new Error(String(cause)), 'queue'));
+      }
+    };
   }
 
   /**
@@ -248,6 +276,10 @@ export class SessionEvents {
   }
 
   #deliver(channel: string, payload: string): void {
+    if (channel === SessionEvents.queueChannel) {
+      for (const listener of this.#queueListeners) listener();
+      return;
+    }
     const listeners = this.#listeners.get(channel);
     if (listeners === undefined || listeners.size === 0) {
       return;

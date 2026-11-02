@@ -181,6 +181,12 @@ export function registerSessionRoutes(
       log.error({ diagnostic: safeErrorDiagnostic(error), sessionId, type }, 'session event was not published');
     });
   };
+  /** A queued session should be claimed now, not on a runner's next poll. */
+  const wakeRunners = (log: FastifyBaseLogger): void => {
+    events.notifyQueued().catch((error: unknown) => {
+      log.warn({ diagnostic: safeErrorDiagnostic(error) }, 'runners were not notified of queued work');
+    });
+  };
 
   app.post<{ Params: { projectId: string }; Body: {
     attachments?: AttachmentRef[]; prompt?: string; entrypoint?: 'voice';
@@ -239,6 +245,7 @@ export function registerSessionRoutes(
       const session = await sessions.create(user.uid, request.params.projectId, input, undefined,
         mutation<BuildSession>(user.uid, `POST /projects/${request.params.projectId}/sessions`,
           commandKey(request.headers['idempotency-key'], true), { ...input, effort: request.body.effort }, (value) => ({ statusCode: 201, body: toResponse(value) })));
+      if (!commandWasReplayed(session) && session.status === 'QUEUED') wakeRunners(request.log);
       if (!commandWasReplayed(session)) publish(request.log, session.id, session.status === 'IDLE' ? 'session.idle' : 'session.queued', {
 
         status: session.status,
@@ -385,7 +392,10 @@ export function registerSessionRoutes(
         if (!commandWasReplayed(result)) publish(request.log, result.message.sessionId, 'session.message_queued', { queuedMessageId: result.message.id });
         return reply.code(202).send({ queued: true, queuedMessage: toQueuedMessageResponse(result.message) });
       }
-      if (result.session.status === 'QUEUED' && !commandWasReplayed(result)) publish(request.log, result.session.id, 'session.queued', { status: result.session.status, messageCount: result.session.messageCount });
+      if (result.session.status === 'QUEUED' && !commandWasReplayed(result)) {
+        publish(request.log, result.session.id, 'session.queued', { status: result.session.status, messageCount: result.session.messageCount });
+        wakeRunners(request.log);
+      }
       return reply.code(202).send({ queued: false, session: toResponse(result.session) });
 
     },

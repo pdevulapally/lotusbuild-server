@@ -210,6 +210,7 @@ async function main(): Promise<void> {
 
       },
       idlePollSeconds: config.RUNNER_IDLE_POLL_SECONDS,
+      wake: (onWake) => events.onQueued(onWake),
       concurrency: config.RUNNER_CONCURRENCY,
       shouldContinue: () => !shutdown.signal.aborted,
       signal: shutdown.signal,

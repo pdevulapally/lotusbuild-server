@@ -1161,6 +1161,8 @@ export async function runUntilStopped(
     readonly idlePollSeconds: number;
     readonly shouldContinue: () => boolean;
     readonly log: RunnerLogger;
+    /** Registers `onWake`, called when work may have been queued; returns the release function. The poll remains the backstop. */
+    readonly wake?: (onWake: () => void) => Promise<() => void>;
     readonly maintenance?: () => Promise<void>;
     readonly signal?: AbortSignal;
     /** Sessions worked at the same time by this process; each keeps its own lease and heartbeat. */
@@ -1182,9 +1184,15 @@ export async function runUntilStopped(
       if (stopping() && !failedDuringShutdown) { failedDuringShutdown = true; shutdownFailure = error; }
     } else options.log.error({}, 'could not claim a session');
   };
+  // A wake that arrives while claiming is remembered so the next idle returns at once.
+  let woken = false;
+  let wakeNow: (() => void) | undefined;
+  const releaseWake = options.wake === undefined ? undefined : await options.wake(() => { woken = true; wakeNow?.(); });
   const idle = () => new Promise<void>((resolve) => {
-    const done = () => { clearTimeout(timer); options.signal?.removeEventListener('abort', done); resolve(); };
+    if (woken) { woken = false; resolve(); return; }
+    const done = () => { clearTimeout(timer); wakeNow = undefined; woken = false; options.signal?.removeEventListener('abort', done); resolve(); };
     const timer = setTimeout(done, options.idlePollSeconds * 1000);
+    wakeNow = done;
     options.signal?.addEventListener('abort', done, { once: true });
     if (options.signal?.aborted) done();
   });
@@ -1220,6 +1228,7 @@ export async function runUntilStopped(
       else if (active.size >= concurrency) await Promise.race(active);
     }
   } finally {
+    releaseWake?.();
     await Promise.all(active);
   }
   if (failedDuringShutdown) throw shutdownFailure;
