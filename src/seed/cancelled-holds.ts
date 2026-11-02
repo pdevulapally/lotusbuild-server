@@ -30,6 +30,8 @@ export function planCancelledHoldClosure(input: {
   readonly session: Readonly<Record<string, unknown>> | undefined;
   readonly reservations: ReadonlyMap<string, Readonly<Record<string, unknown>> | undefined>;
   readonly tokenMeterKeys: ReadonlySet<string>;
+  /** How long a worker's heartbeat keeps its lease alive; the server's SESSION_LEASE_SECONDS. */
+  readonly leaseSeconds: number;
   readonly now: Date;
 }): ClosurePlan {
   const { session } = input;
@@ -39,10 +41,12 @@ export function planCancelledHoldClosure(input: {
   if (field(session, 'status') !== 'RUNNING' || field(session, 'cancelRequested') !== true) {
     throw new Error(`Session ${input.sessionId} is ${String(field(session, 'status'))} without a pending cancellation; nothing to close.`);
   }
-  // A running session becomes claimable again when its lease lapses, so a
-  // future claimableAt means a worker may still be finishing it.
-  const claimableAt = field(session, 'claimableAt');
-  if (claimableAt instanceof Timestamp && claimableAt.toMillis() > input.now.getTime()) {
+  // claimableAt also carries the recovery back-off of an abandoned session, so
+  // liveness is judged by the heartbeat: a worker that still holds the lease
+  // has renewed it within the lease window.
+  const heartbeatAt = field(session, 'heartbeatAt');
+  if (field(session, 'claimedBy') !== undefined && heartbeatAt instanceof Timestamp
+    && heartbeatAt.toMillis() > input.now.getTime() - input.leaseSeconds * 1000) {
     throw new Error(`Session ${input.sessionId} still has a live lease; a worker may be finishing it.`);
   }
 
