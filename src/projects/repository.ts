@@ -72,6 +72,8 @@ export interface ProjectSource {
   readonly connectionId: string;
   readonly fullName: string;
   readonly defaultBranch: string;
+  /** The `lotusbuild/…` task branch the agent is working on, once it has named one. */
+  readonly branch?: string;
   readonly boundAt: Date;
 }
 
@@ -159,6 +161,7 @@ function sourceField(fields: Fields, where: string): { source: ProjectSource } |
     connectionId: stringField(source, 'connectionId', nested),
     fullName: stringField(source, 'fullName', nested),
     defaultBranch: stringField(source, 'defaultBranch', nested),
+    ...(typeof source['branch'] === 'string' && source['branch'] !== '' ? { branch: source['branch'] } : {}),
     boundAt: timestampField(source, 'boundAt', nested),
   } };
 }
@@ -299,10 +302,19 @@ export class ProjectRepository {
       source: {
         kind: source.kind, connectionId: source.connectionId, fullName: source.fullName,
         defaultBranch: source.defaultBranch, boundAt: Timestamp.fromDate(source.boundAt),
+        ...(source.branch === undefined ? {} : { branch: source.branch }),
       },
       updatedAt: FieldValue.serverTimestamp(),
     });
     return { ...existing, source };
+  }
+
+  /** The task branch the agent named; a re-bind clears it because `bindSource` rewrites the map. */
+  async setSourceBranch(ownerUid: string, projectId: string, branch: string): Promise<Project> {
+    const existing = await this.readOwned(ownerUid, projectId);
+    if (existing.source === undefined) throw new AppError({ code: 'project/no-source', statusCode: 409, message: 'This project is not linked to a repository.' });
+    await this.refFor(projectId).update({ 'source.branch': branch, updatedAt: FieldValue.serverTimestamp() });
+    return { ...existing, source: { ...existing.source, branch } };
   }
 
   async unbindSource(ownerUid: string, projectId: string): Promise<Project> {

@@ -22,6 +22,21 @@ export interface ToolContext {
   readonly toolOutputMaxChars: number;
   /** Told when a preview comes up, so the session can show it. */
   readonly onPreview: (preview: { readonly url: string; readonly port: number }) => Promise<void>;
+  /** Present when the project is linked to a GitHub repository; shapes what `git_commit` allows. */
+  readonly repository?: RepositoryContext;
+}
+
+/**
+ * The repository a linked project works in. `branch` is the task branch the
+ * agent has named so far — undefined until its first commit — and `onBranch`
+ * is how naming one is made durable, so a later session continues it.
+ */
+export interface RepositoryContext {
+  readonly fullName: string;
+  readonly defaultBranch: string;
+  branch: string | undefined;
+  readonly coauthor?: { readonly name: string; readonly email: string } | undefined;
+  readonly onBranch: (branch: string) => Promise<void>;
 }
 
 async function projectRead(context: ToolContext, path: string): Promise<string> {
@@ -1047,10 +1062,197 @@ const definitions: readonly ToolDefinition[] = [
   },
 ];
 
+
+const taskSlugPattern = /^[a-z0-9][a-z0-9._-]{1,62}$/;
+const taskBranchPrefix = 'lotusbuild/';
+const commitMessagePath = '/tmp/lotusbuild-commit-message';
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Runs one git command in the project directory; every argument is quoted, never interpolated. */
+async function git(context: ToolContext, args: readonly string[], envs?: Readonly<Record<string, string>>): Promise<CommandOutcome> {
+  return context.sandbox.runCommand(['git', ...args].map(shellQuote).join(' '), {
+    cwd: context.provider.workdir, timeoutMs: context.commandTimeoutMs,
+    ...(envs === undefined ? {} : { envs }),
+    ...(context.signal === undefined ? {} : { signal: context.signal }),
+  });
+}
+
+function gitResult(outcome: CommandOutcome, empty: string): ToolResult {
+  if (outcome.exitCode !== 0) {
+    const detail = outcome.stderr.trim() || outcome.stdout.trim();
+    return { text: /not a git repository/i.test(detail) ? 'This project has no Git history yet.' : `git failed (exit ${outcome.exitCode}): ${detail}`, isError: true };
+  }
+  const text = outcome.stdout.replace(/\s+$/, '');
+  return { text: text === '' ? empty : text, isError: false };
+}
+
+function optionalProjectPath(context: ToolContext, input: Record<string, unknown>): string | undefined {
+  const value = input['path'];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value === '') throw new Error('"path" must be a non-empty string when given.');
+  resolveInWorkdir(context.provider, value);
+  if (value.startsWith('-')) throw new Error('"path" must not start with "-".');
+  return value;
+}
+
+function optionalTaskSlug(input: Record<string, unknown>): string | undefined {
+  const value = input['task'];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !taskSlugPattern.test(value)) {
+    throw new Error('"task" must be a short lowercase slug (letters, digits, ".", "_" or "-"), e.g. "add-login-page".');
+  }
+  return value;
+}
+
+const gitStatusDefinition: ToolDefinition = {
+  parallelSafe: true,
+  spec: {
+    name: 'git_status',
+    description:
+      'Show the Git state of the project: the current branch, how it relates to its remote, and every ' +
+      'changed, added, deleted or untracked file (porcelain format, one per line). Use it before ' +
+      'committing and whenever you need to know what has changed since the last commit.',
+    input_schema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  run: async (_input, context) => gitResult(await git(context, ['status', '--porcelain=v1', '--branch']), 'Nothing has changed since the last commit.'),
+};
+
+const gitDiffDefinition: ToolDefinition = {
+  parallelSafe: true,
+  spec: {
+    name: 'git_diff',
+    description:
+      'Show uncommitted changes as a unified diff — the working tree against the last commit, ' +
+      'including files not yet staged. Optionally scope to one file or directory, or ask for a ' +
+      'per-file summary instead of the full patch. Long output is truncated; scope it when it is.',
+    input_schema: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        path: { type: 'string', description: 'File or directory relative to the project directory. Omit for everything.' },
+        stat: { type: 'boolean', description: 'Return only the per-file change summary.' },
+      },
+    },
+  },
+  run: async (input, context) => {
+    const path = optionalProjectPath(context, input);
+    const args = ['diff', 'HEAD', '--no-color', '--no-ext-diff'];
+    if (input['stat'] === true) args.push('--stat');
+    if (path !== undefined) args.push('--', path);
+    const outcome = await git(context, args);
+    // A repository before its first commit has no HEAD; show what is there instead.
+    if (outcome.exitCode !== 0 && /ambiguous argument 'HEAD'|unknown revision/i.test(outcome.stderr)) {
+      return gitResult(await git(context, ['diff', '--no-color', '--no-ext-diff', ...(input['stat'] === true ? ['--stat'] : []), ...(path === undefined ? [] : ['--', path])]), 'No changes.');
+    }
+    return gitResult(outcome, 'No changes.');
+  },
+};
+
+const gitLogDefinition: ToolDefinition = {
+  parallelSafe: true,
+  spec: {
+    name: 'git_log',
+    description:
+      'List recent commits on the current branch, newest first: short hash, relative date, author ' +
+      'and subject. Optionally scope to one file or directory.',
+    input_schema: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        limit: { type: 'number', description: 'How many commits, 1–50. Default 20.' },
+        path: { type: 'string', description: 'File or directory relative to the project directory.' },
+      },
+    },
+  },
+  run: async (input, context) => {
+    const requested = input['limit'];
+    const limit = requested === undefined ? 20 : Number(requested);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new Error('"limit" must be a whole number from 1 to 50.');
+    const path = optionalProjectPath(context, input);
+    const args = ['log', `--max-count=${limit}`, '--no-color', '--date=relative', '--format=%h  %ad  %an  %s'];
+    if (path !== undefined) args.push('--', path);
+    return gitResult(await git(context, args), 'No commits yet.');
+  },
+};
+
+const gitCommitDefinition: ToolDefinition = {
+  spec: {
+    name: 'git_commit',
+    description:
+      'Commit everything that has changed in the project (all tracked and untracked files, honouring ' +
+      '.gitignore) with the given message. In a project linked to a GitHub repository, work is never ' +
+      'committed on the default branch: the first commit of a piece of work names the task with "task" ' +
+      '(a short slug such as "add-login-page") and lands on the branch lotusbuild/<task>, which later ' +
+      'sessions continue. Pass a different "task" only when you are genuinely starting a new piece of ' +
+      'work — it starts a fresh branch from the default branch. Commit at meaningful points, with a ' +
+      'subject line that says what changed and why. Nothing is pushed by this tool.',
+    input_schema: {
+      type: 'object', required: ['message'], additionalProperties: false,
+      properties: {
+        message: { type: 'string', description: 'Commit message: a short subject line, optionally a blank line and a body.' },
+        task: { type: 'string', description: 'Task slug for the branch lotusbuild/<task>. Required for the first commit of a linked project; otherwise omit to keep committing on the current task.' },
+      },
+    },
+  },
+  run: async (input, context) => {
+    const message = requireString(input, 'message').trim();
+    if (message.length > 4000) throw new Error('"message" must be at most 4000 characters.');
+    const task = optionalTaskSlug(input);
+    const repository = context.repository;
+    let newBranch: string | undefined;
+    if (repository !== undefined) {
+      const wanted = task === undefined ? undefined : `${taskBranchPrefix}${task}`;
+      if (repository.branch === undefined && wanted === undefined) {
+        return { isError: true, text:
+          `This project is linked to ${repository.fullName}, and nothing is committed on ${repository.defaultBranch}. ` +
+          'Name the task first: pass "task" (e.g. "add-login-page") and this commit starts lotusbuild/<task>.' };
+      }
+      if (wanted !== undefined && wanted !== repository.branch) newBranch = wanted;
+    } else if (task !== undefined) {
+      newBranch = `${taskBranchPrefix}${task}`;
+    }
+
+    const trailer = repository?.coauthor === undefined ? '' : `\n\nCo-authored-by: ${repository.coauthor.name} <${repository.coauthor.email}>`;
+    await context.sandbox.writeFile(commitMessagePath, `${message}${trailer}\n`);
+    const base = repository === undefined ? 'HEAD' : `origin/${repository.defaultBranch}`;
+    const script = [
+      'set -eu',
+      `trap 'rm -f ${commitMessagePath}' EXIT`,
+      ...(newBranch === undefined ? [] : [
+        `if git rev-parse --verify --quiet ${shellQuote(base)} >/dev/null; then git checkout -q -b ${shellQuote(newBranch)} ${shellQuote(base)}; else git checkout -q -b ${shellQuote(newBranch)}; fi`,
+      ]),
+      'git add -A',
+      'if [ -z "$(git status --porcelain)" ]; then echo "nothing=yes"; exit 0; fi',
+      `git commit -q -F ${commitMessagePath}`,
+      'echo "commit=$(git rev-parse --short HEAD)"',
+      'echo "branch=$(git rev-parse --abbrev-ref HEAD)"',
+      'echo "files=$(git show --pretty=format: --name-only HEAD | sed "/^$/d" | wc -l | tr -d " ")"',
+      '',
+    ].join('\n');
+    const outcome = await context.sandbox.runCommand(script, {
+      cwd: context.provider.workdir, timeoutMs: context.commandTimeoutMs,
+      ...(context.signal === undefined ? {} : { signal: context.signal }),
+    });
+    if (outcome.exitCode !== 0) return gitResult(outcome, '');
+    if (newBranch !== undefined && repository !== undefined) {
+      await repository.onBranch(newBranch);
+      repository.branch = newBranch;
+    }
+    const fields = Object.fromEntries(outcome.stdout.split('\n').filter((line) => line.includes('=')).map((line) => line.split('=', 2) as [string, string]));
+    if (fields['nothing'] === 'yes') {
+      return { isError: false, text: newBranch === undefined ? 'Nothing to commit: the working tree matches the last commit.' : `Switched to ${newBranch}; nothing to commit yet.` };
+    }
+    return { isError: false, text: `Committed ${fields['commit']} on ${fields['branch']} (${fields['files']} file(s)). Not pushed.` };
+  },
+};
+
+const gitDefinitions: readonly ToolDefinition[] = [gitStatusDefinition, gitDiffDefinition, gitLogDefinition, gitCommitDefinition];
+
 function setOf(names: readonly string[]): ToolSet {
   return new Map(
     names.map((name) => {
-      const definition = definitions.find((candidate) => candidate.spec.name === name);
+      const definition = [...definitions, ...gitDefinitions].find((candidate) => candidate.spec.name === name);
       if (definition === undefined) {
         throw new Error(`No tool called "${name}" exists to grant.`);
       }
@@ -1068,6 +1270,10 @@ export const workspaceTools: ToolSet = setOf([
   'list_files',
   'search_files',
   'start_preview',
+  'git_status',
+  'git_diff',
+  'git_log',
+  'git_commit',
 ]);
 
 /**
@@ -1077,7 +1283,7 @@ export const workspaceTools: ToolSet = setOf([
  * `npm install`, `git checkout` all go through it — so granting it to a
  * read-only role would make the role read-only in name only.
  */
-export const readOnlyTools: ToolSet = setOf(['read_file', 'list_files', 'search_files']);
+export const readOnlyTools: ToolSet = setOf(['read_file', 'list_files', 'search_files', 'git_status', 'git_diff', 'git_log']);
 
 export function specsOf(tools: ToolSet): readonly Tool[] {
   return [...tools.values()].map((definition) => definition.spec);

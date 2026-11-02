@@ -35,6 +35,7 @@ import {
 } from './computer.ts';
 import {
   type ToolContext,
+  type RepositoryContext,
   type ToolDefinition,
   type ToolSet,
   makeRunValidation,
@@ -1289,8 +1290,10 @@ export async function runAgentTurn(input: {
   readonly onAdmissionFailure?: (error: unknown, checkpoint: ContinuationCheckpoint) => Promise<void>;
   readonly saveTaskContext?: (state: TaskContext) => Promise<void>;
   readonly requestInput?: (kind: PendingInput['kind'], prompt: string) => Promise<PendingInput>;
+  readonly repository?: RepositoryContext;
 }): Promise<AgentRun> {
   const toolContext: ToolContext = {
+    ...(input.repository === undefined ? {} : { repository: input.repository }),
     signal: input.signal,
     // Kept in step with the sandbox: a desktop sandbox is never public, so the
     // agent must not be told it can hand out a public URL.
