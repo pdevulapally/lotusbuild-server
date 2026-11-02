@@ -830,7 +830,7 @@ async function routeApp(h: ReturnType<typeof harness>, append: SessionEvents['ap
   registerErrorHandler(app);
   app.decorate('enforceRateLimit', () => async () => {});
   registerProjectRoutes(app, h.projects);
-  registerSessionRoutes(app, h.sessions, { append } as SessionEvents,
+  registerSessionRoutes(app, h.sessions, { append, notifyQueued: async () => {} } as SessionEvents,
     { heartbeatSeconds: 15, maxConnections: 10, maxConnectionsPerUser: 2, maxBufferedBytes: 1024, reauthenticate: async () => {} });
   return app;
 }

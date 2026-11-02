@@ -36,7 +36,7 @@ function harness(verified: boolean | undefined) {
     appendPrompt: async () => { touched.push('sessions.appendPrompt'); return session; },
     cancel: async () => session,
     deleteQueuedMessage: async () => {},
-  } as unknown as SessionRepository, { append: async (_id: string, type: string, data: Record<string, unknown>) => ({ id: '1-0', type, data }) } as unknown as SessionEvents,
+  } as unknown as SessionRepository, { append: async (_id: string, type: string, data: Record<string, unknown>) => ({ id: '1-0', type, data }), notifyQueued: async () => {} } as unknown as SessionEvents,
   { heartbeatSeconds: 15, maxConnections: 10, maxConnectionsPerUser: 2, maxBufferedBytes: 1024, reauthenticate: async () => {} });
   registerBillingRoutes(app, { stripe: new Stripe('fixture-api-key'), webhookSecret: 'fixture-webhook-key', catalogueTtlMs: 1000,
     configuration: { get: async () => { touched.push('billing.configuration'); throw new Error('must not be reached'); } } } as unknown as Parameters<typeof registerBillingRoutes>[1]);
