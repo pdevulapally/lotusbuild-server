@@ -1233,12 +1233,16 @@ export class SessionRepository {
       const policy = input.lane === 'premium' ? undefined : requireFallbackPolicy(registry, entitlements, offer?.policyFingerprint);
       const project = await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId);
       assertBuildAllowed(entitlements, project.platform, current.model);
-      if (!entitlements.capabilities.boolean('git.persistence')) throw new AppError({ code: 'fallback/persistence-required', statusCode: 409, message: 'Safe continuation requires saved project persistence.' });
       this.#assertProjectCanActivate(project, current.id);
       const checkpoint = await transaction.get(ref.collection('continuations').doc('active'));
       const fields = checkpoint.data() ?? {};
       if (fields['version'] !== input.checkpointId || fields['status'] !== 'READY' || fields['source'] !== continuationSource(project, current) || (input.lane !== 'premium' && (policy === undefined || fields['policy'] !== policyFingerprint(policy)))) throw new AppError({ code: 'fallback/checkpoint-stale', statusCode: 409, message: 'The project or checkpoint for this task changed while awaiting your decision.' });
-      parseCheckpoint(stringField(fields, 'payload', 'continuation'), continuationProtocolMaxBytes);
+      const parsed = parseCheckpoint(stringField(fields, 'payload', 'continuation'), continuationProtocolMaxBytes);
+      // Persistence is required only when the checkpoint must restore a
+      // durable environment. A transcript-only checkpoint (no sandbox was ever
+      // acquired) resumes safely without it — free plans get no workspace back,
+      // and the resumed conversation is told so.
+      if (!entitlements.capabilities.boolean('git.persistence') && parsed.restoredEnvironment === true) throw new AppError({ code: 'fallback/persistence-required', statusCode: 409, message: 'Safe continuation requires saved project persistence.' });
       const now = new Date();
       let inputMeterKey = registry.inputTokenMeterKey; let outputMeterKey = registry.outputTokenMeterKey;
       let inputQuantity = 1; let outputQuantity = 1;
