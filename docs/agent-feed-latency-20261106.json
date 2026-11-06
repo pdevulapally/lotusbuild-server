@@ -1,0 +1,20 @@
+﻿{
+    "capturedAt":  "2026-11-06T10:36:13.131Z",
+    "scope":  "offline sequential single-user loopback; in-memory Firestore/Redis/Auth, synthetic sandbox/model; no external provider/Caddy/network calls",
+    "node":  "v24.16.0",
+    "metric":  "worker emitted text to durable event (controlled stream)",
+    "before":  {
+                   "n":  20,
+                   "minMs":  251.137,
+                   "medianMs":  253.963,
+                   "p95Ms":  266.24,
+                   "maxMs":  266.245
+               },
+    "after":  {
+                  "n":  20,
+                  "minMs":  0.286,
+                  "medianMs":  0.717,
+                  "p95Ms":  1.65,
+                  "maxMs":  1.921
+              }
+}

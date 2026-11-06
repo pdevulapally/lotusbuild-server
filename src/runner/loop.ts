@@ -1,4 +1,4 @@
-import { timingContext, timed, observeMethods, timingTraceId } from '../diagnostics/timing.ts';
+import { timingContext, timed, observeMethods, timingTraceId, startTiming } from '../diagnostics/timing.ts';
 import { ContinuationPause, serializeCheckpoint, type ContinuationCheckpoint } from './continuation.ts';
 import { requireFallbackPolicy, tokenLimit, verifyFallbackModel, quotaMetadata as quotaDescription, type FallbackState, type FallbackOffer } from '../sessions/fallback.ts';
 import type { Registry } from '../entitlements/schema.ts';
@@ -346,6 +346,7 @@ export class SessionRunner {
 
   async #work(session: ClaimedSession, shutdown?: AbortSignal): Promise<void> {
     const { sessions, sandboxes, events, log, runnerId } = this.#deps;
+    const endClaimToStep = startTiming('runner.claim_to_model_step');
     const authority: SessionLease = {
       sessionId: session.id,
       runnerId,
@@ -392,6 +393,7 @@ export class SessionRunner {
     }
 
     let pendingText = '';
+    let firstText = true;
     let textTimer: ReturnType<typeof setTimeout> | undefined;
     const appendEvent = async (type: string, data: Record<string, unknown>): Promise<void> => {
       try { await events.append(session.id, type, data, authority); }
@@ -410,10 +412,15 @@ export class SessionRunner {
       return textFlush;
     };
     const queueText = (delta: string): void => {
+      if (delta.length === 0) return;
       pendingText += delta;
+      // The first visible chunk should not pay the batching window. Later
+      // chunks still coalesce into bounded durable writes in the same chain.
+      if (firstText) { firstText = false; void flushText(); return; }
       if (textTimer === undefined) textTimer = setTimeout(() => { void flushText(); }, 250);
     };
     const publish = async (type: string, data: Record<string, unknown>): Promise<void> => {
+      if (type === 'agent.step') endClaimToStep();
       await flushText();
       await appendEvent(type, data);
     };
@@ -1012,6 +1019,7 @@ export class SessionRunner {
         throw new RunnerWorkError(error, 'session/finalization-failed');
       }
     } finally {
+      endClaimToStep(false);
       clearInterval(heartbeat);
       unsubscribeCancel?.();
       // Nothing should still be streaming by now; this is the backstop for a
