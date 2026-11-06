@@ -38,8 +38,9 @@ function harness(failSecond = false, rejectRecheck = false, models = fixtureMode
       markInFlight: async (_uid: string, ids: string[]) => { events.push(`dispatch:${ids.join(',')}`); },
       release: async (_uid: string, id: string) => { events.push(`release:${id}`); },
       recordObservedUsage: async (_uid: string, id: string, quantity: number) => { events.push(`journal:${id}:${quantity}`); },
-      settle: async (input: { reservationId: string; actualQuantity: number; recordOverrun: boolean }) => {
+      settle: async (input: { reservationId: string; actualQuantity: number; recordOverrun: boolean; evidence?: { model: string; raw: object } }) => {
         events.push(`settle:${input.reservationId}:${input.actualQuantity}:${input.recordOverrun}`);
+        if (input.evidence !== undefined) events.push(`evidence:${input.reservationId}:${input.evidence.model}`);
       },
     } as unknown as MeteringService,
   });
@@ -75,6 +76,15 @@ test('observed usage is journalled before settlement and input overruns are reco
   await (await h.begin()).settle({ input: 15, output: 7 });
   assert.deepEqual(h.events, ['hold:input:10', 'hold:output:20', 'dispatch:input,output',
     'journal:input:15', 'settle:input:15:true', 'forget:input', 'journal:output:7', 'settle:output:7:false', 'forget:output']);
+});
+test('shadow evidence is recorded exactly once per call, on the input hold only', async () => {
+  const h = harness();
+  await (await h.begin()).settle({ input: 15, output: 7, raw: { input: 15, output: 7 } });
+  assert.deepEqual(h.events.filter((event) => event.startsWith('evidence:')), ['evidence:input:test']);
+  // Without raw categories there is nothing to record, and nothing is invented.
+  const bare = harness();
+  await (await bare.begin()).settle({ input: 15, output: 7 });
+  assert.ok(!bare.events.some((event) => event.startsWith('evidence:')));
 });
 test('missing authoritative usage preserves dispatched holds', async () => {
   const h = harness();

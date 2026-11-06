@@ -100,6 +100,8 @@ function fakeFirestore(): Firestore {
   return {
     doc: (path: string) => ({
       get: async () => {
+        // The rate table is optional configuration: absent until seeded, never a failure.
+        if (path === 'config/aiRates') return { exists: false, data: () => undefined };
         if (path !== 'config/registry') {
           throw new Error(`unexpected doc path in this fake: ${path}`);
         }
@@ -364,6 +366,7 @@ test('missing registry document rejects', async () => {
   const missingRegistry = {
     doc: (path: string) => ({
       get: async () => {
+        if (path === 'config/aiRates') return { exists: false, data: () => undefined };
         if (path !== 'config/registry') {
           throw new Error(`unexpected doc path: ${path}`);
         }
@@ -383,6 +386,7 @@ test('an old/malformed registry schema rejects', async () => {
   const oldShapeRegistry = {
     doc: (path: string) => ({
       get: async () => {
+        if (path === 'config/aiRates') return { exists: false, data: () => undefined };
         if (path !== 'config/registry') {
           throw new Error(`unexpected doc path: ${path}`);
         }
@@ -473,6 +477,7 @@ test('no Firestore writes occur at any stage, including a successful run', async
   const watchedFirestore = {
     doc: (path: string) => ({
       get: async () => {
+        if (path === 'config/aiRates') return { exists: false, data: () => undefined };
         if (path !== 'config/registry') {
           throw new Error(`unexpected doc path: ${path}`);
         }

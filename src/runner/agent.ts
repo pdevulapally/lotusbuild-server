@@ -1,3 +1,4 @@
+import type { RawUsage } from '../entitlements/rates.ts';
 import { TaskTracker, compactTaskConversation, type TaskContext } from './task-context.ts';
 import { timed, startTiming } from '../diagnostics/timing.ts';
 import { contextFingerprint, retainCheckpointImages, type AdmissionBoundary, type ContinuationCheckpoint } from './continuation.ts';
@@ -137,6 +138,26 @@ export interface SpecialistReservations {
 export interface AuthoritativeUsage {
   readonly input: number | undefined;
   readonly output: number | undefined;
+  /** Provider categories as reported, for shadow unified accounting; absent categories stay undefined. */
+  readonly raw?: RawUsage;
+}
+
+/** Reads the raw categories off a provider usage object without inventing values it did not report. */
+export function rawUsageOf(usage: unknown): RawUsage | undefined {
+  if (typeof usage !== 'object' || usage === null) return undefined;
+  const u = usage as Record<string, unknown>;
+  const num = (value: unknown): number | undefined => (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined);
+  const creation = typeof u['cache_creation'] === 'object' && u['cache_creation'] !== null ? (u['cache_creation'] as Record<string, unknown>) : undefined;
+  const raw: { -readonly [K in keyof RawUsage]: RawUsage[K] } = {};
+  const put = (key: keyof RawUsage, value: number | undefined): void => { if (value !== undefined) raw[key] = value; };
+  put('input', num(u['input_tokens']));
+  put('cacheRead', num(u['cache_read_input_tokens']));
+  const five = num(creation?.['ephemeral_5m_input_tokens']), hour = num(creation?.['ephemeral_1h_input_tokens']);
+  // With a TTL breakdown the split is authoritative; without one the total is kept as a single category.
+  if (five !== undefined || hour !== undefined) { put('cacheCreation5m', five); put('cacheCreation1h', hour); }
+  else put('cacheCreation', num(u['cache_creation_input_tokens']));
+  put('output', num(u['output_tokens']));
+  return Object.keys(raw).length > 0 ? raw : undefined;
 }
 
 /** A secondary failure that must stay visible without becoming the outcome. */

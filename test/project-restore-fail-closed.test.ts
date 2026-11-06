@@ -153,7 +153,7 @@ test('a project that has never been saved starts a repository without reading st
     projectWith({ kind: 'none' }, 0),
   );
 
-  assert.equal(outcome, 'initialised');
+  assert.equal(outcome.outcome, 'initialised');
   assert.ok(initialisedRepository(sandbox));
   assert.deepEqual(snapshots.reads, []);
 });
@@ -168,7 +168,7 @@ test('a legacy snapshot that exists is restored', async () => {
     projectWith({ kind: 'legacy' }, 4096),
   );
 
-  assert.equal(outcome, 'restored');
+  assert.equal(outcome.outcome, 'restored');
   assert.equal(initialisedRepository(sandbox), false);
   assert.deepEqual(snapshots.reads, ['legacy']);
   // The archive is fetched from the URL the read handed over, in a file.
@@ -198,7 +198,7 @@ test('an immutable snapshot is restored at the exact recorded generation', async
     projectWith({ kind: 'immutable', objectName, generation: '7' }, 4096),
   );
 
-  assert.equal(outcome, 'restored');
+  assert.equal(outcome.outcome, 'restored');
   assert.equal(initialisedRepository(sandbox), false);
   assert.deepEqual(snapshots.reads, [`${objectName}#7`]);
 });
@@ -255,4 +255,17 @@ test('the failure tells the client nothing about where the snapshot lives', asyn
   });
   // The candidate object is named after the lease token that wrote it.
   assert.equal(JSON.stringify(error.details).includes(objectName), false);
+});
+
+test('a restore reports the bytes the download itself measured', async () => {
+  class EvidenceSandbox extends RecordingSandbox {
+    override async runCommand(command: string): Promise<CommandOutcome> {
+      await super.runCommand(command);
+      return { exitCode: 0, stdout: command.includes('restore_evidence') ? 'restore_evidence 4096 200\n' : '', stderr: '' };
+    }
+  }
+  const sandbox = new EvidenceSandbox();
+  const outcome = await persistence(new FakeSnapshotStorage(['legacy'])).restore(sandbox, provider, projectWith({ kind: 'legacy' }, 4096));
+  assert.deepEqual(outcome, { outcome: 'restored', observedBytes: 4096, httpCode: 200 });
+  assert.ok(sandbox.commands.some((command) => command.includes("-w 'restore_evidence %{size_download} %{http_code}")));
 });

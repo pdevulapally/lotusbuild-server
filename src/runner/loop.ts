@@ -18,7 +18,7 @@ import type { ConfigurationStore } from '../entitlements/store.ts';
 import type { DesktopHandoff, DesktopHandoffPort } from '../desktop/handoff.ts';
 import { AppError, safeErrorDiagnostic } from '../http/errors.ts';
 import type { MeteringService } from '../metering/service.ts';
-import type { ProjectPersistence, RestoreOutcome } from '../projects/persistence.ts';
+import type { ProjectPersistence, RestoreOutcome, RestoreResult } from '../projects/persistence.ts';
 import type { Project, ProjectRepository } from '../projects/repository.ts';
 import type { AcquiredSandbox, SandboxService } from '../sandboxes/service.ts';
 import type { RunningSandbox } from '../sandboxes/provider.ts';
@@ -45,12 +45,15 @@ export class RunSummary {
   readonly #emit: (fields: Record<string, unknown>) => void;
   #open: { sessionId: string; execution: number; startedAt: number } | undefined;
   constructor(records: TimingRecord[], emit: (fields: Record<string, unknown>) => void) { this.#records = records; this.#emit = emit; }
-  begin(sessionId: string, execution: number): void { this.#open = { sessionId, execution, startedAt: Date.now() }; }
+  #notes: Record<string, unknown> = {};
+  begin(sessionId: string, execution: number): void { this.#open = { sessionId, execution, startedAt: Date.now() }; this.#notes = {}; }
+  /** Facts about the run worth one line of log, merged into its summary. */
+  note(fields: Record<string, unknown>): void { Object.assign(this.#notes, fields); }
   end(outcome: 'completed' | 'stopped' | 'failed'): void {
     const open = this.#open; if (open === undefined) return; this.#open = undefined;
     try {
       const stages = summarizeTimings(this.#records.splice(0));
-      this.#emit({ sessionId: open.sessionId, execution: open.execution, timingTraceId: timingTraceId(), outcome, durationMs: Date.now() - open.startedAt, stages, environment: environmentSummary(stages) });
+      this.#emit({ sessionId: open.sessionId, execution: open.execution, timingTraceId: timingTraceId(), outcome, durationMs: Date.now() - open.startedAt, ...this.#notes, stages, environment: environmentSummary(stages) });
     } catch { /* Diagnostics never fail a run. */ }
   }
 }
@@ -624,8 +627,9 @@ export class SessionRunner {
         forget: (id: string) => sessions.forgetSpecialistReservation(session.id, authority, id),
       };
       persists = entitlements.capabilities.boolean('git.persistence');
-      const { registry } = await this.#deps.configuration.get();
+      const { registry, rates } = await this.#deps.configuration.get();
       sourceRegistry = registry;
+      summary?.note({ model: session.model });
       let executionRegistry = registry;
       if (isContinuation) {
         const policy = inFallback ? requireFallbackPolicy(registry, entitlements, session.fallback?.offer?.policyFingerprint) : undefined;
@@ -664,6 +668,7 @@ export class SessionRunner {
         inputMeterKey: executionRegistry.inputTokenMeterKey, outputMeterKey: executionRegistry.outputTokenMeterKey,
         ...(selectedOffer === undefined ? {} : { maxInputTokens: selectedOffer.maxInputTokens }),
         metering: this.#deps.metering, reservations: tokenReservations,
+        ...(rates === undefined ? {} : { rates }),
         authorize: async () => {
           await sessions.assertPersistenceLease(authority);
           const latest = await this.#deps.entitlements.forUser(session.ownerUid, new Date(), true);
@@ -738,7 +743,10 @@ export class SessionRunner {
             // Only a plan that pays for it gets its work back. For everyone else the
             // sandbox is genuinely disposable, which is the difference being sold.
             if (persists) {
-              restored = await this.#deps.persistence.restore(machine.running, machine.provider, project!);
+              const restoreRaw: RestoreResult | RestoreOutcome = await this.#deps.persistence.restore(machine.running, machine.provider, project!);
+              const restoreResult: RestoreResult = typeof restoreRaw === 'string' ? { outcome: restoreRaw } : restoreRaw;
+              restored = restoreResult.outcome;
+              summary?.note({ restoreOutcome: restored, restoreBytes: project!.snapshotBytes ?? 0, ...(restoreResult.observedBytes === undefined ? {} : { restoreObservedBytes: restoreResult.observedBytes }) });
               await publish('project.restored', { outcome: restored });
             }
             const source = project!.source;

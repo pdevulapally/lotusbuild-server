@@ -3,6 +3,7 @@ import { AppError } from '../http/errors.ts';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { MessageCountTokensParams } from '@anthropic-ai/sdk/resources/messages';
 import type { MeteringService } from '../metering/service.ts';
+import { unifiedFor, type AiRateTable } from '../entitlements/rates.ts';
 import type { AuthoritativeUsage, SpecialistReservations, ProblemReporter } from './agent.ts';
 import { modelOutputConfig, type ModelResolver } from '../models/catalog.ts';
 import type { TokenCount } from '../models/provider.ts';
@@ -33,6 +34,8 @@ export function createCallAdmission(deps: {
   readonly reservations: SpecialistReservations;
   readonly authorize: () => Promise<void>;
   readonly onProblem: ProblemReporter;
+  /** Unified-token rate table for shadow accounting; absent until seeded. */
+  readonly rates?: AiRateTable;
 }): CallAdmission {
   return {
     async begin(input) {
@@ -77,8 +80,13 @@ export function createCallAdmission(deps: {
           }
           try {
             await deps.metering.recordObservedUsage(deps.uid, hold.id, actual);
+            // Shadow evidence travels with the input hold only, so a logical call is
+            // recorded exactly once however its output hold is shared.
+            const evidence = hold.kind === 'input' && usage.raw !== undefined
+              ? { model: input.params.model, raw: usage.raw, ...(deps.rates === undefined ? {} : (unifiedFor(deps.rates, input.params.model, usage.raw) ?? {})) }
+              : undefined;
             await deps.metering.settle({ uid: deps.uid, reservationId: hold.id,
-              actualQuantity: actual, recordOverrun: hold.kind === 'input', now: new Date() });
+              actualQuantity: actual, recordOverrun: hold.kind === 'input', now: new Date(), ...(evidence === undefined ? {} : { evidence }) });
             await deps.reservations.forget(hold.id);
           } catch (error) { failures.push(error); }
         }

@@ -17,6 +17,8 @@ const archivePath = '/tmp/lotusbuild-repo.tar.gz';
 const urlPath = '/tmp/lotusbuild-url';
 
 export type RestoreOutcome = 'restored' | 'initialised';
+/** What a restore did, with the transfer evidence the download itself reported. */
+export interface RestoreResult { readonly outcome: RestoreOutcome; readonly observedBytes?: number; readonly httpCode?: number }
 
 export interface SaveOutcome {
   readonly bytes: number;
@@ -140,7 +142,7 @@ export class ProjectPersistence {
     sandbox: RunningSandbox,
     provider: SandboxProvider,
     project: Project,
-  ): Promise<RestoreOutcome> {
+  ): Promise<RestoreResult> {
     if (project.snapshot.kind === 'none') {
       await this.#run(
         sandbox,
@@ -148,7 +150,7 @@ export class ProjectPersistence {
         'set -eu\ngit init -q\n',
         this.#gitEnv(),
       );
-      return 'initialised';
+      return { outcome: 'initialised' };
     }
 
     const url = await this.#snapshots.readUrl(project.id, project.snapshot);
@@ -157,14 +159,16 @@ export class ProjectPersistence {
     // bearer credential, and an argument is visible to every process in the
     // sandbox through /proc.
     await sandbox.writeFile(urlPath, url);
-    await this.#run(
+    const stdout = await this.#run(
       sandbox,
       provider,
       [
         'set -eu',
         `url=$(cat ${urlPath})`,
         `rm -f ${urlPath}`,
-        `curl -sfL -o ${archivePath} "$url"`,
+        // The download reports what it actually transferred: the evidence a
+        // transfer charge may later settle against, never the estimate.
+        `curl -sfL -o ${archivePath} -w 'restore_evidence %{size_download} %{http_code}\\n' "$url"`,
         // Only .git is in the archive; the working tree comes back from it.
         `tar -xzf ${archivePath} -C .`,
         `rm -f ${archivePath}`,
@@ -175,7 +179,8 @@ export class ProjectPersistence {
       ].join('\n'),
       this.#gitEnv(),
     );
-    return 'restored';
+    const evidence = /restore_evidence (\d+) (\d{3})/.exec(stdout);
+    return evidence === null ? { outcome: 'restored' } : { outcome: 'restored', observedBytes: Number(evidence[1]), httpCode: Number(evidence[2]) };
   }
 
   /**

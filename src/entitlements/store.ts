@@ -2,6 +2,7 @@ import { timed } from '../diagnostics/timing.ts';
 import type { Firestore } from 'firebase-admin/firestore';
 
 import { type Cached, cached } from '../support/cache.ts';
+import { aiRatesDocumentPath, parseAiRateTable, type AiRateTable } from './rates.ts';
 import { DocumentShapeError } from '../support/documents.ts';
 import {
   type Plan,
@@ -19,10 +20,13 @@ import {
  */
 export const registryDocumentPath = 'config/registry';
 export const plansCollectionPath = 'plans';
+export { aiRatesDocumentPath } from './rates.ts';
 
 export interface Configuration {
   readonly registry: Registry;
   readonly plans: ReadonlyMap<string, Plan>;
+  /** Unified-token rate table; undefined until `config/aiRates` is seeded (shadow accounting then records no unified figure). */
+  readonly rates: AiRateTable | undefined;
 }
 
 /**
@@ -36,9 +40,10 @@ export class ConfigurationStore {
 
   constructor(firestore: Firestore, ttlMs: number) {
     this.#entry = cached(ttlMs, async (): Promise<Configuration> => {
-      const [registrySnapshot, planSnapshots] = await timed('configuration.firestore', () => Promise.all([
+      const [registrySnapshot, planSnapshots, ratesSnapshot] = await timed('configuration.firestore', () => Promise.all([
         firestore.doc(registryDocumentPath).get(),
         firestore.collection(plansCollectionPath).get(),
+        firestore.doc(aiRatesDocumentPath).get(),
       ]));
 
       if (!registrySnapshot.exists) {
@@ -92,7 +97,8 @@ export class ConfigurationStore {
       }
       assertSandboxAllowancesAreUsable(registry, [...plans.values()], registry.sandboxTimeMeterKey);
 
-      return { registry, plans };
+      const rates = ratesSnapshot.exists ? parseAiRateTable(ratesSnapshot.data() ?? {}, aiRatesDocumentPath) : undefined;
+      return { registry, plans, rates };
     });
   }
 
