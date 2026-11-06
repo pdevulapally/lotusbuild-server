@@ -108,6 +108,32 @@ export class SessionEvents {
 
   /** Not a session's channel: a tilde can never be part of a session id. */
   static readonly queueChannel = `${redisKeyPrefixes.sessionEvents}~queued`;
+  /** Carries the id of a session the user just stopped, so its runner aborts now rather than on its next heartbeat. */
+  static readonly cancelChannel = `${redisKeyPrefixes.sessionEvents}~cancelled`;
+  readonly #cancelListeners = new Map<string, Set<() => void>>();
+
+  /** A hint only, like `notifyQueued`: the heartbeat's lease check remains the guarantee. */
+  async notifyCancelled(sessionId: string): Promise<void> {
+    await this.#redis.publish(SessionEvents.cancelChannel, sessionId);
+  }
+
+  /** Runs `listener` when `sessionId` is cancelled by its user; returns the release function. */
+  async onCancelled(sessionId: string, listener: () => void): Promise<() => void> {
+    if (this.#cancelListeners.size === 0) await this.#subscriber.subscribe(SessionEvents.cancelChannel);
+    const set = this.#cancelListeners.get(sessionId) ?? new Set();
+    set.add(listener);
+    this.#cancelListeners.set(sessionId, set);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      set.delete(listener);
+      if (set.size === 0) this.#cancelListeners.delete(sessionId);
+      if (this.#cancelListeners.size === 0) {
+        void this.#subscriber.unsubscribe(SessionEvents.cancelChannel).catch((cause: unknown) => this.#onListenerError(cause instanceof Error ? cause : new Error(String(cause)), 'cancel'));
+      }
+    };
+  }
 
   /**
    * Tells idle runners that a session just became claimable so they claim it
@@ -278,6 +304,10 @@ export class SessionEvents {
   #deliver(channel: string, payload: string): void {
     if (channel === SessionEvents.queueChannel) {
       for (const listener of this.#queueListeners) listener();
+      return;
+    }
+    if (channel === SessionEvents.cancelChannel) {
+      for (const listener of this.#cancelListeners.get(payload) ?? []) listener();
       return;
     }
     const listeners = this.#listeners.get(channel);

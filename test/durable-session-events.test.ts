@@ -124,3 +124,18 @@ test('stale worker progress cannot overwrite the successor journal or publish a 
   await events.append('s', 'agent.step', {}, { sessionId: 's', runnerId: 'successor', token: 'new-token' });
   assert.equal((await events.history('s', undefined)).length, 1);
 });
+
+test('a stop notification reaches only the runner working that session, and releasing stops listening', async () => {
+  const h = fixture(); const events = h.events();
+  const fired: string[] = [];
+  const releaseS = await events.onCancelled('s', () => fired.push('s'));
+  const releaseT = await events.onCancelled('t', () => fired.push('t'));
+  await events.notifyCancelled('s');
+  assert.deepEqual(fired, ['s'], 'only the cancelled session\'s listener runs');
+  releaseS();
+  await events.notifyCancelled('s');
+  await events.notifyCancelled('t');
+  assert.deepEqual(fired, ['s', 't'], 'a released listener is silent; others still hear their own session');
+  releaseT();
+  releaseT();
+});
