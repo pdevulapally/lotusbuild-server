@@ -1073,7 +1073,19 @@ export class SessionRepository {
    */
   async claim(runnerId: string, now: Date = new Date(), signal?: AbortSignal): Promise<ClaimedSession | undefined> {
     signal?.throwIfAborted();
-    const candidates = await this.#firestore
+    // A session the user stopped whose worker has gone quiet is finished
+    // ahead of everything else and regardless of any recovery back-off: the
+    // user is looking at "Stopping" and must not wait out a retry schedule.
+    const stopped = await this.#firestore.collection(sessionsCollectionPath)
+      .where('cancelRequested', '==', true).limit(10).get();
+    const leaseFloor = now.getTime() - this.#leaseSeconds * 1000;
+    const abandonedStop = stopped.docs.find((doc) => {
+      const fields = doc.data();
+      const heartbeat = fields['heartbeatAt'];
+      return fields['status'] === 'RUNNING'
+        && (fields['claimedBy'] === undefined || !(heartbeat instanceof Timestamp) || heartbeat.toMillis() <= leaseFloor);
+    });
+    const candidates = abandonedStop !== undefined ? { docs: [abandonedStop] } : await this.#firestore
       .collection(sessionsCollectionPath)
       .where('claimableAt', '<=', Timestamp.fromDate(now))
       .orderBy('claimableAt', 'asc')
@@ -1102,8 +1114,11 @@ export class SessionRepository {
       const fields = snapshot.data() ?? {};
       if (!fallbackTurn && recovering && fields['status'] !== 'RUNNING') return undefined;
       const claimableAt = optionalTimestampField(fields, fallbackTurn ? 'fallbackClaimableAt' : 'claimableAt', ref.path);
+      const heartbeatAt = optionalTimestampField(fields, 'heartbeatAt', ref.path);
+      const stoppedAndAbandoned = !fallbackTurn && candidate === abandonedStop && fields['status'] === 'RUNNING' && fields['cancelRequested'] === true
+        && (fields['claimedBy'] === undefined || heartbeatAt === undefined || heartbeatAt.getTime() <= leaseFloor);
       // Another runner won the race between the query and this transaction.
-      if (claimableAt === undefined || claimableAt.getTime() > now.getTime()) {
+      if (!stoppedAndAbandoned && (claimableAt === undefined || claimableAt.getTime() > now.getTime())) {
         return undefined;
       }
 

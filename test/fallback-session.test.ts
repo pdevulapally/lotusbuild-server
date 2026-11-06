@@ -358,3 +358,24 @@ test('cancelling a session whose worker is alive leaves its lease alone', async 
   assert.equal(cancelled.cancelRequested, true);
   assert.equal((h.data.get(`sessions/${session.id}`)!['claimableAt'] as Timestamp).toMillis(), before);
 });
+
+test('a stopped session whose worker went quiet is claimed at once, ahead of its recovery back-off', async () => {
+  const h = fixture();
+  const session = await h.create('p-abandoned');
+  const first = await h.sessions.claim('worker'); assert.equal(first?.id, session.id);
+  const record = h.data.get(`sessions/${session.id}`)!;
+  record['cancelRequested'] = true;
+  record['heartbeatAt'] = Timestamp.fromMillis(Date.now() - 10 * 60_000);
+  record['claimableAt'] = Timestamp.fromMillis(Date.now() + 50 * 60_000);
+  const reclaimed = await h.sessions.claim('recovery-worker');
+  assert.equal(reclaimed?.id, session.id, 'the back-off does not hold a stopped session hostage');
+  assert.equal(reclaimed?.cancelRequested, true);
+});
+
+test('a stopped session whose worker is still heartbeating is not stolen', async () => {
+  const h = fixture();
+  const session = await h.create('p-live-stop');
+  await h.sessions.claim('worker');
+  h.data.get(`sessions/${session.id}`)!['cancelRequested'] = true;
+  assert.equal(await h.sessions.claim('other'), undefined);
+});
