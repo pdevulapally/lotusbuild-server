@@ -88,6 +88,8 @@ function toResponse(session: BuildSession) {
     sandboxId: session.sandboxId,
     error: session.error,
     cancelRequested: session.cancelRequested === true,
+    cancelRequestedAt: session.cancelRequestedAt?.toISOString(),
+    execution: session.execution,
     workspaceRecovery: session.workspaceRecovery,
     pendingInput: session.pendingInput,
     fallback: session.fallback === undefined ? undefined : {
@@ -458,7 +460,7 @@ export function registerSessionRoutes(
     },
   );
 
-  app.post<{ Params: { sessionId: string } }>(
+  app.post<{ Params: { sessionId: string }; Body: { execution?: number } | null }>(
     '/sessions/:sessionId/cancel',
 
     {
@@ -470,21 +472,31 @@ export function registerSessionRoutes(
           additionalProperties: false,
           properties: { sessionId: { type: 'string', pattern: documentId } },
         },
+        // The run the user is looking at. A Stop aimed at an earlier run is refused, not redirected.
+        // A client that predates run numbers may omit it; that Stop applies to the current run as before.
+        body: {
+          type: ['object', 'null'],
+          additionalProperties: false,
+          properties: { execution: { type: 'integer', minimum: 1 } },
+        },
       },
     },
     async (request, reply) => {
       const user = authenticatedUser(request);
       const session = await sessions.cancel(user.uid, request.params.sessionId,
         mutation<BuildSession>(user.uid, `POST /sessions/${request.params.sessionId}/cancel`,
-          commandKey(request.headers['idempotency-key'], true), {}, (value) => ({ statusCode: 200, body: toResponse(value) })));
+          commandKey(request.headers['idempotency-key'], true), { execution: request.body?.execution ?? null }, (value) => ({ statusCode: 200, body: toResponse(value) })),
+        request.body?.execution);
+      if (request.body?.execution === undefined) request.log.warn({ sessionId: session.id, execution: session.execution }, 'stop requested without a run number (older client)');
 
-      if (session.status === 'FAILED') {
-        publish(request.log, session.id, 'session.failed', {
-          error: session.error ?? 'Cancelled by user',
-        });
+      // A replayed Stop already told the runner and the journal once.
+      if (commandWasReplayed(session)) return reply.code(200).send(toResponse(session));
+      if (session.status === 'STOPPED') {
+        publish(request.log, session.id, 'session.stopped', { execution: session.execution, stopAfterMs: 0 });
       } else if (session.cancelRequested === true) {
         publish(request.log, session.id, 'session.cancel_requested', {
           sessionId: session.id,
+          execution: session.execution,
         });
         // The runner working this session aborts on the notification instead
         // of at its next heartbeat; a missed notification costs one heartbeat.

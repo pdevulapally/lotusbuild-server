@@ -125,6 +125,7 @@ const session: BuildSession = {
   projectId: 'project-1',
   ownerUid: 'user-1',
   status: 'RUNNING',
+  execution: 1,
   model: 'model-1',
   effort: 'standard',
   mode: 'build',

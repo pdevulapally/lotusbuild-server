@@ -124,3 +124,20 @@ test('a completed recovery clears the attempt counter', async () => {
   assert.equal(h.record()['recoveryAttempts'], undefined);
   assert.equal(h.record()['sandboxId'], undefined);
 });
+
+test('a stopped session is retried every lease, never on the doubling schedule', async () => {
+  const h = fixture();
+  h.record()['cancelRequested'] = true; h.record()['cancelRequestedAt'] = Timestamp.now();
+  const before = Date.now();
+  await failedRecovery(h);
+  let claimableAt = (h.record()['claimableAt'] as Timestamp).toMillis();
+  assert.equal(h.record()['status'], 'RUNNING', 'STOPPED is not written while the machine or holds are unconfirmed');
+  assert.equal(h.record()['cancelRequested'], true, 'the Stop request survives a failed recovery attempt');
+  assert.equal(h.record()['recoveryAttempts'], 1, 'attempts are still counted for monitoring');
+  assert.ok(claimableAt >= before + LEASE_SECONDS * 1000 - 1 && claimableAt <= Date.now() + LEASE_SECONDS * 1000, 'retry after one lease, not two');
+
+  h.record()['recoveryAttempts'] = 20; h.expire();
+  await failedRecovery(h);
+  claimableAt = (h.record()['claimableAt'] as Timestamp).toMillis();
+  assert.ok(claimableAt <= Date.now() + LEASE_SECONDS * 1000, 'still one lease after many attempts: a user watching "Stopping" never waits out an hour');
+});

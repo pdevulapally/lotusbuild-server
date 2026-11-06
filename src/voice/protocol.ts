@@ -11,7 +11,8 @@ export function voiceTaskStatus(session: Pick<BuildSession, 'status' | 'pendingI
   if (session.fallback && session.fallback.status !== 'COMPLETED') return 'The task is paused or waiting for capacity. Review the continuation options on screen.';
   if (session.status === 'IDLE' && session.messageCount === 0) return 'No task has been requested yet.';
   return { QUEUED: 'Your task is queued.', RUNNING: 'Your task is running. You can add a clarification while it works.',
-    IDLE: 'This turn has stopped. Review the response and any checks in the chat.', FAILED: 'The task stopped with a problem. Review the details in the chat.' }[session.status];
+    IDLE: 'This turn has stopped. Review the response and any checks in the chat.', STOPPED: 'You stopped the task. Send a message to continue.',
+    FAILED: 'The task stopped with a problem. Review the details in the chat.' }[session.status];
 }
 
 /** Only factual activity labels. Tool arguments, outputs, external text and model claims never become progress speech. */

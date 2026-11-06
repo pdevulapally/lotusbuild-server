@@ -24,11 +24,16 @@ export class SessionJournal {
         const expiresAt = fields['claimableAt'];
         const running = fields['status'] === 'RUNNING' && fields['claimedBy'] === authority.runnerId && fields['leaseToken'] === authority.token
           && expiresAt instanceof Timestamp && expiresAt.toMillis() > Date.now();
-        const finished = ['session.idle', 'session.queued', 'session.failed'].includes(type) && fields['lastFinishedLeaseToken'] === authority.token;
+        const finished = ['session.idle', 'session.queued', 'session.stopped', 'session.failed'].includes(type) && fields['lastFinishedLeaseToken'] === authority.token;
         if (authority.sessionId !== sessionId || (!running && !finished)) throw new AppError({
           code: 'session/lease-lost', statusCode: 409, message: 'This worker no longer owns this session event.' });
       }
-      const stateEvents: Record<string, string> = { 'session.queued': 'QUEUED', 'session.running': 'RUNNING', 'session.idle': 'IDLE', 'session.failed': 'FAILED' };
+      // An event names the run it belongs to; one naming any other run than the
+      // document's current run is late (or impossible) and is not journaled as
+      // current. Events without a run number, and all stored history, are untouched.
+      const run = data['execution'];
+      if (typeof run === 'number' && typeof fields['execution'] === 'number' && run !== fields['execution']) throw new Error('Obsolete run event.');
+      const stateEvents: Record<string, string> = { 'session.queued': 'QUEUED', 'session.running': 'RUNNING', 'session.idle': 'IDLE', 'session.stopped': 'STOPPED', 'session.failed': 'FAILED' };
       if ((stateEvents[type] !== undefined && fields['status'] !== stateEvents[type]) ||
           (type === 'session.cancel_requested' && fields['cancelRequested'] !== true)) throw new Error('Obsolete session notification.');
       const previous = fields['eventSequence'] === undefined ? 0 : integerField(fields, 'eventSequence', parent.path, { min: 0 });

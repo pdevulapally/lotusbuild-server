@@ -194,7 +194,7 @@ function runnerFixture(options: {
         : [{ type: 'tool_use', id: 'done', name: 'finish_task', input: { outcome: 'blocked', summary: 'Fixture turn complete.', evidence: [] } }],
       usage: { input_tokens: 2, output_tokens: 1 }, stop_reason: 'tool_use' }) }; },
   } } as unknown as Anthropic;
-  const session = { id: 's', projectId: 'p', ownerUid: 'u', model: entitlements.capabilities.stringList('ai.model.allowlist')[0],
+  const session = { id: 's', projectId: 'p', ownerUid: 'u', execution: 1, model: entitlements.capabilities.stringList('ai.model.allowlist')[0],
     effort: 'low', mode: 'build', leaseToken: 'lease', reservationIds: [], specialistReservationIds: [] };
   const sessions = {
     saveTaskContext: async () => {}, requireWorkspaceSalvage: async () => {}, claim: async () => session, heartbeat: async () => {}, assertPersistenceLease: async () => { if (cancelled) throw new AppError({ code: 'session/cancelled', statusCode: 409, message: 'Cancelled by user' }); }, markExecutionStarted: async () => {},
@@ -204,7 +204,7 @@ function runnerFixture(options: {
       metering.reserve({ ...input, uid: 'u', entitlements, now: new Date() }),
     forgetSpecialistReservation: async () => {},
     appendAssistantMessage: async () => {}, dequeueNextMessage: async () => undefined,
-    yieldForRecovery: async () => {}, finish: async () => { order.push('finish'); return 'IDLE'; },
+    readOwned: async () => session, yieldForRecovery: async () => {}, finish: async () => { order.push('finish'); return 'IDLE'; },
   };
   const handoffPort: DesktopHandoffPort = {
     publish: async (sessionId, handoff, ttl) => {
@@ -263,8 +263,9 @@ test('a desktop is announced once it is reachable, and withdrawn before the sand
 
   const ready = h.emitted.find((event) => event.type === 'desktop.ready');
   const ended = h.emitted.filter((event) => event.type === 'desktop.ended');
-  assert.deepEqual(ready!.data, desktopSize);
-  assert.deepEqual(ended.map((event) => event.data), [{ reason: 'session-ended' }]);
+  assert.deepEqual(ready!.data, { execution: 1, ...desktopSize });
+  assert.ok(h.emitted.length > 3 && h.emitted.every((event) => (event.data as { execution?: number }).execution === 1), 'every event this run journals names its run');
+  assert.deepEqual(ended.map((event) => event.data), [{ execution: 1, reason: 'session-ended' }]);
   // Published only after the handoff exists; withdrawn and announced over before the machine is terminated.
   const at = (name: string) => h.order.indexOf(name);
   assert.ok(at('startDesktop') < at('publish') && at('publish') < at('desktop.ready'));
@@ -282,7 +283,7 @@ test('a desktop that fails to start does not fail the build, and the user is tol
   assert.ok(h.order.includes('finish'));
   assert.deepEqual(h.handoffCalls, [], 'nothing was announced to the relay');
   assert.ok(!h.types().includes('desktop.ready'));
-  assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data), [{ reason: 'error' }]);
+  assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data), [{ execution: 1, reason: 'error' }]);
   assert.equal(JSON.stringify(h.emitted).includes('provider detail'), false);
   assert.ok(h.logs.some((entry) => entry.message.includes('continuing without it')));
 });
@@ -293,7 +294,7 @@ test('a provider with a desktop but a runner with no handoff is a loud failure t
   assert.equal(h.modelCalls(), 2, h.diagnostics());
   assert.ok(!h.order.includes('startDesktop'));
   assert.ok(h.logs.some((entry) => entry.message.includes('continuing without it')));
-  assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data), [{ reason: 'error' }]);
+  assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data), [{ execution: 1, reason: 'error' }]);
 });
 
 test('a timed-out desktop start lets the build continue without screen access', async () => {
@@ -311,7 +312,7 @@ test('a timed-out desktop start lets the build continue without screen access', 
 
   assert.equal(startupSignal?.aborted, true);
   assert.equal(h.modelCalls(), 2, h.diagnostics());
-  assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data), [{ reason: 'error' }]);
+  assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data), [{ execution: 1, reason: 'error' }]);
   assert.ok(!h.types().includes('desktop.ready'));
 });
 
@@ -378,7 +379,7 @@ test('a handoff that does not settle is covered by the desktop startup deadline'
   assert.equal(h.handoffCalls[0]?.call, 'publish');
   assert.deepEqual(
     h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data),
-    [{ reason: 'error' }],
+    [{ execution: 1, reason: 'error' }],
   );
 });
 
@@ -396,7 +397,7 @@ test('a handoff that completes after the startup deadline is withdrawn without a
   assert.equal(h.modelCalls(), 2, h.diagnostics());
   assert.deepEqual(
     h.emitted.filter((event) => event.type === 'desktop.ended').map((event) => event.data),
-    [{ reason: 'error' }],
+    [{ execution: 1, reason: 'error' }],
   );
   assert.ok(!h.types().includes('desktop.ready'));
   assert.deepEqual(h.handoffCalls.map((call) => call.call), ['publish']);
@@ -460,5 +461,5 @@ test('cancelling while the desktop starts stops the build instead of being swall
 
   assert.equal(h.modelCalls(), 1, 'a cancelled session must not go on to run the agent');
   assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended' && (event.data as { reason?: string }).reason === 'error'), []);
-  assert.ok(h.types().includes('session.failed'));
+  assert.ok(h.types().includes('session.stopped'), 'a user stop ends STOPPED, not failed');
 });

@@ -57,7 +57,7 @@ export type SessionMode = (typeof sessionModes)[number];
  * answered is waiting for the next thing the user asks, which is what makes a
  * build a conversation rather than a job.
  */
-export const buildSessionStatuses = ['QUEUED', 'RUNNING', 'IDLE', 'FAILED'] as const;
+export const buildSessionStatuses = ['QUEUED', 'RUNNING', 'IDLE', 'STOPPED', 'FAILED'] as const;
 export type BuildSessionStatus = (typeof buildSessionStatuses)[number];
 
 function isActiveSessionStatus(status: BuildSessionStatus): status is 'QUEUED' | 'RUNNING' {
@@ -118,7 +118,16 @@ export interface BuildSession {
   readonly leaseToken: string | undefined;
   readonly heartbeatAt: Date | undefined;
   readonly error: string | undefined;
+  /**
+   * Which run of this session is current (or was last). Starts at 1 and rises
+   * by one every time a run starts, so an outcome, a Stop and every journaled
+   * event name the run they belong to. Documents written before runs were
+   * numbered read as run 1.
+   */
+  readonly execution: number;
   readonly cancelRequested?: boolean | undefined;
+  /** When the user asked the current run to stop; cleared when the run ends. */
+  readonly cancelRequestedAt?: Date | undefined;
   readonly pendingInput?: PendingInput | undefined;
   readonly fallback?: FallbackState | undefined;
   readonly inputContext?: string | undefined;
@@ -185,6 +194,17 @@ export interface SteerMessage {
   readonly attachments: readonly AttachmentRef[];
 }
 
+function assertSameExecution(current: BuildSession, expectedExecution: number | undefined): void {
+  if (expectedExecution !== undefined && current.execution !== expectedExecution) {
+    throw new AppError({
+      code: 'session/execution-changed',
+      statusCode: 409,
+      message: 'A newer run has started since this Stop was requested, so it was not applied.',
+      details: { execution: current.execution, requested: expectedExecution },
+    });
+  }
+}
+
 export interface QueuedMessage {
   readonly id: string;
   readonly sessionId: string;
@@ -247,6 +267,8 @@ function parseSession(id: string, fields: Fields, where: string): BuildSession {
     leaseToken: optionalStringField(fields, 'leaseToken'),
     heartbeatAt: optionalTimestampField(fields, 'heartbeatAt', where),
     error: optionalStringField(fields, 'error'),
+    execution: fields['execution'] === undefined ? 1 : integerField(fields, 'execution', where, { min: 1 }),
+    cancelRequestedAt: optionalTimestampField(fields, 'cancelRequestedAt', where),
     pendingInput: parsePendingInput(fields['pendingInput']),
     inputContext: optionalStringField(fields, 'inputContext'),
     fallback: parseFallbackState(fields['fallback']),
@@ -349,6 +371,7 @@ export type NewSession = {
 /** What a runner reports when it stops working on a session. */
 export type SessionOutcome =
   | { readonly status: 'IDLE' }
+  | { readonly status: 'STOPPED' }
   | { readonly status: 'FAILED'; readonly error: string; readonly fallback?: FallbackState };
 
 export class SessionRepository {
@@ -486,6 +509,7 @@ export class SessionRepository {
         effort,
         mode,
         messageCount: voice ? 0 : 1,
+        execution: 1,
         // The single field a runner queries on. See `claim`.
         ...(voice ? {} : { claimableAt: Timestamp.fromDate(now) }),
         createdAt: FieldValue.serverTimestamp(),
@@ -517,6 +541,7 @@ export class SessionRepository {
       error: undefined,
       reservationIds: [],
       specialistReservationIds: [],
+      execution: 1,
       messageCount: voice ? 0 : 1,
       createdAt: now,
     };
@@ -745,9 +770,9 @@ export class SessionRepository {
         role: 'user', content, ...attachmentsField(attachments), createdAt: FieldValue.serverTimestamp(),
       });
       transaction.update(ref, { status: 'QUEUED', ...(mode === undefined ? {} : { mode }), pendingInput: FieldValue.delete(), inputContext: FieldValue.delete(), fallback: FieldValue.delete(), executionStarted: FieldValue.delete(), messageCount: FieldValue.increment(1), claimableAt: Timestamp.fromDate(now),
-        cancelRequested: FieldValue.delete(), error: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() });
+        execution: current.execution + 1, cancelRequested: FieldValue.delete(), cancelRequestedAt: FieldValue.delete(), error: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() });
       transaction.update(this.#projects.refFor(current.projectId), { activeSessionId: current.id, updatedAt: FieldValue.serverTimestamp() });
-      return { kind: 'prompt', session: { ...current, status: 'QUEUED', ...(mode === undefined ? {} : { mode }), pendingInput: undefined, inputContext: undefined, fallback: undefined, executionStarted: undefined, error: undefined, cancelRequested: undefined, messageCount: current.messageCount + 1 } };
+      return { kind: 'prompt', session: { ...current, status: 'QUEUED', ...(mode === undefined ? {} : { mode }), pendingInput: undefined, inputContext: undefined, fallback: undefined, executionStarted: undefined, error: undefined, cancelRequested: undefined, cancelRequestedAt: undefined, execution: current.execution + 1, messageCount: current.messageCount + 1 } };
     } });
     return accepted.kind === 'prompt' ? reconciledCommand(accepted, { ...accepted, session: await this.readOwned(uid, sessionId) }) : accepted;
 
@@ -807,7 +832,7 @@ export class SessionRepository {
    * Dequeues the next message in the queue under the runner's lease,
    * charges the build quota, and appends it to the messages collection.
    */
-  async dequeueNextMessage(sessionId: string, authority: SessionLease, signal?: AbortSignal): Promise<QueuedMessage | undefined> {
+  async dequeueNextMessage(sessionId: string, authority: SessionLease, signal?: AbortSignal): Promise<(QueuedMessage & { readonly execution: number }) | undefined> {
     signal?.throwIfAborted();
     const ref = this.#ref(sessionId);
     const now = new Date();
@@ -842,11 +867,13 @@ export class SessionRepository {
         createdAt: FieldValue.serverTimestamp(),
       });
       transaction.delete(nextDoc.ref);
+      // A hot-chained message is a new run in the same claim.
       transaction.update(ref, {
         messageCount: FieldValue.increment(1),
+        execution: session.execution + 1,
         updatedAt: FieldValue.serverTimestamp(),
       });
-      return nextData;
+      return { ...nextData, execution: session.execution + 1 };
     });
   }
 
@@ -898,7 +925,8 @@ export class SessionRepository {
   }
 
   /** Start work accepted during finalization, after claiming and recovering old resources. */
-  async startPendingTurn(sessionId: string, authority: SessionLease, signal?: AbortSignal): Promise<boolean> {
+  /** Starts the turn queued behind an ended run; resolves to the run number it starts, or undefined when nothing is left to start. */
+  async startPendingTurn(sessionId: string, authority: SessionLease, signal?: AbortSignal): Promise<number | undefined> {
     signal?.throwIfAborted();
     const ref = this.#ref(sessionId);
     return this.#firestore.runTransaction(async (transaction) => {
@@ -910,7 +938,7 @@ export class SessionRepository {
         ? { prompt: session.pendingSteer, attachments: session.pendingSteerAttachments ?? [] }
         : next === undefined ? undefined : parseQueuedMessage(next.id, sessionId, next.data(), next.ref.path);
       const prompt = pending?.prompt;
-      if (prompt === undefined) return false; // The owner removed the last queued message.
+      if (prompt === undefined) return undefined; // The owner removed the last queued message.
       const entitlements = await this.#entitlements.forUser(session.ownerUid);
       const project = await this.#projects.readOwnedInTransaction(transaction, session.ownerUid, session.projectId);
       assertBuildAllowed(entitlements, project.platform, session.model);
@@ -926,9 +954,8 @@ export class SessionRepository {
         role: 'user', content: prompt, ...attachmentsField(pending?.attachments ?? []), createdAt: FieldValue.serverTimestamp(),
       });
       transaction.update(ref, { queuedTurnPending: FieldValue.delete(), fallback: FieldValue.delete(), pendingSteer: FieldValue.delete(),
-
-        messageCount: FieldValue.increment(1), updatedAt: FieldValue.serverTimestamp() });
-      return true;
+        execution: session.execution + 1, messageCount: FieldValue.increment(1), updatedAt: FieldValue.serverTimestamp() });
+      return session.execution + 1;
     });
   }
 
@@ -940,9 +967,14 @@ export class SessionRepository {
    * claimableAt is deleted so no runner will claim it. A prepaid turn is refunded;
    * late follow-ups awaiting admission have no new charge to refund.
    * If the session is RUNNING, cancelRequested is set to true so the active runner halts on its
-   * next step, tears down resources, and transitions the session to FAILED.
+   * next step, tears down resources, and transitions the session to STOPPED.
+   *
+   * `expectedExecution` names the run the user was looking at. A Stop that
+   * reaches the server after a newer run has started is refused rather than
+   * applied to the run it was never aimed at; the idempotency receipt alone
+   * cannot tell those apart.
    */
-  async cancel(uid: string, sessionId: string, commandId?: string | Mutation<BuildSession>): Promise<BuildSession> {
+  async cancel(uid: string, sessionId: string, commandId?: string | Mutation<BuildSession>, expectedExecution?: number): Promise<BuildSession> {
 
     const session = await this.readOwned(uid, sessionId);
     const entitlements = await this.#entitlements.forUser(uid);
@@ -950,8 +982,11 @@ export class SessionRepository {
     const ref = this.#ref(sessionId);
     const now = new Date();
 
-    const accepted = await commandTransaction({ db: this.#firestore, parent: ref, uid, key: commandId, input: ['cancel'], decode: async (_value, transaction) => {
+    const accepted = await commandTransaction({ db: this.#firestore, parent: ref, uid, key: commandId, input: ['cancel', expectedExecution ?? null], decode: async (_value, transaction) => {
       const snapshot = await transaction.get(ref); const current = parseSession(sessionId, snapshot.data() ?? {}, ref.path);
+      // A replayed receipt is read against the run it was aimed at too: a retry
+      // that lands after a newer run started must not report that run as stopped.
+      assertSameExecution(current, expectedExecution);
       await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId, true); return current;
     }, work: async (transaction) => {
       const snapshot = await transaction.get(ref);
@@ -972,15 +1007,16 @@ export class SessionRepository {
       }
 
       const project = await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId, true);
+      assertSameExecution(current, expectedExecution);
       if (current.status === 'IDLE' && (current.pendingInput !== undefined || (current.fallback !== undefined && current.fallback.status !== 'COMPLETED'))) {
         await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId);
         transaction.delete(ref.collection('continuations').doc('active'));
         if (current.pendingInput !== undefined) transaction.update(ref.collection('input_requests').doc(current.pendingInput.id), { cancelledAt: FieldValue.serverTimestamp() });
-        transaction.update(ref, { status: 'FAILED', error: 'Cancelled by user', discardQueuedBefore: FieldValue.serverTimestamp(), pendingInput: FieldValue.delete(), fallback: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() });
-        return { ...current, status: 'FAILED' as const, error: 'Cancelled by user', pendingInput: undefined };
+        transaction.update(ref, { status: 'STOPPED', error: FieldValue.delete(), discardQueuedBefore: FieldValue.serverTimestamp(), pendingInput: FieldValue.delete(), fallback: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() });
+        return { ...current, status: 'STOPPED' as const, error: undefined, pendingInput: undefined };
       }
 
-      if (current.status === 'IDLE' || current.status === 'FAILED') {
+      if (current.status === 'IDLE' || current.status === 'STOPPED' || current.status === 'FAILED') {
         throw new AppError({
           code: 'session/not-cancellable',
           statusCode: 409,
@@ -1004,9 +1040,9 @@ export class SessionRepository {
 
         transaction.delete(ref.collection('continuations').doc('active'));
         transaction.update(ref, {
-          status: 'FAILED',
+          status: 'STOPPED',
           discardQueuedBefore: FieldValue.serverTimestamp(),
-          error: 'Cancelled by user',
+          error: FieldValue.delete(),
           leaseToken: FieldValue.delete(),
           claimableAt: FieldValue.delete(),
           fallbackClaimableAt: FieldValue.delete(),
@@ -1022,8 +1058,8 @@ export class SessionRepository {
 
         const result = {
           ...current,
-          status: 'FAILED' as const,
-          error: 'Cancelled by user',
+          status: 'STOPPED' as const,
+          error: undefined,
           cancelRequested: undefined,
         };
         return result;
@@ -1036,14 +1072,18 @@ export class SessionRepository {
       // now, so the next recovery pass finishes it within seconds.
       const leaseAlive = current.claimedBy !== undefined && current.heartbeatAt !== undefined
         && current.heartbeatAt.getTime() > now.getTime() - this.#leaseSeconds * 1000;
+      // The first Stop keeps its timestamp: stop latency is measured from the
+      // moment the user asked, and a repeated Stop does not restart the clock.
+      const cancelRequestedAt = current.cancelRequestedAt ?? now;
       transaction.update(ref, {
         cancelRequested: true,
+        cancelRequestedAt: Timestamp.fromDate(cancelRequestedAt),
         discardQueuedBefore: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
         ...(leaseAlive ? {} : { claimableAt: Timestamp.fromDate(now), recoveryAttempts: FieldValue.delete() }),
       });
 
-      return { ...current, cancelRequested: true };
+      return { ...current, cancelRequested: true, cancelRequestedAt };
     } });
     return reconciledCommand(accepted, await this.readOwned(uid, sessionId));
 
@@ -1623,7 +1663,11 @@ export class SessionRepository {
     let retryAt = now;
     await this.#withLease(sessionId, authority, (transaction, ref, session) => {
       const attempts = (session.recoveryAttempts ?? 0) + 1;
-      const waitSeconds = Math.min(this.#leaseSeconds * 2 ** Math.min(attempts, 10), RECOVERY_RETRY_CAP_SECONDS);
+      // A session the user stopped is retried every lease, never on the doubling
+      // schedule: the user is watching "Stopping" and must not wait out an hour.
+      // Each attempt is still one bounded try, counted and logged by the caller.
+      const waitSeconds = session.cancelRequested === true ? this.#leaseSeconds
+        : Math.min(this.#leaseSeconds * 2 ** Math.min(attempts, 10), RECOVERY_RETRY_CAP_SECONDS);
       retryAt = new Date(now.getTime() + waitSeconds * 1000);
       transaction.update(ref, {
         recoveryAttempts: attempts,
@@ -1666,11 +1710,13 @@ export class SessionRepository {
     authority: SessionLease,
     outcome: SessionOutcome,
     now: Date = new Date(),
-  ): Promise<'IDLE' | 'FAILED' | 'QUEUED'> {
+  ): Promise<'IDLE' | 'STOPPED' | 'FAILED' | 'QUEUED'> {
     const ref = this.#ref(sessionId);
     return this.#firestore.runTransaction(async (transaction) => {
       const { session, project } = await this.#requireLeaseState(transaction, ref, authority, true);
       if (session.workspaceRecovery?.status === 'REQUIRED') throw new Error('Unsaved workspace prevents finalization.');
+      // STOPPED is the user's doing, and only the user's: without their request it is not an outcome.
+      if (outcome.status === 'STOPPED' && session.cancelRequested !== true) throw new Error('A session finishes STOPPED only after the user asked it to stop.');
       if (session.cancelRequested === true && outcome.status === 'IDLE') {
         throw new AppError({
           code: 'session/cancelled',
@@ -1707,7 +1753,7 @@ export class SessionRepository {
         status,
         lastFinishedLeaseToken: authority.token,
         ...(outcome.status === 'FAILED' && outcome.fallback !== undefined ? { fallback: outcome.fallback } : {}),
-        ...(continuationQueued(session) && !(outcome.status === 'FAILED' && outcome.fallback !== undefined) ? { fallback: { ...session.fallback, status: outcome.status === 'IDLE' ? 'COMPLETED' : 'UNAVAILABLE', resumable: false, reason: outcome.status === 'IDLE' ? 'The continuation ended within its execution budget.' : outcome.error } } : {}),
+        ...(continuationQueued(session) && !(outcome.status === 'FAILED' && outcome.fallback !== undefined) ? { fallback: { ...session.fallback, status: outcome.status === 'IDLE' ? 'COMPLETED' : 'UNAVAILABLE', resumable: false, reason: outcome.status === 'IDLE' ? 'The continuation ended within its execution budget.' : outcome.status === 'STOPPED' ? 'Stopped by user.' : outcome.error } } : {}),
         executionStarted: FieldValue.delete(),
         inputContext: session.pendingInput === undefined ? FieldValue.delete() : inputContext(project, session),
         error: outcome.status === 'FAILED' ? outcome.error : FieldValue.delete(),
@@ -1716,6 +1762,8 @@ export class SessionRepository {
         claimableAt: pending ? Timestamp.fromDate(now) : FieldValue.delete(),
         queuedTurnPending: pending ? true : FieldValue.delete(),
         ...(!pending ? { pendingSteer: FieldValue.delete() } : {}),
+        // The run is over, so its Stop request is spent with it.
+        ...(outcome.status === 'IDLE' ? {} : { cancelRequested: FieldValue.delete(), cancelRequestedAt: FieldValue.delete() }),
         specialistReservationIds: FieldValue.delete(),
         updatedAt: FieldValue.serverTimestamp(),
       });
