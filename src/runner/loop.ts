@@ -1,4 +1,4 @@
-import { timingContext, timed, observeMethods, timingTraceId, startTiming } from '../diagnostics/timing.ts';
+import { timingContext, timed, observeMethods, timingTraceId, startTiming, summarizeTimings, type TimingRecord, type TimingSummary } from '../diagnostics/timing.ts';
 import { ContinuationPause, serializeCheckpoint, type ContinuationCheckpoint } from './continuation.ts';
 import { requireFallbackPolicy, tokenLimit, verifyFallbackModel, quotaMetadata as quotaDescription, type FallbackState, type FallbackOffer } from '../sessions/fallback.ts';
 import type { Registry } from '../entitlements/schema.ts';
@@ -37,7 +37,18 @@ import {
 
 /** Safe primary/secondary categories; never retain raw provider payloads or stderr. */
 /** A claimed session whose work is in flight. */
-export interface ClaimedWork { readonly done: Promise<void>; }
+export interface ClaimedWork { readonly sessionId: string; readonly done: Promise<void>; }
+
+/** What the run did with machines, read off its own stage records rather than tracked separately. */
+export function environmentSummary(stages: TimingSummary): { sandboxes: number; desktop: 'none' | 'ready' | 'failed'; restored: boolean; saved: boolean; released: boolean } {
+  const ok = (stage: keyof TimingSummary) => { const entry = stages[stage]; return entry !== undefined && entry.count > entry.failed; };
+  const desktop = stages['desktop.start'];
+  return {
+    sandboxes: stages['sandbox.acquire']?.count ?? 0,
+    desktop: desktop === undefined ? 'none' : desktop.count > desktop.failed ? 'ready' : 'failed',
+    restored: ok('workspace.restore'), saved: ok('workspace.save'), released: ok('sandbox.release'),
+  };
+}
 
 export class RunnerWorkError extends AggregateError {
   readonly primaryCategory: string;
@@ -244,6 +255,7 @@ export class SessionRunner {
   ): Promise<boolean> {
     const settings = acquired.provider.desktop;
     if (settings === undefined) return false;
+    const endTiming = startTiming('desktop.start');
     try {
       const handoff = this.#deps.desktop;
       if (handoff === undefined) throw new Error('The runner has no desktop handoff configured.');
@@ -273,12 +285,14 @@ export class SessionRunner {
       try {
         await Promise.race([startAndPublish(), aborted]);
         this.#desktops.add(session.id);
+        endTiming();
         await publish('desktop.ready', { width: settings.width, height: settings.height });
         return true;
       } finally {
         if (onAbort !== undefined) startupSignal.removeEventListener('abort', onAbort);
       }
     } catch (error) {
+      endTiming(false);
       signal.throwIfAborted();
       desktopAbort.throwIfAborted();
       this.#deps.log.error(
@@ -324,11 +338,24 @@ export class SessionRunner {
    * promise: a promise returned through async code would be awaited flat.)
    */
   async start(shutdown?: AbortSignal): Promise<ClaimedWork | undefined> {
-    const debug = this.#deps.log.debug;
-    if (debug === undefined) return this.#start(shutdown);
-    return timingContext((timing) => debug.call(this.#deps.log, { timing }, 'phase timing'), async () => {
+    const { log } = this.#deps;
+    const records: TimingRecord[] = [];
+    return timingContext((timing) => { records.push(timing); log.debug?.call(log, { timing }, 'phase timing'); }, async () => {
       const claimed = await this.#start(shutdown);
-      return claimed === undefined ? undefined : { done: timed('runner.total', () => claimed.done) };
+      if (claimed === undefined) return undefined;
+      const traceId = timingTraceId();
+      const started = Date.now();
+      // One line per run at info level, so production can answer "how long did
+      // each part take" without debug logging: the per-stage records above are
+      // folded, and the machine-level facts are read off them.
+      const summarize = (outcome: 'completed' | 'failed') => {
+        try {
+          const stages = summarizeTimings(records);
+          log.info({ sessionId: claimed.sessionId, timingTraceId: traceId, outcome, durationMs: Date.now() - started, stages, environment: environmentSummary(stages) }, 'run summary');
+        } catch { /* Diagnostics never fail a run. */ }
+      };
+      const done = timed('runner.total', () => claimed.done).then(() => summarize('completed'), (error: unknown) => { summarize('failed'); throw error; });
+      return { sessionId: claimed.sessionId, done };
     });
   }
 
@@ -343,7 +370,8 @@ export class SessionRunner {
     const done = this.#work(session, shutdown).catch((error: unknown) => {
       throw error instanceof RunnerWorkError ? error : new RunnerWorkError(error, 'runner/work-failed');
     });
-    return { done };
+    const sessionId = session.id;
+    return { sessionId, done };
   }
 
   async #work(session: ClaimedSession, shutdown?: AbortSignal): Promise<void> {

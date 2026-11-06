@@ -503,3 +503,15 @@ test('a pending turn runs as the next numbered run, and every event it writes na
   assert.ok(h.journal.length >= 2);
   assert.deepEqual(h.journal.filter((event) => event.data['execution'] !== 2).map((event) => event.type), [], 'no event of the new turn carries the old run number');
 });
+
+test('every run ends with one info-level summary of its stages and machine use', async () => {
+  const h = runnerFixture('reply');
+  await h.runner.runOnce();
+  const summaries = h.logs.filter((entry) => entry.message === 'run summary');
+  assert.equal(summaries.length, 1);
+  const details = summaries[0]!.details as { sessionId: string; outcome: string; durationMs: number; stages: Record<string, { count: number }>; environment: { sandboxes: number; desktop: string } };
+  assert.equal(details.sessionId, 's'); assert.equal(details.outcome, 'completed'); assert.ok(details.durationMs >= 0);
+  assert.ok((details.stages['runner.total']?.count ?? 0) >= 1, 'the whole run is one stage');
+  assert.deepEqual({ sandboxes: details.environment.sandboxes, desktop: details.environment.desktop }, { sandboxes: 0, desktop: 'none' }, 'a reply without tools used no machine');
+  assert.doesNotMatch(JSON.stringify(details), /secret|bearer|password/i);
+});

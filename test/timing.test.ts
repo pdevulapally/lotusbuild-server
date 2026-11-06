@@ -24,3 +24,20 @@ test('timing preserves receivers, results and original failures even when its si
     await assert.rejects(timed('session.read', async () => { throw failure; }), error => error === failure);
   });
 });
+
+test('a run summary folds stage records and reads machine facts off them', async () => {
+  const { summarizeTimings } = await import('../src/diagnostics/timing.ts');
+  const { environmentSummary } = await import('../src/runner/loop.ts');
+  const row = (stage: TimingRecord['stage'], durationMs: number, ok = true): TimingRecord => ({ traceId: 't', stage, startMs: 0, durationMs, ok });
+  const stages = summarizeTimings([
+    row('sandbox.acquire', 1200.5), row('workspace.restore', 300), row('tool.execute', 10), row('tool.execute', 20.25, false),
+    row('desktop.start', 4000, false), row('workspace.save', 500), row('sandbox.release', 100),
+  ]);
+  assert.deepEqual(stages['tool.execute'], { count: 2, totalMs: 30.25, failed: 1 });
+  assert.deepEqual(stages['sandbox.acquire'], { count: 1, totalMs: 1200.5, failed: 0 });
+  assert.equal(stages['model.generation'], undefined);
+  assert.deepEqual(environmentSummary(stages), { sandboxes: 1, desktop: 'failed', restored: true, saved: true, released: true });
+  assert.deepEqual(environmentSummary(summarizeTimings([])), { sandboxes: 0, desktop: 'none', restored: false, saved: false, released: false });
+  assert.deepEqual(environmentSummary(summarizeTimings([row('sandbox.acquire', 1), row('desktop.start', 1), row('workspace.save', 1, false)])).desktop, 'ready');
+  assert.equal(environmentSummary(summarizeTimings([row('workspace.save', 1, false)])).saved, false);
+});
