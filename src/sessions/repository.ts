@@ -1030,10 +1030,17 @@ export class SessionRepository {
       }
 
       transaction.delete(ref.collection('continuations').doc('active'));
+      // A worker that still holds the lease aborts on the cancel notification.
+      // One whose heartbeat has lapsed is gone, and the user must not wait out
+      // its recovery back-off to see the session end: it becomes claimable
+      // now, so the next recovery pass finishes it within seconds.
+      const leaseAlive = current.claimedBy !== undefined && current.heartbeatAt !== undefined
+        && current.heartbeatAt.getTime() > now.getTime() - this.#leaseSeconds * 1000;
       transaction.update(ref, {
         cancelRequested: true,
         discardQueuedBefore: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
+        ...(leaseAlive ? {} : { claimableAt: Timestamp.fromDate(now), recoveryAttempts: FieldValue.delete() }),
       });
 
       return { ...current, cancelRequested: true };

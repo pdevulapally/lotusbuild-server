@@ -332,3 +332,29 @@ test('private working context is durably owned and fenced by the existing sessio
   await assert.rejects(h.sessions.saveTaskContext({...authority,token:'stale'},tracker.state));
   assert.deepEqual((await h.sessions.readOwned('u',session.id)).taskContext,tracker.state);
 });
+
+test('cancelling a session whose worker stopped heartbeating makes it claimable now instead of after its recovery back-off', async () => {
+  const h = fixture();
+  const session = await h.create('p-dead');
+  const claimed = await h.sessions.claim('worker'); assert.equal(claimed?.id, session.id);
+  const record = h.data.get(`sessions/${session.id}`)!;
+  record['heartbeatAt'] = Timestamp.fromMillis(Date.now() - 5 * 60_000);
+  record['claimableAt'] = Timestamp.fromMillis(Date.now() + 50 * 60_000);
+  record['recoveryAttempts'] = 3;
+  const cancelled = await h.sessions.cancel('u', session.id);
+  assert.equal(cancelled.cancelRequested, true);
+  assert.equal(cancelled.status, 'RUNNING');
+  const after = h.data.get(`sessions/${session.id}`)!;
+  assert.ok((after['claimableAt'] as Timestamp).toMillis() <= Date.now(), 'the dead session is claimable immediately');
+  assert.equal(after['recoveryAttempts'], undefined);
+});
+
+test('cancelling a session whose worker is alive leaves its lease alone', async () => {
+  const h = fixture();
+  const session = await h.create('p-live');
+  const claimed = await h.sessions.claim('worker'); assert.equal(claimed?.id, session.id);
+  const before = (h.data.get(`sessions/${session.id}`)!['claimableAt'] as Timestamp).toMillis();
+  const cancelled = await h.sessions.cancel('u', session.id);
+  assert.equal(cancelled.cancelRequested, true);
+  assert.equal((h.data.get(`sessions/${session.id}`)!['claimableAt'] as Timestamp).toMillis(), before);
+});

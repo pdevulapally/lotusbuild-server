@@ -891,8 +891,8 @@ export class MeteringService {
    * pressed Stop) before the provider reported usage. The provider will never
    * report it now, so the hold settles at the amount it reserved: the user is
    * never under-charged, the amount is bounded by what admission approved, and
-   * the session can finish instead of waiting forever. Only the caller that
-   * did the cutting may decide this; recovery still closes recorded usage only.
+   * the session can finish instead of waiting forever. Two callers may decide this: the runner that did the cutting, and
+   * recovery once it has proven the dispatching worker is gone (see `reconcile`).
    * Resource holds and holds on any other meter are refused.
    */
   async settleUnobserved(uid: string, id: string, now: Date = new Date()): Promise<boolean> {
