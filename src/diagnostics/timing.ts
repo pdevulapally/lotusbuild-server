@@ -9,7 +9,7 @@ export type TimingStage = 'http.total' | 'auth.verify' | 'configuration.get' | '
   'session.read' | 'session.admit' | 'session.claim' | 'session.finish' | 'project.read' | 'project.list' |
   'runner.total' | 'runner.maintenance' | 'runner.claim_to_model_step' | 'sandbox.acquire' | 'sandbox.release' | 'workspace.restore' | 'workspace.save' |
   'model.admission' | 'model.count_tokens' | 'model.first_text' | 'model.first_delta' | 'model.generation' | 'model.settle' |
-  'tool.execute' | 'tool.computer' | 'events.append' | 'events.replay' | 'sse.socket_write';
+  'tool.execute' | 'tool.computer' | 'events.append' | 'events.replay' | 'sse.socket_write' | 'desktop.start';
 export interface TimingRecord { traceId: string; stage: TimingStage; startMs: number; durationMs: number; ok: boolean }
 export type TimingSink = (record: TimingRecord) => void;
 interface Context { traceId: string; start: number; sink: TimingSink }
@@ -40,6 +40,17 @@ export function observeMethods<T extends object>(target: T, stages: Partial<Reco
     const stage = stages[key as keyof T];
     return (...args: unknown[]) => stage === undefined ? Reflect.apply(value, object, args) : timed(stage, () => Reflect.apply(value, object, args) as Promise<unknown>);
   } });
+}
+/** One run's stages folded together: how many times, how long in total, how many failed. */
+export type TimingSummary = Partial<Record<TimingStage, { count: number; totalMs: number; failed: number }>>;
+export function summarizeTimings(records: readonly TimingRecord[]): TimingSummary {
+  const summary: TimingSummary = {};
+  for (const record of records) {
+    const entry = summary[record.stage] ?? { count: 0, totalMs: 0, failed: 0 };
+    entry.count += 1; entry.totalMs = +(entry.totalMs + record.durationMs).toFixed(3); if (!record.ok) entry.failed += 1;
+    summary[record.stage] = entry;
+  }
+  return summary;
 }
 export function installHttpTimings(app: FastifyInstance, sink: TimingSink): void {
   const ends = new WeakMap<object, (ok?: boolean) => void>();

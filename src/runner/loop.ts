@@ -1,4 +1,4 @@
-import { timingContext, timed, observeMethods, timingTraceId, startTiming } from '../diagnostics/timing.ts';
+import { timingContext, timed, observeMethods, timingTraceId, startTiming, summarizeTimings, type TimingRecord, type TimingSummary } from '../diagnostics/timing.ts';
 import { ContinuationPause, serializeCheckpoint, type ContinuationCheckpoint } from './continuation.ts';
 import { requireFallbackPolicy, tokenLimit, verifyFallbackModel, quotaMetadata as quotaDescription, type FallbackState, type FallbackOffer } from '../sessions/fallback.ts';
 import type { Registry } from '../entitlements/schema.ts';
@@ -37,7 +37,34 @@ import {
 
 /** Safe primary/secondary categories; never retain raw provider payloads or stderr. */
 /** A claimed session whose work is in flight. */
-export interface ClaimedWork { readonly done: Promise<void>; }
+export interface ClaimedWork { readonly sessionId: string; readonly done: Promise<void>; }
+
+/** Folds the stage records of one execution into one info line; `end` is idempotent so the claim's final flush never double-logs. */
+export class RunSummary {
+  readonly #records: TimingRecord[];
+  readonly #emit: (fields: Record<string, unknown>) => void;
+  #open: { sessionId: string; execution: number; startedAt: number } | undefined;
+  constructor(records: TimingRecord[], emit: (fields: Record<string, unknown>) => void) { this.#records = records; this.#emit = emit; }
+  begin(sessionId: string, execution: number): void { this.#open = { sessionId, execution, startedAt: Date.now() }; }
+  end(outcome: 'completed' | 'stopped' | 'failed'): void {
+    const open = this.#open; if (open === undefined) return; this.#open = undefined;
+    try {
+      const stages = summarizeTimings(this.#records.splice(0));
+      this.#emit({ sessionId: open.sessionId, execution: open.execution, timingTraceId: timingTraceId(), outcome, durationMs: Date.now() - open.startedAt, stages, environment: environmentSummary(stages) });
+    } catch { /* Diagnostics never fail a run. */ }
+  }
+}
+
+/** What the run did with machines, read off its own stage records rather than tracked separately. */
+export function environmentSummary(stages: TimingSummary): { sandboxes: number; desktop: 'none' | 'ready' | 'failed'; restored: boolean; saved: boolean; released: boolean } {
+  const ok = (stage: keyof TimingSummary) => { const entry = stages[stage]; return entry !== undefined && entry.count > entry.failed; };
+  const desktop = stages['desktop.start'];
+  return {
+    sandboxes: stages['sandbox.acquire']?.count ?? 0,
+    desktop: desktop === undefined ? 'none' : desktop.count > desktop.failed ? 'ready' : 'failed',
+    restored: ok('workspace.restore'), saved: ok('workspace.save'), released: ok('sandbox.release'),
+  };
+}
 
 export class RunnerWorkError extends AggregateError {
   readonly primaryCategory: string;
@@ -244,6 +271,7 @@ export class SessionRunner {
   ): Promise<boolean> {
     const settings = acquired.provider.desktop;
     if (settings === undefined) return false;
+    const endTiming = startTiming('desktop.start');
     try {
       const handoff = this.#deps.desktop;
       if (handoff === undefined) throw new Error('The runner has no desktop handoff configured.');
@@ -273,12 +301,14 @@ export class SessionRunner {
       try {
         await Promise.race([startAndPublish(), aborted]);
         this.#desktops.add(session.id);
+        endTiming();
         await publish('desktop.ready', { width: settings.width, height: settings.height });
         return true;
       } finally {
         if (onAbort !== undefined) startupSignal.removeEventListener('abort', onAbort);
       }
     } catch (error) {
+      endTiming(false);
       signal.throwIfAborted();
       desktopAbort.throwIfAborted();
       this.#deps.log.error(
@@ -324,15 +354,23 @@ export class SessionRunner {
    * promise: a promise returned through async code would be awaited flat.)
    */
   async start(shutdown?: AbortSignal): Promise<ClaimedWork | undefined> {
-    const debug = this.#deps.log.debug;
-    if (debug === undefined) return this.#start(shutdown);
-    return timingContext((timing) => debug.call(this.#deps.log, { timing }, 'phase timing'), async () => {
-      const claimed = await this.#start(shutdown);
-      return claimed === undefined ? undefined : { done: timed('runner.total', () => claimed.done) };
+    const { log } = this.#deps;
+    const records: TimingRecord[] = [];
+    return timingContext((timing) => { records.push(timing); log.debug?.call(log, { timing }, 'phase timing'); }, async () => {
+      // One line per execution at info level, so production can answer "how long
+      // did each part take" without debug logging: the stage records since the
+      // previous execution ended are folded, and machine facts are read off them.
+      // A claim can run several executions (hot-chained turns), so the work
+      // reports each boundary; whatever is left when the claim ends is the last one.
+      const summary = new RunSummary(records, (fields) => log.info(fields, 'run summary'));
+      const claimed = await this.#start(shutdown, summary);
+      if (claimed === undefined) return undefined;
+      const done = timed('runner.total', () => claimed.done).then(() => summary.end('completed'), (error: unknown) => { summary.end('failed'); throw error; });
+      return { sessionId: claimed.sessionId, done };
     });
   }
 
-  async #start(shutdown?: AbortSignal): Promise<ClaimedWork | undefined> {
+  async #start(shutdown?: AbortSignal, summary?: RunSummary): Promise<ClaimedWork | undefined> {
     if (shutdown?.aborted) return undefined;
     const session = await this.#deps.sessions.claim(this.#deps.runnerId, new Date(), shutdown);
     if (session === undefined) {
@@ -340,13 +378,15 @@ export class SessionRunner {
     }
 
     this.#deps.log.info({ sessionId: session.id, uid: session.ownerUid, timingTraceId: timingTraceId() }, 'claimed a session');
-    const done = this.#work(session, shutdown).catch((error: unknown) => {
+    summary?.begin(session.id, session.execution);
+    const done = this.#work(session, shutdown, summary).catch((error: unknown) => {
       throw error instanceof RunnerWorkError ? error : new RunnerWorkError(error, 'runner/work-failed');
     });
-    return { done };
+    const sessionId = session.id;
+    return { sessionId, done };
   }
 
-  async #work(session: ClaimedSession, shutdown?: AbortSignal): Promise<void> {
+  async #work(session: ClaimedSession, shutdown?: AbortSignal, summary?: RunSummary): Promise<void> {
     const { sessions, sandboxes, events, log, runnerId } = this.#deps;
     const endClaimToStep = startTiming('runner.claim_to_model_step');
     const authority: SessionLease = {
@@ -635,6 +675,7 @@ export class SessionRunner {
           return;
         }
         execution = started; // The pending turn is a new run; everything from here names it.
+        summary?.begin(session.id, started);
       }
 
       await publish('session.running', {
@@ -834,7 +875,9 @@ export class SessionRunner {
       let nextQueued = registry.fallback === undefined && !isContinuation ? await sessions.dequeueNextMessage(session.id, authority, signal) : undefined;
       while (nextQueued !== undefined) {
         turnCompleted = false;
+        summary?.end('completed');
         execution = nextQueued.execution;
+        summary?.begin(session.id, execution);
         signal.throwIfAborted();
         await publish('session.queued', { queuedMessageId: nextQueued.id });
         log.info(
@@ -1050,6 +1093,7 @@ export class SessionRunner {
           await sessions.finish(session.id, authority, { status: 'STOPPED' });
           await publish('session.stopped', { ...(stopAfterMs === undefined ? {} : { stopAfterMs }) });
           log.info({ sessionId: session.id, execution, ...(stopAfterMs === undefined ? {} : { stopAfterMs }), path: session.recovered === true ? 'recovered' : 'live' }, 'session stopped');
+          summary?.end('stopped');
         } catch (cause) {
           log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(cause) }, 'could not mark the session stopped');
           throw new RunnerWorkError(error, 'session/finalization-failed');
