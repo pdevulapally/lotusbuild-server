@@ -321,6 +321,8 @@ test('user cancellation reaches the active command, saves partial work and finis
   assert.equal(h.events.includes('yield'), false);
   assert.equal(h.events.includes('dequeue'), false);
   assert.equal(h.data.get(`users/u/usage/${provider.concurrencyMeterKey}`)?.['reserved'], 0);
+  const stopped = h.logs.filter((entry) => entry.message === 'run summary').map((entry) => (entry.details as { outcome: string; execution: number }));
+  assert.deepEqual(stopped, [{ ...stopped[0], outcome: 'stopped', execution: 1 }], 'a confirmed Stop is summarised as stopped, once');
 });
 
 for (const mode of ['model', 'command', 'queue', 'save-failure'] as const) {
@@ -510,7 +512,7 @@ test('every run ends with one info-level summary of its stages and machine use',
   const summaries = h.logs.filter((entry) => entry.message === 'run summary');
   assert.equal(summaries.length, 1);
   const details = summaries[0]!.details as { sessionId: string; outcome: string; durationMs: number; stages: Record<string, { count: number }>; environment: { sandboxes: number; desktop: string } };
-  assert.equal(details.sessionId, 's'); assert.equal(details.outcome, 'completed'); assert.ok(details.durationMs >= 0);
+  assert.equal(details.sessionId, 's'); assert.equal(details.outcome, 'completed'); assert.ok(details.durationMs >= 0); assert.equal((details as { execution?: number }).execution, 1);
   assert.ok((details.stages['runner.total']?.count ?? 0) >= 1, 'the whole run is one stage');
   assert.deepEqual({ sandboxes: details.environment.sandboxes, desktop: details.environment.desktop }, { sandboxes: 0, desktop: 'none' }, 'a reply without tools used no machine');
   assert.doesNotMatch(JSON.stringify(details), /secret|bearer|password/i);
