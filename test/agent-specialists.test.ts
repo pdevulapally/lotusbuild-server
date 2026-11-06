@@ -17,7 +17,9 @@ import type {
 
 import type { Registry, SandboxProvider, SpecialistDefinition } from '../src/entitlements/schema.ts';
 import { ResolvedEntitlements, type UserEntitlements } from '../src/entitlements/service.ts';
-import type { MeteringService } from '../src/metering/service.ts';
+import type { MeteringService, Reservation } from '../src/metering/service.ts';
+import { createCallAdmission } from '../src/runner/call-admission.ts';
+import { fixtureModels } from './support/models.ts';
 import type { Project } from '../src/projects/repository.ts';
 import type { CommandOutcome, RunningSandbox } from '../src/sandboxes/provider.ts';
 import type { BuildSession } from '../src/sessions/repository.ts';
@@ -988,6 +990,46 @@ test('a normal consultation records its hold, settles once, and clears the recor
   // Taken and recorded in one step, forgotten only after the settle.
   assert.deepEqual(reservations.order, ['take:reservation-1', 'forget:reservation-1']);
   assert.equal(reservations.open.size, 0);
+});
+
+/** The real admission over recording fakes, so the holds the agent closes (or leaves open) are visible. */
+function recordedAdmission(): { events: string[]; admission: ReturnType<typeof createCallAdmission> } {
+  const events: string[] = [];
+  const admission = createCallAdmission({
+    models: fixtureModels, uid: 'user', sessionId: 'session', inputMeterKey: 'input', outputMeterKey: 'output',
+    anthropic: { messages: { countTokens: async () => ({ input_tokens: 10 }) } } as unknown as Anthropic,
+    authorize: async () => {},
+    onProblem: (_error, context) => { events.push(`problem:${context}`); },
+    reservations: {
+      take: async ({ meterKey, quantity }) => { events.push(`hold:${meterKey}:${quantity}`); return { id: meterKey } as Reservation; },
+      forget: async (id) => { events.push(`forget:${id}`); },
+    },
+    metering: {
+      markInFlight: async () => {},
+      release: async (_uid: string, id: string) => { events.push(`release:${id}`); },
+      recordObservedUsage: async () => {},
+      settle: async (input: { reservationId: string; actualQuantity: number }) => { events.push(`settle:${input.reservationId}:${input.actualQuantity}`); },
+    } as unknown as MeteringService,
+  });
+  return { events, admission };
+}
+
+test('a provider refusal before any stream event settles both holds at zero so the session can finish', async () => {
+  const { events, admission } = recordedAdmission();
+  const refusal = Object.assign(new Error('404 No endpoints found for this model.'), { status: 404 });
+  await assert.rejects(turn({ admission, script: [() => { throw refusal; }] }), /No endpoints/);
+  // Nothing was processed: both holds close at zero instead of staying open
+  // for a reconciliation that can never come.
+  assert.deepEqual(events.filter((event) => event.startsWith('settle:')), ['settle:input:0', 'settle:output:0']);
+  assert.ok(!events.some((event) => event.startsWith('problem:')), events.join(', '));
+});
+
+test('a provider failure that may have done work keeps the holds open for reconciliation', async () => {
+  const { events, admission } = recordedAdmission();
+  const failure = Object.assign(new Error('500 upstream error'), { status: 500 });
+  await assert.rejects(turn({ admission, script: [() => { throw failure; }] }), /upstream/);
+  assert.deepEqual(events.filter((event) => event.startsWith('settle:')), []);
+  assert.ok(events.includes('problem:model usage reconciliation required'), events.join(', '));
 });
 
 test('a specialist that fails normally still finalises its hold', async () => {
