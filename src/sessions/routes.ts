@@ -491,6 +491,9 @@ export function registerSessionRoutes(
         events.notifyCancelled(session.id).catch((error: unknown) => {
           request.log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'the runner was not notified of the cancellation');
         });
+        // If no worker is alive to hear that, the session was just made
+        // claimable; an idle runner picks it up now instead of on its poll.
+        wakeRunners(request.log);
       }
       return reply.code(200).send(toResponse(session));
     },
