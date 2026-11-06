@@ -486,6 +486,11 @@ export function registerSessionRoutes(
         publish(request.log, session.id, 'session.cancel_requested', {
           sessionId: session.id,
         });
+        // The runner working this session aborts on the notification instead
+        // of at its next heartbeat; a missed notification costs one heartbeat.
+        events.notifyCancelled(session.id).catch((error: unknown) => {
+          request.log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'the runner was not notified of the cancellation');
+        });
       }
       return reply.code(200).send(toResponse(session));
     },

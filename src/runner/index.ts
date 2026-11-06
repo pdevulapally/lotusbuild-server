@@ -177,6 +177,7 @@ async function main(): Promise<void> {
       config.AGENT_COMMAND_TIMEOUT_SECONDS * 1000,
     ),
     ...(repositories === undefined ? {} : { repositories }),
+    onCancelled: (sessionId, listener) => events.onCancelled(sessionId, listener),
     events,
     limits: {
       maxSteps: config.AGENT_MAX_STEPS,

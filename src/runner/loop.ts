@@ -121,6 +121,8 @@ export interface RunnerDependencies {
   readonly metering: MeteringService;
   readonly sandboxes: SandboxService;
   readonly persistence: ProjectPersistence;
+  /** Tells a working runner that its session was stopped by the user, so it aborts now; the heartbeat remains the backstop. */
+  readonly onCancelled?: (sessionId: string, listener: () => void) => Promise<() => void>;
   /** Clones and syncs linked GitHub repositories; absent when the GitHub App is not configured. */
   readonly repositories?: RepositoryWorkspaces;
   readonly events: SessionEvents;
@@ -367,6 +369,18 @@ export class SessionRunner {
       leaseLost = reason;
       cancellation.abort(reason);
     };
+    // Stop is a tap the user expects to act at once. The notification aborts
+    // the stream and any running command immediately; the heartbeat below
+    // still trips the same cancelled check if the notification never arrives.
+    const releaseCancelListener = this.#deps.onCancelled === undefined ? undefined
+      : await this.#deps.onCancelled(session.id, () => {
+        if (cancellation.signal.aborted) return;
+        log.info({ sessionId: session.id }, 'stop requested by the user');
+        stopWork(new AppError({ code: 'session/cancelled', statusCode: 409, message: 'Cancelled by user' }));
+      }).catch((error: unknown) => {
+        log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'cancel notifications unavailable; relying on the heartbeat');
+        return undefined;
+      });
     const heartbeat = setInterval(() => {
       void sessions.heartbeat(session.id, authority, new Date(), cancellation.signal.aborted).catch((error: unknown) => {
         stopWork(error instanceof Error ? error : new Error(String(error)));
@@ -1028,6 +1042,7 @@ export class SessionRunner {
     } finally {
       endClaimToStep(false);
       clearInterval(heartbeat);
+      releaseCancelListener?.();
       unsubscribeCancel?.();
       // Nothing should still be streaming by now; this is the backstop for a
       // path that left one running.
