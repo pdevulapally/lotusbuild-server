@@ -89,6 +89,18 @@ test('unknown provider create outcome retains in-flight reservations without inv
   assert.ok(h.holds.every((hold) => h.record(hold)['sandboxExternalId'] === undefined));
 });
 
+test('recovery of a dead worker settles its in-flight token hold at the estimate, but only when told the worker is gone', async () => {
+  const h = fixture();
+  const hold = await h.metering.reserve({ uid: 'u', entitlements: h.input.entitlements, meterKey: h.registry.inputTokenMeterKey, quantity: 10, operationId: 'model-input:s', now: new Date() });
+  await h.metering.markInFlight('u', [hold.id]);
+  const recovery = { ...h.recovery(), reservationIds: [hold.id] };
+  await assert.rejects(h.restarted().recover(recovery), /Recovery remains incomplete/);
+  assert.equal(h.record(hold)['status'], 'OPEN');
+  await h.restarted().recover({ ...recovery, unreportableUsage: true });
+  assert.equal(h.record(hold)['status'], 'SETTLED');
+  assert.equal(h.reserved(h.registry.inputTokenMeterKey), 0);
+});
+
 test('real E2B preparation failure records identity before mkdir and frees confirmed-stopped concurrency', async (t) => {
   const h = fixture();
   t.mock.method(Sandbox, 'create', async () => ({ sandboxId: 'vm-1', commands: { run: async () => {

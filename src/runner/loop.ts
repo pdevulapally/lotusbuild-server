@@ -517,6 +517,9 @@ export class SessionRunner {
         try {
           await sandboxes.recover({ uid: session.ownerUid, platform: project.platform,
             externalSandboxId: session.sandboxId, reservationIds: abandoned, now: new Date(),
+            // We hold this session's only lease, so whoever dispatched these
+            // holds is gone and no provider will report their usage now.
+            unreportableUsage: true,
             salvageRequired: recovery !== undefined && !['COMPLETED', 'UNRECOVERABLE'].includes(recovery.status),
             onProblem: (problem) => log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(problem) }, 'resource or usage recovery remains pending'),
           });
