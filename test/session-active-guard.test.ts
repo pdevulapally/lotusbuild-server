@@ -388,7 +388,7 @@ const capabilities = new ResolvedEntitlements(
   ]),
 );
 
-function harness(projectIds: readonly string[] = ['project-1']) {
+function harness(projectIds: readonly string[] = ['project-1'], options: { desktop?: boolean } = {}) {
   const firestore = new FakeFirestore();
   const now = Timestamp.now();
   for (const projectId of projectIds) {
@@ -415,7 +415,7 @@ function harness(projectIds: readonly string[] = ['project-1']) {
     forUser: async () => entitlementValue,
   } as unknown as EntitlementService;
   const configuration = {
-    get: async () => ({ registry: { buildMeterKey: 'builds.started' } }),
+    get: async () => ({ registry: { buildMeterKey: 'builds.started', sandboxProviders: new Map(options.desktop === false ? [] : [['web', { desktop: { width: 1280, height: 800 } }]]) } }),
   } as unknown as ConfigurationStore;
   const meterRef = firestore.doc('test-meter/user-1');
   // Reservation ledger the fake release reads, so a test can put a hold into any
@@ -1464,4 +1464,43 @@ test('starting the pending turn reports the run it starts', async () => {
   h.firestore.seed('sessions/s', { ...h.session('s'), queuedTurnPending: true });
   assert.equal(await h.sessions.startPendingTurn('s', authority), 2);
   assert.equal(h.session('s')?.['execution'], 2);
+});
+
+test('asking for the desktop is recorded on the running session, aimed at the run the caller named, and announced every time', async (t) => {
+  const h = harness(); const published: { type: string; data: Record<string, unknown> }[] = [];
+  const app = await routeApp(h, async (_id, type, data) => { published.push({ type, data }); return { id: '1-0', type, data }; });
+  t.after(() => app.close());
+  const created = await h.sessions.create('user-1', 'project-1', { model: 'model-1', prompt: 'Build' });
+  const ask = (execution: unknown) => app.inject({ method: 'POST', url: `/sessions/${created.id}/desktop`, headers: authHeaders, payload: { execution } });
+  assert.equal((await ask(1)).statusCode, 409, 'only a live run can show a desktop');
+  assert.equal((await ask(1)).json().error.code, 'desktop/no-active-run');
+  assert.equal((await app.inject({ method: 'POST', url: `/sessions/${created.id}/desktop`, headers: authHeaders })).statusCode, 400, 'the run number is required');
+  assert.equal(h.session(created.id)?.['desktopRequested'], undefined);
+  await h.sessions.claim('runner-1');
+  const stale = await ask(2);
+  assert.equal(stale.statusCode, 409); assert.equal(stale.json().error.code, 'session/execution-changed');
+  assert.equal(h.session(created.id)?.['desktopRequested'], undefined, 'a stale tab starts nothing');
+  const first = await ask(1);
+  assert.equal(first.statusCode, 202);
+  assert.deepEqual(first.json(), { sessionId: created.id, execution: 1, requested: true });
+  assert.equal((h.session(created.id)?.['desktopRequested'] as { execution: number }).execution, 1);
+  const again = await ask(1);
+  assert.equal(again.statusCode, 202);
+  assert.deepEqual(published.filter((event) => event.type === 'desktop.requested').map((event) => event.data), [{ sessionId: created.id, execution: 1 }, { sessionId: created.id, execution: 1 }], 'a repeat is announced again, so a lost notification can be retried');
+  await assert.rejects(h.sessions.requestDesktop('intruder', created.id, 1), { code: 'session/not-found' });
+  const lease = authority(h, created.id);
+  await h.sessions.clearDesktopRequest(lease, 2);
+  assert.equal((h.session(created.id)?.['desktopRequested'] as { execution: number }).execution, 1, 'a handler for another run clears nothing');
+  await h.sessions.clearDesktopRequest(lease, 1);
+  assert.equal(h.session(created.id)?.['desktopRequested'], undefined);
+});
+
+test('a project whose environment has no desktop is refused, not acknowledged', async (t) => {
+  const h = harness(['project-1'], { desktop: false });
+  const app = await routeApp(h); t.after(() => app.close());
+  const created = await h.sessions.create('user-1', 'project-1', { model: 'model-1', prompt: 'Build' });
+  await h.sessions.claim('runner-1');
+  const refused = await app.inject({ method: 'POST', url: `/sessions/${created.id}/desktop`, headers: authHeaders, payload: { execution: 1 } });
+  assert.equal(refused.statusCode, 409); assert.equal(refused.json().error.code, 'desktop/unsupported');
+  assert.equal(h.session(created.id)?.['desktopRequested'], undefined);
 });

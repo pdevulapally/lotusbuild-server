@@ -426,6 +426,7 @@ export class SessionRunner {
         stopWork(error instanceof Error ? error : new Error(String(error)));
         log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(leaseLost) }, 'lost the lease on this session');
       });
+      onHeartbeat?.();
     }, this.#deps.heartbeatSeconds * 1000);
 
     let unsubscribeCancel: (() => void) | undefined;
@@ -434,6 +435,7 @@ export class SessionRunner {
 
     try {
       unsubscribeCancel = await events.subscribe(session.id, (event) => {
+        if (event.type === 'desktop.requested') onDesktopRequested?.();
         if (event.type === 'session.cancel_requested') {
           // Notifications can be delayed or duplicated, including after a new turn starts.
           // Only the current durable cancellation/lease state may abort this worker.
@@ -510,10 +512,17 @@ export class SessionRunner {
     let repository: RepositoryContext | undefined;
     let desktopAbort: AbortController | undefined;
     let desktopStart: Promise<boolean> | undefined;
+    let onDesktopRequested: (() => void) | undefined;
+    // Once final cleanup begins no desktop may be acquired: a user request that
+    // lands while the run is still RUNNING but already saving is answered with
+    // "could not start", and any start in flight is settled before release.
+    let desktopClosed = false;
+    let onHeartbeat: (() => void) | undefined;
     let sandboxProvider: SandboxProvider | undefined;
     // A desktop still starting when the session is over is withdrawn, never
     // announced: the user must not be shown a screen for work that has ended.
     const settleDesktop = async (): Promise<void> => {
+      desktopClosed = true;
       if (desktopStart === undefined) return;
       desktopAbort?.abort(new Error('The session finished before the desktop started.'));
       await desktopStart.catch(() => {});
@@ -725,8 +734,6 @@ export class SessionRunner {
             platform: machine.provider.platform,
           });
           desktopAbort = new AbortController();
-          desktopStart = this.#startDesktop(session, machine, publish, signal, desktopAbort.signal);
-          void desktopStart.catch(() => {});
           try {
             // Only a plan that pays for it gets its work back. For everyone else the
             // sandbox is genuinely disposable, which is the difference being sold.
@@ -748,20 +755,51 @@ export class SessionRunner {
             }
           } catch (error) {
             desktopAbort.abort(error);
-            await desktopStart.catch(() => {});
             throw error;
           }
-          void desktopStart.then((ready) => { desktopUp = ready; }, () => {});
-          await settleWithin(desktopStart, this.#deps.desktopStartGraceMs ?? DEFAULT_DESKTOP_START_GRACE_MS, false);
           return machine;
         })();
         return provisioning;
       };
       let desktopUp = false;
       const sandbox = lazySandbox(provision);
-      // Optimistic by configuration: a desktop that then fails to start surfaces
-      // as a failed screen action, which the agent sees, not as a silent downgrade.
-      const desktopReady = sandboxProvider.desktop !== undefined;
+      // The desktop exists only on demand: the first screen action, a tool that
+      // declares it needs one, or the user asking for it. One start per run,
+      // however many of those arrive at once; `desktop.ready` only after the
+      // adapter confirmed the stream is reachable.
+      const ensureDesktop = (): Promise<boolean> => {
+        if (sandboxProvider!.desktop === undefined || desktopClosed) return Promise.resolve(false);
+        desktopStart ??= (async () => {
+          const machine = await provision();
+          desktopAbort ??= new AbortController();
+          const ready = await this.#startDesktop(session, machine, publish, signal, desktopAbort.signal);
+          desktopUp = ready;
+          return ready;
+        })();
+        return desktopStart;
+      };
+      const desktopOffered = sandboxProvider.desktop !== undefined;
+      // A user's request for the desktop is durable on the session; the Redis
+      // notification only hurries it along, and every heartbeat re-reads it so a
+      // lost notification costs one heartbeat, as with Stop. Only a request
+      // naming this run counts, and only that request is cleared afterwards.
+      let honouring: Promise<void> | undefined;
+      const honourDesktopRequest = (): Promise<void> => {
+        honouring ??= (async () => {
+          try {
+            const durable = await sessions.readOwned(session.ownerUid, session.id);
+            if (durable.desktopRequested?.execution !== execution) return;
+            const requested = execution;
+            const ready = await ensureDesktop();
+            try { await sessions.clearDesktopRequest(authority, requested); } catch (error) { log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'could not clear the desktop request'); }
+            if (!ready) log.warn({ sessionId: session.id, execution }, 'the desktop the user asked for could not be started');
+          } finally { honouring = undefined; }
+        })();
+        return honouring;
+      };
+      onDesktopRequested = () => { void honourDesktopRequest().catch((error: unknown) => log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'desktop request could not be honoured')); };
+      onHeartbeat = onDesktopRequested;
+      const desktopReady = desktopOffered;
       const toolCall = async (name: string, input: Record<string, unknown>, callId?: string) => {
         await sessions.assertPersistenceLease(authority);
         signal.throwIfAborted();
@@ -799,6 +837,7 @@ export class SessionRunner {
         return outcome;
       };
       await sessions.markExecutionStarted(authority);
+      await honourDesktopRequest();
       const requestInput = (kind: import('../sessions/repository.ts').PendingInput['kind'], prompt: string) => sessions.requestInput(authority, kind, prompt);
       const run = await runAgentTurn({
         requestInput, onAdmissionFailure,
@@ -825,6 +864,7 @@ export class SessionRunner {
         drainSteer: () => this.#drainSteer(session, authority),
         skills: await this.#skillsFor(session.ownerUid, messages),
         desktopReady,
+        ensureDesktop,
         events: {
           // Text arrives as it is generated. Not awaited: the model does not
           // wait for Redis, and back-pressure here would stall generation.
@@ -915,6 +955,7 @@ export class SessionRunner {
           drainSteer: () => this.#drainSteer(session, authority),
           skills: await this.#skillsFor(session.ownerUid, chainMessages),
           desktopReady: desktopUp,
+          ensureDesktop,
           events: {
             text: (delta) => {
               queueText(delta);

@@ -365,6 +365,9 @@ export function screenInstructions(
   return [
     `You can see and operate the desktop, a ${screen?.width}x${screen?.height} screen, with the computer tool: screenshot to look,`,
     'then click, type, key and scroll. The user is watching the same screen live but cannot touch it.',
+    '- The desktop starts the first time you use a screen tool, so do not start one for anything a command can check.',
+    '  To show the user a running app, call open_in_browser with its URL rather than launching a browser yourself,',
+    '  then take a screenshot to confirm the page is actually showing.',
     '- Coordinates are pixels in the screenshot, with the origin at the top left. Take a screenshot before you act',
     '  and again after anything that changes the screen; a screenshot is the only evidence of what is on it.',
     '  Never say the screen shows something you have not seen in a screenshot, and if what you see is not what',
@@ -612,6 +615,8 @@ interface ModelLoopInput {
    * dispatched on the toolset name; a specialist is handed none, so cannot reach it.
    */
   readonly computer?: Computer | undefined;
+  /** Brings the desktop up on demand for screen tools; false when it could not start. */
+  readonly ensureDesktop?: (() => Promise<boolean>) | undefined;
   readonly toolContext: ToolContext;
   readonly maxSteps: number;
   readonly maxOutputTokens: number;
@@ -869,6 +874,13 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
             ? truncate(outcome.text, input.toolOutputMaxChars)
             : [screenshotBlock(outcome.image)],
         };
+      }
+      // A tool that declared it needs the screen gets one started here, on
+      // demand; if that fails the model sees a failed call and carries on.
+      if (input.tools.get(toolUse.name)?.requires?.has('desktop') === true && input.ensureDesktop !== undefined && !(await input.ensureDesktop())) {
+        input.assertStillOurs();
+        input.signal.throwIfAborted();
+        return { type: 'tool_result', tool_use_id: toolUse.id, is_error: true, content: 'Not executed: the desktop could not be started in this turn, so there is no screen to open anything on. Continue without it.' };
       }
       const result = await timed('tool.execute', () => runTool(toolUse.name, toolInput, input.toolContext, input.tools));
       input.assertStillOurs();
@@ -1303,6 +1315,12 @@ export async function runAgentTurn(input: {
    * this session has one.
    */
   readonly desktopReady: boolean;
+  /**
+   * Starts the desktop (and the machine under it) the first time a screen
+   * action needs one; resolves false when it could not be started. Absent means
+   * the desktop is whatever `desktopReady` says and is never started here.
+   */
+  readonly ensureDesktop?: () => Promise<boolean>;
   readonly resume?: ContinuationCheckpoint;
   readonly onAdmissionFailure?: (error: unknown, checkpoint: ContinuationCheckpoint) => Promise<void>;
   readonly saveTaskContext?: (state: TaskContext) => Promise<void>;
@@ -1332,7 +1350,7 @@ export async function runAgentTurn(input: {
   const desktop = input.provider.desktop;
   const screenAccess: ScreenAccess | undefined =
     desktop === undefined ? undefined
-      : !input.desktopReady ? 'unavailable'
+      : !input.desktopReady && input.ensureDesktop === undefined ? 'unavailable'
         : input.session.mode === 'build'
           && desktop.computerModels?.includes(input.session.model) === true
           && input.sandbox.readBytes !== undefined
@@ -1342,6 +1360,12 @@ export async function runAgentTurn(input: {
   const computer: Computer | undefined = originalComputer === undefined ? undefined : {
     toolset: originalComputer.toolset,
     run: async (name, value, signal) => {
+      // The screen exists only once something looks at it: the first action
+      // brings the desktop up, and a desktop that will not start is reported
+      // as a failed action the model can see, never as a silent downgrade.
+      if (input.ensureDesktop !== undefined && !(await input.ensureDesktop())) {
+        return { text: 'The desktop could not be started, so there is no screen to act on in this turn. Continue without it.', isError: true };
+      }
       if (!observedNewDesktop && name !== 'screenshot') return { text: 'The desktop is new. Take a fresh screenshot before performing any other computer action. Earlier screenshots are historical context, not the current screen.', isError: true };
       const result = await originalComputer.run(name, value, signal);
       if (name === 'screenshot' && !result.isError) observedNewDesktop = true;
@@ -1577,6 +1601,7 @@ export async function runAgentTurn(input: {
 
     tools,
     computer,
+    ensureDesktop: input.ensureDesktop,
     toolContext,
     maxSteps: input.limits.maxSteps,
     maxOutputTokens: input.limits.maxOutputTokens,
