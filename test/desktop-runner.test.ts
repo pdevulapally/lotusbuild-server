@@ -158,7 +158,12 @@ function runnerFixture(options: {
   withoutHandoffPort?: boolean;
   restore?: () => Promise<string>;
   publishHandoff?: () => Promise<void>;
+  /** The tool the first model step reaches for; a screen tool is what brings the desktop up. */
+  firstTool?: 'run_command' | 'open_in_browser';
+  /** A durable user request for the desktop, as the session document would carry it. */
+  desktopRequested?: { execution: number };
 }) {
+  const firstTool = options.firstTool ?? (options.desktop ? 'open_in_browser' : 'run_command');
   const { db } = ledger();
   const registry = registryWith(options.desktop ? desktopSize : undefined);
   const plans = new Map(planDocuments.map((doc) => [doc.key, parsePlan(doc, doc.key, registry)]));
@@ -190,12 +195,14 @@ function runnerFixture(options: {
       if (modelCalls > 1) order.push('model');
       systemPrompts.push(typeof params.system === 'string' ? params.system : JSON.stringify(params.system ?? ''));
       return { on: () => {}, finalMessage: async () => ({ content: modelCalls === 1
-        ? [{ type: 'tool_use', id: 'look', name: 'run_command', input: { command: 'true' } }]
+        ? [{ type: 'tool_use', id: 'look', name: firstTool, input: firstTool === 'run_command' ? { command: 'true' } : { url: 'http://127.0.0.1:5173' } }]
         : [{ type: 'tool_use', id: 'done', name: 'finish_task', input: { outcome: 'blocked', summary: 'Fixture turn complete.', evidence: [] } }],
       usage: { input_tokens: 2, output_tokens: 1 }, stop_reason: 'tool_use' }) }; },
   } } as unknown as Anthropic;
   const session = { id: 's', projectId: 'p', ownerUid: 'u', execution: 1, model: entitlements.capabilities.stringList('ai.model.allowlist')[0],
-    effort: 'low', mode: 'build', leaseToken: 'lease', reservationIds: [], specialistReservationIds: [] };
+    effort: 'low', mode: 'build', leaseToken: 'lease', reservationIds: [], specialistReservationIds: [],
+    ...(options.desktopRequested === undefined ? {} : { desktopRequested: { ...options.desktopRequested, at: new Date() } }) };
+  const clearedRequests: number[] = [];
   const sessions = {
     saveTaskContext: async () => {}, requireWorkspaceSalvage: async () => {}, claim: async () => session, heartbeat: async () => {}, assertPersistenceLease: async () => { if (cancelled) throw new AppError({ code: 'session/cancelled', statusCode: 409, message: 'Cancelled by user' }); }, markExecutionStarted: async () => {},
     attachSandbox: async () => {}, detachSandbox: async () => {}, drainSteerMessage: async () => undefined,
@@ -205,6 +212,7 @@ function runnerFixture(options: {
     forgetSpecialistReservation: async () => {},
     appendAssistantMessage: async () => {}, dequeueNextMessage: async () => undefined,
     readOwned: async () => session, yieldForRecovery: async () => {}, finish: async () => { order.push('finish'); return 'IDLE'; },
+    clearDesktopRequest: async () => { clearedRequests.push(1); order.push('clearDesktopRequest'); },
   };
   const handoffPort: DesktopHandoffPort = {
     publish: async (sessionId, handoff, ttl) => {
@@ -232,6 +240,7 @@ function runnerFixture(options: {
   } as unknown as RunnerDependencies;
   return { runner: new SessionRunner(deps), order, emitted, handoffCalls, logs, timeoutSeconds: registry.sandboxProviders.get('web')!.timeoutSeconds,
     cancel: () => { cancelled = true; cancelListener?.({ type: 'session.cancel_requested' }); }, modelCalls: () => modelCalls,
+    requestDesktop: () => cancelListener?.({ type: 'desktop.requested' }), clearedRequests,
     systemPrompts: () => systemPrompts,
 
     types: () => emitted.map((event) => event.type),
@@ -252,6 +261,7 @@ test('a desktop is announced once it is reachable, and withdrawn before the sand
   await h.runner.runOnce();
 
   assert.equal(h.modelCalls(), 2, h.diagnostics());
+  assert.ok(h.handoffCalls.length > 0, h.diagnostics());
   const [publish, clear] = h.handoffCalls;
   assert.equal(publish!.call, 'publish');
   assert.equal(publish!.sessionId, 's');
@@ -316,54 +326,25 @@ test('a timed-out desktop start lets the build continue without screen access', 
   assert.ok(!h.types().includes('desktop.ready'));
 });
 
-test('a slow desktop does not hold the first turn back, and one that is still starting when the session ends is never announced', async () => {
-  let startupSignal: AbortSignal | undefined;
-  const h = runnerFixture({
-    desktop: true,
-    desktopStartGraceMs: 20,
-    startDesktop: (signal) => {
-      startupSignal = signal;
-      return new Promise<DesktopHandoff>(() => {});
-    },
-  });
-
-  const started = Date.now();
+test('a desktop that already failed this run is not started again when the user asks for it', async () => {
+  const h = runnerFixture({ desktop: true, desktopRequested: { execution: 1 }, startDesktop: async () => { throw new Error('no display'); } });
   await h.runner.runOnce();
-
-  assert.ok(Date.now() - started < 1_000, 'the first turn waited for the desktop deadline');
-  assert.equal(h.modelCalls(), 2, h.diagnostics());
+  assert.equal(h.order.filter((step) => step === 'startDesktop').length, 1, h.diagnostics());
+  assert.equal(h.modelCalls(), 2, 'the build still ran: ' + h.diagnostics());
   assert.ok(!h.types().includes('desktop.ready'));
-  assert.equal(startupSignal?.aborted, true);
-  assert.ok(!h.emitted.some((event) => event.type === 'desktop.ready'));
-  assert.ok(!h.logs.some((entry) => entry.message.includes('continuing without it')));
+  assert.equal(h.clearedRequests.length, 1, 'the request is settled even though the desktop failed');
+  assert.ok(h.logs.some((entry) => entry.message.includes('could not be started')));
 });
 
-test('a restore failure aborts pending desktop startup before it can publish a handoff', async () => {
-  let startupSignal: AbortSignal | undefined;
-  const restoreError = new AppError({
-    code: 'workspace/unrecoverable',
-    statusCode: 409,
-    message: 'Workspace restoration failed.',
-  });
-  const h = runnerFixture({
-    desktop: true,
-    startDesktop: (signal) => {
-      startupSignal = signal;
-      return new Promise<DesktopHandoff>(() => {});
-    },
-    restore: async () => { throw restoreError; },
-  });
-
+test('a restore failure means no desktop is ever attempted, and nothing is announced', async () => {
+  const restoreError = new AppError({ code: 'workspace/unrecoverable', statusCode: 409, message: 'Workspace restoration failed.' });
+  const h = runnerFixture({ desktop: true, restore: async () => { throw restoreError; } });
   await h.runner.runOnce();
-
-  assert.equal(startupSignal?.aborted, true);
+  assert.ok(!h.order.includes('startDesktop'), h.diagnostics());
   assert.equal(h.modelCalls(), 1, h.diagnostics());
-  assert.equal(h.handoffCalls.some((call) => call.call === 'publish'), false);
-  assert.ok(!h.types().includes('desktop.ready'));
-  assert.deepEqual(
-    h.emitted.filter((event) => event.type === 'session.failed').map((event) => event.data.error),
-    [restoreError.message],
-  );
+  assert.deepEqual(h.handoffCalls, []);
+  assert.ok(!h.types().some((type) => type.startsWith('desktop.')));
+  assert.deepEqual(h.emitted.filter((event) => event.type === 'session.failed').map((event) => event.data.error), [restoreError.message]);
 });
 
 test('a handoff that does not settle is covered by the desktop startup deadline', async () => {
@@ -409,22 +390,20 @@ test('a handoff that completes after the startup deadline is withdrawn without a
   assert.ok(h.order.indexOf('clear') > h.order.indexOf('publish'));
 });
 
-test('desktop startup overlaps project restoration', async () => {
+test('the desktop starts only when the first screen tool asks for it, after the machine and the restore', async () => {
   let resolveDesktop!: (handoff: DesktopHandoff) => void;
   const start = new Promise<DesktopHandoff>((resolve) => { resolveDesktop = resolve; });
   const h = runnerFixture({ desktop: true, startDesktop: () => start });
   const run = h.runner.runOnce();
-
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.ok(h.order.indexOf('startDesktop') >= 0);
-  assert.ok(h.order.indexOf('restore') > h.order.indexOf('startDesktop'), h.diagnostics());
+  await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  assert.ok(h.order.indexOf('startDesktop') >= 0, h.diagnostics());
+  assert.ok(h.order.indexOf('restore') < h.order.indexOf('startDesktop'), h.diagnostics());
   assert.ok(!h.types().includes('desktop.ready'));
-
+  assert.equal(h.modelCalls(), 1, 'the screen tool waits for its desktop: ' + h.diagnostics());
   resolveDesktop({ host: '6080-abcdefghij1234567890x.e2b.test', token: 'traffic-token-fixture' });
   await run;
-
   assert.equal(h.modelCalls(), 2, h.diagnostics());
-  assert.ok(h.order.indexOf('desktop.ready') > h.order.indexOf('restore'));
+  assert.ok(h.order.indexOf('desktop.ready') < h.order.indexOf('model'));
 });
 
 test('startDesktop does not launch another background step after cancellation', async (t) => {
@@ -462,4 +441,39 @@ test('cancelling while the desktop starts stops the build instead of being swall
   assert.equal(h.modelCalls(), 1, 'a cancelled session must not go on to run the agent');
   assert.deepEqual(h.emitted.filter((event) => event.type === 'desktop.ended' && (event.data as { reason?: string }).reason === 'error'), []);
   assert.ok(h.types().includes('session.stopped'), 'a user stop ends STOPPED, not failed');
+});
+
+test('a run that only uses the shell never starts the desktop, even on a provider that has one', async () => {
+  const h = runnerFixture({ desktop: true, firstTool: 'run_command' });
+  await h.runner.runOnce();
+  assert.equal(h.modelCalls(), 2, h.diagnostics());
+  assert.ok(!h.order.includes('startDesktop'), h.diagnostics());
+  assert.deepEqual(h.handoffCalls, []);
+  assert.ok(!h.types().some((type) => type.startsWith('desktop.')));
+  assert.ok(h.order.includes('terminate'), 'the machine itself was still started for the shell and released');
+});
+
+test('a durable user request for this run starts the desktop once, even if the notification never arrives', async () => {
+  const h = runnerFixture({ desktop: true, firstTool: 'run_command', desktopRequested: { execution: 1 } });
+  await h.runner.runOnce();
+  assert.equal(h.order.filter((step) => step === 'startDesktop').length, 1, h.diagnostics());
+  assert.equal(h.clearedRequests.length, 1);
+  const at = (name: string) => h.order.indexOf(name);
+  assert.ok(at('startDesktop') < at('publish') && at('publish') < at('desktop.ready') && at('desktop.ready') < at('model'), h.diagnostics());
+});
+
+test('a desktop request aimed at another run is ignored', async () => {
+  const h = runnerFixture({ desktop: true, firstTool: 'run_command', desktopRequested: { execution: 2 } });
+  await h.runner.runOnce();
+  assert.ok(!h.order.includes('startDesktop'), h.diagnostics());
+  assert.deepEqual(h.clearedRequests, []);
+});
+
+test('an agent screen tool and a user request arriving together start one desktop', async () => {
+  const h = runnerFixture({ desktop: true, desktopRequested: { execution: 1 } });
+  const run = h.runner.runOnce();
+  h.requestDesktop();
+  await run;
+  assert.equal(h.order.filter((step) => step === 'startDesktop').length, 1, h.diagnostics());
+  assert.equal(h.emitted.filter((event) => event.type === 'desktop.ready').length, 1);
 });

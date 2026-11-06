@@ -63,8 +63,16 @@ export interface ToolResult {
   readonly isError: boolean;
 }
 
+export type ToolCapability = 'sandbox' | 'desktop';
+
 export interface ToolDefinition {
   readonly spec: Tool;
+  /**
+   * What the tool needs before it can run, declared as data so the runner
+   * provisions capabilities on demand instead of guessing from the prompt:
+   * every workspace tool needs a sandbox; only screen tools need a desktop.
+   */
+  readonly requires?: ReadonlySet<ToolCapability>;
   /**
    * Declared only on a tool proven safe to run concurrently with others that
    * declare it — today that is `consult_specialist` alone, because its
@@ -540,6 +548,29 @@ function parseSearchMatches(raw: string): SearchMatch[] {
  * context on descriptions the model already knows from the shell.
  */
 const definitions: readonly ToolDefinition[] = [
+  {
+    requires: new Set<ToolCapability>(['sandbox', 'desktop']),
+    spec: {
+      name: 'open_in_browser',
+      description:
+        'Open a URL in the browser on the desktop the user is watching, so they can see the running app. ' +
+        'The desktop is started on demand the first time this is used. Use this instead of launching a browser with run_command.',
+      input_schema: {
+        type: 'object',
+        required: ['url'],
+        properties: { url: { type: 'string', description: 'The http(s) URL to open, usually a local dev server such as http://127.0.0.1:5173.' } },
+      },
+    },
+    async run(input, context) {
+      const url = requireString(input, 'url');
+      if (!/^https?:\/\/[^\s'"]+$/.test(url)) return { text: 'open_in_browser needs an http(s) URL.', isError: true };
+      const outcome = await context.sandbox.runCommand(
+        `nohup google-chrome --no-sandbox --disable-gpu --no-first-run --no-default-browser-check --start-maximized --new-window '${url.replaceAll("'", '')}' > /tmp/chrome.log 2>&1 &`,
+        { signal: context.signal, cwd: context.provider.workdir, timeoutMs: Math.min(context.commandTimeoutMs, 15_000), envs: { DISPLAY: ':0' } },
+      );
+      return outcome.exitCode === 0 ? { text: `Opened ${url} on the desktop.`, isError: false } : describe(outcome);
+    },
+  },
   {
     spec: {
       name: 'run_command',
@@ -1263,6 +1294,7 @@ function setOf(names: readonly string[]): ToolSet {
 
 /** Everything the primary coding agent may do, including mutating the workspace. */
 export const workspaceTools: ToolSet = setOf([
+  'open_in_browser',
   'run_command',
   'write_file',
   'edit_file',

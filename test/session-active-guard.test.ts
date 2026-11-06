@@ -1465,3 +1465,28 @@ test('starting the pending turn reports the run it starts', async () => {
   assert.equal(await h.sessions.startPendingTurn('s', authority), 2);
   assert.equal(h.session('s')?.['execution'], 2);
 });
+
+test('asking for the desktop is recorded on the running session, aimed at its run, and announced once', async (t) => {
+  const h = harness(); const published: { type: string; data: Record<string, unknown> }[] = [];
+  const app = await routeApp(h, async (_id, type, data) => { published.push({ type, data }); return { id: '1-0', type, data }; });
+  t.after(() => app.close());
+  const created = await h.sessions.create('user-1', 'project-1', { model: 'model-1', prompt: 'Build' });
+  const ask = () => app.inject({ method: 'POST', url: `/sessions/${created.id}/desktop`, headers: authHeaders });
+  const queued = await ask();
+  assert.equal(queued.statusCode, 409, 'only a live run can show a desktop');
+  assert.equal(queued.json().error.code, 'desktop/no-active-run');
+  assert.equal(h.session(created.id)?.['desktopRequested'], undefined);
+  await h.sessions.claim('runner-1');
+  const first = await ask();
+  assert.equal(first.statusCode, 202);
+  assert.deepEqual(first.json(), { sessionId: created.id, execution: 1, requested: true });
+  assert.equal((h.session(created.id)?.['desktopRequested'] as { execution: number }).execution, 1);
+  assert.deepEqual(published.filter((event) => event.type === 'desktop.requested').map((event) => event.data), [{ sessionId: created.id, execution: 1 }]);
+  const again = await ask();
+  assert.equal(again.statusCode, 202);
+  assert.equal(published.filter((event) => event.type === 'desktop.requested').length, 1, 'a repeat is answered, not re-announced');
+  await assert.rejects(h.sessions.requestDesktop('intruder', created.id), { code: 'session/not-found' });
+  const lease = authority(h, created.id);
+  await h.sessions.clearDesktopRequest(lease);
+  assert.equal(h.session(created.id)?.['desktopRequested'], undefined);
+});

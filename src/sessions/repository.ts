@@ -36,6 +36,7 @@ import {
 import type { StoredSnapshot, UploadedSnapshot } from '../storage/snapshots.ts';
 import {
   type Fields,
+  DocumentShapeError,
   booleanField,
   enumField,
   integerField,
@@ -128,6 +129,8 @@ export interface BuildSession {
   readonly cancelRequested?: boolean | undefined;
   /** When the user asked the current run to stop; cleared when the run ends. */
   readonly cancelRequestedAt?: Date | undefined;
+  /** A user asked for the desktop of this run; the runner starts it and clears this. Durable so a lost notification cannot lose the request. */
+  readonly desktopRequested?: { readonly execution: number; readonly at: Date } | undefined;
   readonly pendingInput?: PendingInput | undefined;
   readonly fallback?: FallbackState | undefined;
   readonly inputContext?: string | undefined;
@@ -192,6 +195,14 @@ export interface SessionMessage {
 export interface SteerMessage {
   readonly prompt: string;
   readonly attachments: readonly AttachmentRef[];
+}
+
+function desktopRequestedField(fields: Fields, where: string): { execution: number; at: Date } | undefined {
+  const value = fields['desktopRequested'];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new DocumentShapeError(`${where}: desktopRequested must be an object.`);
+  const record = value as Fields;
+  return { execution: integerField(record, 'execution', `${where}.desktopRequested`, { min: 1 }), at: record['at'] instanceof Timestamp ? record['at'].toDate() : new Date(0) };
 }
 
 function assertSameExecution(current: BuildSession, expectedExecution: number | undefined): void {
@@ -269,6 +280,7 @@ function parseSession(id: string, fields: Fields, where: string): BuildSession {
     error: optionalStringField(fields, 'error'),
     execution: fields['execution'] === undefined ? 1 : integerField(fields, 'execution', where, { min: 1 }),
     cancelRequestedAt: optionalTimestampField(fields, 'cancelRequestedAt', where),
+    desktopRequested: desktopRequestedField(fields, where),
     pendingInput: parsePendingInput(fields['pendingInput']),
     inputContext: optionalStringField(fields, 'inputContext'),
     fallback: parseFallbackState(fields['fallback']),
@@ -1354,6 +1366,29 @@ export class SessionRepository {
     const validated = parseTaskContext(context);
     await this.#withLease(authority.sessionId, authority, (transaction, ref) => {
       transaction.update(ref, { taskContext: validated, updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+
+  /** The owner wants to see this run's desktop. Only a live run can show one; the request names the run so a later run never inherits it. */
+  async requestDesktop(uid: string, sessionId: string): Promise<{ execution: number; alreadyRequested: boolean }> {
+    const ref = this.#ref(sessionId);
+    return this.#firestore.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(ref);
+      const current = parseSession(sessionId, snapshot.data() ?? {}, ref.path);
+      if (!snapshot.exists || current.ownerUid !== uid) throw new AppError({ code: 'session/not-found', statusCode: 404, message: 'No such session.' });
+      await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId, true);
+      if (current.status !== 'RUNNING') {
+        throw new AppError({ code: 'desktop/no-active-run', statusCode: 409, message: 'The desktop can be started while the agent is working. Send a message to start a run.' });
+      }
+      if (current.desktopRequested?.execution === current.execution) return { execution: current.execution, alreadyRequested: true };
+      transaction.update(ref, { desktopRequested: { execution: current.execution, at: FieldValue.serverTimestamp() }, updatedAt: FieldValue.serverTimestamp() });
+      return { execution: current.execution, alreadyRequested: false };
+    });
+  }
+
+  async clearDesktopRequest(authority: SessionLease): Promise<void> {
+    await this.#withLease(authority.sessionId, authority, (tx, ref) => {
+      tx.update(ref, { desktopRequested: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() });
     });
   }
 
