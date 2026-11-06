@@ -50,6 +50,24 @@ test('failed candidate cleanup preserves quota; retry releases it once', async (
   assert.equal(h.data.get('users/u/usage/storage')?.['reserved'], 0);
   assert.equal(h.data.get('snapshotUploads/upload')?.['status'], 'DELETED');
 });
+test('a dead worker\'s in-flight token hold settles at its estimate when recovery proves it unreportable', async () => {
+  const h = fixture();
+  const hold = await h.metering.reserve({ uid: 'u', entitlements: h.entitlements, meterKey: 'input', quantity: 10, operationId: 'call', now: new Date() });
+  await h.metering.markInFlight('u', [hold.id]);
+  await assert.rejects(h.metering.reconcile('u', hold.id), { code: 'usage/reconciliation-required' });
+  assert.equal(await h.metering.reconcile('u', hold.id, new Date(), { unreportable: true }), true);
+  assert.equal(h.data.get(`users/u/reservations/${hold.id}`)?.['status'], 'SETTLED');
+  assert.equal(h.data.get('users/u/usage/input')?.['consumed'], 10);
+  assert.equal(h.data.get('users/u/usage/input')?.['reserved'], 0);
+});
+
+test('unreportable recovery never guesses a resource hold', async () => {
+  const h = fixture();
+  const hold = await h.metering.reserve({ uid: 'u', entitlements: h.entitlements, meterKey: 'storage', quantity: 300, operationId: 'upload', now: new Date() });
+  await h.metering.markInFlight('u', [hold.id]);
+  await assert.rejects(h.metering.reconcile('u', hold.id, new Date(), { unreportable: true }), { code: 'usage/reconciliation-required' });
+});
+
 test('unknown in-flight usage cannot be released and recorded overruns survive recovery', async () => {
   const h = fixture();
   const hold = await h.metering.reserve({ uid: 'u', entitlements: h.entitlements, meterKey: 'input', quantity: 10, operationId: 'call', now: new Date() });

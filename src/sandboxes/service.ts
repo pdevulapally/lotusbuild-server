@@ -236,6 +236,8 @@ export class SandboxService {
     readonly externalSandboxId: string | undefined;
     readonly reservationIds: readonly string[];
     readonly now: Date;
+    /** The worker that dispatched these holds is provably gone; see `MeteringService.reconcile`. */
+    readonly unreportableUsage?: boolean;
     readonly onProblem: (error: Error, what: string) => void;
   }): Promise<void> {
     if (input.salvageRequired === true) throw new Error('Workspace salvage must precede destructive sandbox recovery.');
@@ -267,7 +269,7 @@ export class SandboxService {
       } catch (cause) { failures.push(cause); }
     }
     for (const id of input.reservationIds) {
-      try { await this.#metering.reconcile(input.uid, id, input.now); }
+      try { await this.#metering.reconcile(input.uid, id, input.now, { unreportable: input.unreportableUsage === true }); }
       catch (cause) { failures.push(cause); }
     }
     if (failures.length > 0) {

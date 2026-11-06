@@ -899,10 +899,7 @@ export class MeteringService {
     const fields = await this.reservationRecord(uid, id);
     if (fields['status'] !== 'OPEN') return false;
     if (fields['inFlight'] !== true || typeof fields['observedQuantity'] === 'number') return false;
-    const { registry } = await this.#configuration.get();
-    const tokenMeters = new Set([registry.inputTokenMeterKey, registry.outputTokenMeterKey,
-      ...(registry.fallback === undefined ? [] : [registry.fallback.inputTokenMeterKey, registry.fallback.outputTokenMeterKey])]);
-    if (fields['sandboxExternalId'] !== undefined || !tokenMeters.has(fields['meterKey'] as string)) {
+    if (fields['sandboxExternalId'] !== undefined || !await this.#isTokenMeter(fields['meterKey'])) {
       throw new Error(`Reservation ${id} is not a model-token hold and cannot settle at its estimate.`);
     }
     const estimated = integerField(fields, 'estimatedQuantity', `reservation ${id}`, { min: 1 });
@@ -910,10 +907,28 @@ export class MeteringService {
     return this.settle({ uid, reservationId: id, actualQuantity: estimated, now });
   }
 
-  /** Recovery closes recorded usage, never guessed usage. */
-  async reconcile(uid: string, id: string, now: Date = new Date()): Promise<boolean> {
+  async #isTokenMeter(meterKey: unknown): Promise<boolean> {
+    const { registry } = await this.#configuration.get();
+    return typeof meterKey === 'string' && [registry.inputTokenMeterKey, registry.outputTokenMeterKey,
+      ...(registry.fallback === undefined ? [] : [registry.fallback.inputTokenMeterKey, registry.fallback.outputTokenMeterKey])].includes(meterKey);
+  }
+
+  /**
+   * Recovery closes recorded usage, never guessed usage — with one bounded
+   * exception the caller must prove: `unreportable` says the worker that
+   * dispatched this session's model calls is gone (its lease expired and the
+   * caller now holds the only one), so a token hold still in flight without
+   * usage will never hear from the provider. Such a hold settles at what it
+   * reserved, exactly as a live Stop does, instead of pinning the session in
+   * a state no pass can finish. Resource holds are never guessed at.
+   */
+  async reconcile(uid: string, id: string, now: Date = new Date(), options: { readonly unreportable?: boolean } = {}): Promise<boolean> {
     const fields = await this.reservationRecord(uid, id);
     if (fields['status'] !== 'OPEN') return false;
+    if (options.unreportable === true && fields['inFlight'] === true && typeof fields['observedQuantity'] !== 'number'
+      && fields['sandboxExternalId'] === undefined && await this.#isTokenMeter(fields['meterKey'])) {
+      return this.settleUnobserved(uid, id, now);
+    }
     if (typeof fields['observedQuantity'] === 'number') {
       const { registry } = await this.#configuration.get();
       return this.settle({ uid, reservationId: id, actualQuantity: fields['observedQuantity'], now,
