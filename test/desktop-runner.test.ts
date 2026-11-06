@@ -167,6 +167,8 @@ function runnerFixture(options: {
   heartbeatSeconds?: number;
   /** Holds the final model step open so a heartbeat can fire inside the run. */
   slowFinishMs?: number;
+  /** Holds the final save open so a heartbeat can fire during cleanup. */
+  slowSaveMs?: number;
 }) {
   const firstTool = options.firstTool ?? (options.desktop ? 'open_in_browser' : 'run_command');
   const { db } = ledger();
@@ -241,7 +243,8 @@ function runnerFixture(options: {
     entitlements: { forUser: async () => entitlements },
     projects: { readOwned: async () => ({ id: 'p', platform: 'web', ownerUid: 'u', name: 'Fixture', snapshot: { kind: 'none' } }) },
     sandboxes: new SandboxService(configuration, metering, new Map([['e2b', adapter]])),
-    persistence: { restore: async () => { order.push('restore'); return options.restore === undefined ? 'fresh' : options.restore(); }, save: async () => ({ bytes: 1, committed: true }) },
+    persistence: { restore: async () => { order.push('restore'); return options.restore === undefined ? 'fresh' : options.restore(); },
+      save: async () => { order.push('save'); if (options.slowSaveMs !== undefined) await new Promise<void>((resolve) => setTimeout(resolve, options.slowSaveMs)); return { bytes: 1, committed: true }; } },
     events: { subscribe: async (_id: string, listener: typeof cancelListener) => { cancelListener = listener; return () => {}; },
       append: async (_id: string, type: string, data: Record<string, unknown>) => { emitted.push({ type, data }); order.push(type); } },
     limits: { maxSteps: 3, maxOutputTokens: 10, toolOutputMaxChars: 4096, maxSpecialistConsultations: 0, specialistMaxSteps: 1,
@@ -497,4 +500,30 @@ test('a request that arrives mid-run with its notification lost is found at the 
   assert.equal(h.order.filter((step) => step === 'startDesktop').length, 1, h.diagnostics());
   assert.deepEqual(h.clearedRequests, [1]);
   assert.ok(h.types().includes('desktop.ready'), h.diagnostics());
+});
+
+test('a request that lands once final cleanup has begun starts nothing, is settled, and the machine is still released', async () => {
+  const h = runnerFixture({ desktop: true, firstTool: 'run_command', desktopRequested: { execution: 1 }, desktopRequestedLater: true, heartbeatSeconds: 0.02, slowSaveMs: 120 });
+  await h.runner.runOnce();
+  assert.ok(!h.order.includes('startDesktop'), h.diagnostics());
+  assert.deepEqual(h.clearedRequests, [1], 'the request is settled rather than left for a run that is over');
+  assert.ok(!h.types().some((type) => type.startsWith('desktop.')));
+  assert.ok(h.logs.some((entry) => entry.message.includes('could not be started')));
+  const at = (name: string) => h.order.indexOf(name);
+  assert.ok(at('save') < at('terminate') && at('terminate') >= 0, h.diagnostics());
+});
+
+test('a desktop still starting when the run ends is settled before the machine is released', async () => {
+  let release!: (handoff: DesktopHandoff) => void;
+  const h = runnerFixture({ desktop: true, desktopRequested: { execution: 1 }, firstTool: 'run_command',
+    startDesktop: (signal) => new Promise<DesktopHandoff>((resolve, reject) => { release = resolve; signal?.addEventListener('abort', () => reject(signal.reason), { once: true }); }) });
+  const run = h.runner.runOnce();
+  await new Promise<void>((resolve) => setTimeout(resolve, 30));
+  assert.ok(h.order.includes('startDesktop'), h.diagnostics());
+  await run;
+  const at = (name: string) => h.order.indexOf(name);
+  assert.ok(at('terminate') >= 0 && !h.types().includes('desktop.ready'), h.diagnostics());
+  release({ host: 'late.e2b.test', token: 'late' });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.handoffCalls.filter((call) => call.call === 'publish'), [], 'a start aborted by cleanup never publishes a handoff');
 });

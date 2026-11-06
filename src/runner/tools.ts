@@ -553,8 +553,9 @@ const definitions: readonly ToolDefinition[] = [
     spec: {
       name: 'open_in_browser',
       description:
-        'Open a URL in the browser on the desktop the user is watching, so they can see the running app. ' +
-        'The desktop is started on demand the first time this is used. Use this instead of launching a browser with run_command.',
+        'Ask the browser on the desktop the user is watching to open a URL, so they can see the running app. ' +
+        'The desktop is started on demand the first time this is used. The result only confirms the launch was requested; ' +
+        'take a screenshot to see whether the page is showing. Use this instead of launching a browser with run_command.',
       input_schema: {
         type: 'object',
         required: ['url'],
@@ -568,7 +569,11 @@ const definitions: readonly ToolDefinition[] = [
         `nohup google-chrome --no-sandbox --disable-gpu --no-first-run --no-default-browser-check --start-maximized --new-window '${url.replaceAll("'", '')}' > /tmp/chrome.log 2>&1 &`,
         { signal: context.signal, cwd: context.provider.workdir, timeoutMs: Math.min(context.commandTimeoutMs, 15_000), envs: { DISPLAY: ':0' } },
       );
-      return outcome.exitCode === 0 ? { text: `Opened ${url} on the desktop.`, isError: false } : describe(outcome);
+      // The browser is launched in the background, so a clean exit only means the
+      // launch was requested; what is on screen is confirmed by a screenshot.
+      return outcome.exitCode === 0
+        ? { text: `Asked the desktop browser to open ${url}. Take a screenshot to confirm the page is showing before relying on it.`, isError: false }
+        : describe(outcome);
     },
   },
   {

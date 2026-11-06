@@ -513,11 +513,16 @@ export class SessionRunner {
     let desktopAbort: AbortController | undefined;
     let desktopStart: Promise<boolean> | undefined;
     let onDesktopRequested: (() => void) | undefined;
+    // Once final cleanup begins no desktop may be acquired: a user request that
+    // lands while the run is still RUNNING but already saving is answered with
+    // "could not start", and any start in flight is settled before release.
+    let desktopClosed = false;
     let onHeartbeat: (() => void) | undefined;
     let sandboxProvider: SandboxProvider | undefined;
     // A desktop still starting when the session is over is withdrawn, never
     // announced: the user must not be shown a screen for work that has ended.
     const settleDesktop = async (): Promise<void> => {
+      desktopClosed = true;
       if (desktopStart === undefined) return;
       desktopAbort?.abort(new Error('The session finished before the desktop started.'));
       await desktopStart.catch(() => {});
@@ -763,7 +768,7 @@ export class SessionRunner {
       // however many of those arrive at once; `desktop.ready` only after the
       // adapter confirmed the stream is reachable.
       const ensureDesktop = (): Promise<boolean> => {
-        if (sandboxProvider!.desktop === undefined) return Promise.resolve(false);
+        if (sandboxProvider!.desktop === undefined || desktopClosed) return Promise.resolve(false);
         desktopStart ??= (async () => {
           const machine = await provision();
           desktopAbort ??= new AbortController();
