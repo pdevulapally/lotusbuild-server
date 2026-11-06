@@ -157,3 +157,15 @@ test('a hold without evidence settles exactly as before and records no unified f
   assert.equal(period?.['settled'], 100);
   assert.equal(period?.['unified'], undefined);
 });
+
+import { shadowEvidence } from '../src/runner/call-admission.ts';
+
+test('shadow evidence never fails a settlement: conversion problems just leave the unified figure absent', () => {
+  const raw = { input: 60, output: 9 };
+  assert.deepEqual(shadowEvidence(undefined, 'claude-sonnet-5', raw), { model: 'claude-sonnet-5', raw });
+  assert.deepEqual(shadowEvidence(v1, 'retired-model', raw), { model: 'retired-model', raw });
+  assert.deepEqual(shadowEvidence(v1, 'claude-sonnet-5', raw), { model: 'claude-sonnet-5', raw, unified: 105, tier: 0, rateVersion: 'v1' });
+  const overflow = { input: Number.MAX_SAFE_INTEGER };
+  assert.throws(() => unifiedFor(v1, 'claude-opus-5', overflow));
+  assert.deepEqual(shadowEvidence(v1, 'claude-opus-5', overflow), { model: 'claude-opus-5', raw: overflow });
+});

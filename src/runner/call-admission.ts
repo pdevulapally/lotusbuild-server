@@ -2,8 +2,8 @@ import { timed } from '../diagnostics/timing.ts';
 import { AppError } from '../http/errors.ts';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { MessageCountTokensParams } from '@anthropic-ai/sdk/resources/messages';
-import type { MeteringService } from '../metering/service.ts';
-import { unifiedFor, type AiRateTable } from '../entitlements/rates.ts';
+import type { AiCallEvidence, MeteringService } from '../metering/service.ts';
+import { unifiedFor, type AiRateTable, type RawUsage } from '../entitlements/rates.ts';
 import type { AuthoritativeUsage, SpecialistReservations, ProblemReporter } from './agent.ts';
 import { modelOutputConfig, type ModelResolver } from '../models/catalog.ts';
 import type { TokenCount } from '../models/provider.ts';
@@ -20,6 +20,20 @@ export interface CallAdmission {
 }
 
 /** Admission is shared by primary and specialist calls, including every tool loop. */
+/**
+ * Shadow accounting only: the raw categories are always kept; the unified figure is added when a rate
+ * table knows the model and the conversion succeeds. A conversion failure is recorded as its absence,
+ * never allowed to fail the settlement of a real hold.
+ */
+export function shadowEvidence(rates: AiRateTable | undefined, model: string, raw: RawUsage): AiCallEvidence {
+  if (rates === undefined) return { model, raw };
+  try {
+    return { model, raw, ...(unifiedFor(rates, model, raw) ?? {}) };
+  } catch {
+    return { model, raw };
+  }
+}
+
 export function createCallAdmission(deps: {
   readonly anthropic: Anthropic;
   /** Provider-specific input count; defaults to Anthropic's count_tokens. An estimate is still reserved in full and settled from authoritative usage. */
@@ -83,7 +97,7 @@ export function createCallAdmission(deps: {
             // Shadow evidence travels with the input hold only, so a logical call is
             // recorded exactly once however its output hold is shared.
             const evidence = hold.kind === 'input' && usage.raw !== undefined
-              ? { model: input.params.model, raw: usage.raw, ...(deps.rates === undefined ? {} : (unifiedFor(deps.rates, input.params.model, usage.raw) ?? {})) }
+              ? shadowEvidence(deps.rates, input.params.model, usage.raw)
               : undefined;
             await deps.metering.settle({ uid: deps.uid, reservationId: hold.id,
               actualQuantity: actual, recordOverrun: hold.kind === 'input', now: new Date(), ...(evidence === undefined ? {} : { evidence }) });
