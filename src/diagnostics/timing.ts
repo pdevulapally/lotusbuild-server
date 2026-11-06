@@ -7,7 +7,7 @@ import type { FastifyInstance } from 'fastify';
 export type TimingStage = 'http.total' | 'auth.verify' | 'configuration.get' | 'configuration.firestore' |
   'entitlements.resolve' | 'subscription.firestore' | 'subscription.redis.read' | 'subscription.redis.fill' | 'subscription.redis.write' |
   'session.read' | 'session.admit' | 'session.claim' | 'session.finish' | 'project.read' | 'project.list' |
-  'runner.total' | 'runner.maintenance' | 'sandbox.acquire' | 'sandbox.release' | 'workspace.restore' | 'workspace.save' |
+  'runner.total' | 'runner.maintenance' | 'runner.claim_to_model_step' | 'sandbox.acquire' | 'sandbox.release' | 'workspace.restore' | 'workspace.save' |
   'model.admission' | 'model.count_tokens' | 'model.first_text' | 'model.first_delta' | 'model.generation' | 'model.settle' |
   'tool.execute' | 'tool.computer' | 'events.append' | 'events.replay' | 'sse.socket_write';
 export interface TimingRecord { traceId: string; stage: TimingStage; startMs: number; durationMs: number; ok: boolean }

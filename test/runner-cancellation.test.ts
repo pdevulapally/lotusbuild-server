@@ -160,7 +160,7 @@ test('completed drain returns immediately without waiting for its deadline', asy
   await withDrainDeadline(AbortSignal.abort(), 90000, async () => {}, log);
 });
 
-function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'validation' | 'reply') {
+function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'validation' | 'reply', streamText?: (send: (delta: string) => void) => Promise<void>) {
   const { db, data } = ledger();
   const plans = new Map(planDocuments.map((doc) => [doc.key, parsePlan(doc, doc.key, registry)]));
   const plan = plans.get('business')!;
@@ -171,6 +171,7 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
   const shutdown = new AbortController();
   const entered = deferred<void>();
   const events: string[] = [];
+  const textEvents: string[] = [];
   let activeSignal: AbortSignal | undefined;
   let cancelListener: ((event: { type: string }) => void) | undefined;
   let leaseValid = true; let cancelled = false;
@@ -195,7 +196,9 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
       // `calls` counts the generations that then run against it, as before.
       const preamble = ++totalCalls === 1 && !['command', 'validation', 'reply'].includes(mode);
       if (!preamble) calls++;
-      return { on: () => {}, finalMessage: async () => {
+      let onText: ((delta: string) => void) | undefined;
+      return { on: (type: string, listener: (delta: string) => void) => { if (type === 'text') onText = listener; }, finalMessage: async () => {
+        if (mode === 'reply' && calls === 1 && streamText) await streamText((delta) => onText?.(delta));
         if (preamble) return { content: [{ type: 'tool_use', id: 'look', name: 'list_files', input: {} }],
           usage: { input_tokens: 2, output_tokens: 1 }, stop_reason: 'tool_use' };
         if (mode === 'model' || mode === 'save-failure') {
@@ -241,12 +244,12 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
       if (!leaseValid) throw new Error('Lease authority lost');
       if (mode === 'save-failure') throw new Error('Storage unavailable');
       return { bytes: 1, committed: true };
-    } }, events: { subscribe: async (_id: string, listener: typeof cancelListener) => { cancelListener = listener; return () => {}; }, append: async () => {} },
+    } }, events: { subscribe: async (_id: string, listener: typeof cancelListener) => { cancelListener = listener; return () => {}; }, append: async (_id: string, type: string, data: Record<string, unknown>) => { if (type === 'agent.text') textEvents.push(String(data.delta)); } },
     limits: { maxSteps: 3, maxOutputTokens: 10, toolOutputMaxChars: 4096, maxSpecialistConsultations: mode === 'validation' ? 1 : 0,
       specialistMaxSteps: mode === 'validation' ? 2 : 1, commandTimeoutMs: 1000, previewReadyTimeoutSeconds: 1 }, heartbeatSeconds: 60, messageHistoryLimit: 10,
     log: { info: capture, warn: capture, error: capture },
   } as unknown as RunnerDependencies;
-  return { runner: new SessionRunner(deps), shutdown, entered, events, data, logs, sessions, running, adapter, signal: () => activeSignal, calls: () => calls,
+  return { runner: new SessionRunner(deps), shutdown, entered, events, textEvents, data, logs, sessions, running, adapter, signal: () => activeSignal, calls: () => calls,
     cancel: () => { cancelled = true; cancelListener?.({ type: 'session.cancel_requested' }); }, loseLease: () => { leaseValid = false; } };
 }
 
@@ -368,6 +371,28 @@ test('a message that needs no tool is answered without starting a sandbox or a d
   assert.deepEqual(h.events.filter((event) => ['mutation', 'terminate', 'stop-commands', 'save', 'detach'].includes(event)), []);
   assert.ok(h.events.includes('finish'));
   assert.equal([...h.data.values()].some((fields) => fields['meterKey'] === provider.concurrencyMeterKey), false, 'no sandbox capacity was ever held');
+});
+
+test('the first text chunk bypasses the timer while later chunks still batch without provisioning a sandbox', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const sent = deferred<void>(); const later = deferred<void>(); const sentLater = deferred<void>(); const finish = deferred<void>();
+  const h = runnerFixture('reply', async (send) => {
+    send('Hello'); sent.resolve(); await later.promise;
+    send(' there'); send('!'); sentLater.resolve(); await finish.promise;
+  });
+  const work = h.runner.runOnce();
+  await sent.promise; await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.textEvents, ['Hello'], 'first text is published without advancing the batching clock');
+  later.resolve(); await sentLater.promise;
+  assert.deepEqual(h.textEvents, ['Hello']);
+  t.mock.timers.tick(249); await Promise.resolve();
+  assert.deepEqual(h.textEvents, ['Hello']);
+  t.mock.timers.tick(1); await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.textEvents, ['Hello', ' there!']);
+  finish.resolve(); await work;
+  assert.deepEqual(h.textEvents, ['Hello', ' there!'], 'finishing does not duplicate flushed text');
+  assert.equal(h.events.includes('mutation'), false);
+  assert.equal([...h.data.values()].some((fields) => fields['meterKey'] === provider.concurrencyMeterKey), false);
 });
 
 test('cancelling a stream before the provider reported usage closes its holds at what they reserved', async () => {

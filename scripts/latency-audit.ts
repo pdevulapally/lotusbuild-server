@@ -129,7 +129,7 @@ try {
     });
   } finally { abort.abort(); await reader.cancel().catch(() => {}); }
   // Controlled model stream measures our coalescing timer, not provider performance.
-  for (let run = 0; run < 3; run++) {
+  for (let run = 0; run < 20; run++) {
     const projectId = `worker-audit-${run}`;
     h.data.set(`projects/${projectId}`, { ownerUid: 'audit-user', name: 'Audit', platform: 'web', status: 'draft', activeSessionId: null, snapshotBytes: 0, createdAt: Timestamp.now() });
     const account = await entitlements.forUser('audit-user'); const model = account.capabilities.stringList('ai.model.allowlist')[0]; assert.ok(model);
@@ -167,7 +167,7 @@ try {
   // Exercise the real runner polling loop, with an explicitly supplied diagnostic interval; this does not change configuration.
   for (let run = 0; run < 3; run++) {
     let readyAt = 0; let pickedAt = 0; let stopped = false; let polls = 0;
-    const runner = { runOnce: async () => { if (++polls === 1) { setTimeout(() => { readyAt = performance.now(); }, 20); return false; } pickedAt = performance.now(); stopped = true; return true; } } as SessionRunner;
+    const runner = { start: async () => { if (++polls === 1) { setTimeout(() => { readyAt = performance.now(); }, 20); return undefined; } pickedAt = performance.now(); stopped = true; return undefined; } } as unknown as SessionRunner;
     await runUntilStopped(runner, { idlePollSeconds: pollSeconds, shouldContinue: () => !stopped, log: { info() {}, warn() {}, error() {} } });
     (elapsed[`poll pickup after enqueue (diagnostic ${pollSeconds}s interval)`] ??= []).push(pickedAt-readyAt);
   }
