@@ -581,7 +581,8 @@ test('queued cancellation releases the project guard and refunds the build', asy
   const created = await h.sessions.create('user-1', 'project-1', { prompt: 'build', model: 'model-1' });
   await h.sessions.cancel('user-1', created.id);
 
-  assert.equal(h.session(created.id)?.['status'], 'FAILED');
+  assert.equal(h.session(created.id)?.['status'], 'STOPPED');
+  assert.equal(h.session(created.id)?.['error'], undefined);
   assert.equal(h.project()?.['activeSessionId'], null);
   assert.equal(h.charges(), 0);
 });
@@ -830,7 +831,7 @@ async function routeApp(h: ReturnType<typeof harness>, append: SessionEvents['ap
   registerErrorHandler(app);
   app.decorate('enforceRateLimit', () => async () => {});
   registerProjectRoutes(app, h.projects);
-  registerSessionRoutes(app, h.sessions, { append, notifyQueued: async () => {} } as SessionEvents,
+  registerSessionRoutes(app, h.sessions, { append, notifyQueued: async () => {}, notifyCancelled: async () => {} } as unknown as SessionEvents,
     { heartbeatSeconds: 15, maxConnections: 10, maxConnectionsPerUser: 2, maxBufferedBytes: 1024, reauthenticate: async () => {} });
   return app;
 }
@@ -974,7 +975,7 @@ test('cancel retries replay their committed result without refunding the build t
   const h = harness(); const app = await routeApp(h); t.after(() => app.close());
   const session = await h.sessions.create('user-1', 'project-1', { prompt: 'Build', model: 'model-1' });
   const request = { method: 'POST' as const, url: `/sessions/${session.id}/cancel`,
-    headers: { ...authHeaders, 'idempotency-key': 'cancel-operation-1' } };
+    headers: { ...authHeaders, 'idempotency-key': 'cancel-operation-1' }, payload: { execution: 1 } };
   const [first, repeated] = await Promise.all([app.inject(request), app.inject(request)]);
   assert.equal(first.statusCode, 200); assert.deepEqual(repeated.json(), first.json());
   assert.equal(h.charges(), 0); assert.equal(h.project()?.['activeSessionId'], null);
@@ -1276,7 +1277,7 @@ test('an awaiting-input task can be explicitly cancelled without granting approv
   const request = await h.sessions.requestInput(authority, 'approval', 'Publish?');
   await h.sessions.finish('s', authority, { status: 'IDLE' });
   const result = await h.sessions.cancel('user-1', 's', 'stable-cancel-input-key');
-  assert.equal(result.status, 'FAILED'); assert.equal(result.pendingInput, undefined);
+  assert.equal(result.status, 'STOPPED'); assert.equal(result.error, undefined); assert.equal(result.pendingInput, undefined);
   assert.equal(h.firestore.documents.get(`sessions/s/input_requests/${request.id}`)?.data['answer'], undefined);
 });
 
@@ -1353,4 +1354,85 @@ test('plan approval retries replay the accepted mode change while the session is
   assert.equal(conflict.statusCode, 409); assert.equal(conflict.json().error.code, 'request/idempotency-conflict');
   assert.equal(h.charges(), 1);
 
+});
+
+test('a Stop names the run it is aimed at, and a newer run refuses it without changing anything', async () => {
+  const h = harness();
+  const created = await h.sessions.create('user-1', 'project-1', { prompt: 'build', model: 'model-1' });
+  assert.equal(created.execution, 1);
+  await assert.rejects(h.sessions.cancel('user-1', created.id, 'stop-aimed-at-run-2', 2), { code: 'session/execution-changed' });
+  assert.equal(h.session(created.id)?.['status'], 'QUEUED');
+  assert.equal(h.session(created.id)?.['cancelRequested'], undefined);
+  const stopped = await h.sessions.cancel('user-1', created.id, 'stop-aimed-at-run-1', 1);
+  assert.equal(stopped.status, 'STOPPED'); assert.equal(stopped.error, undefined);
+  // The next message is a new run; a late Stop for run 1 cannot touch it.
+  const resumed = await h.sessions.appendPrompt('user-1', created.id, 'carry on');
+  assert.equal(resumed.execution, 2); assert.equal(h.session(created.id)?.['execution'], 2);
+  await assert.rejects(h.sessions.cancel('user-1', created.id, 'late-stop-for-run-1', 1), { code: 'session/execution-changed' });
+  assert.equal(h.session(created.id)?.['status'], 'QUEUED'); assert.equal(h.session(created.id)?.['cancelRequested'], undefined);
+});
+
+test('a hot-chained message is a new run under the same lease', async () => {
+  const h = harness(); h.seedSession('s', 'project-1', 'RUNNING');
+  h.firestore.seed('projects/project-1', { ...h.project(), activeSessionId: 's' });
+  const authority = { sessionId: 's', runnerId: 'runner-1', token: 'seed-token' };
+  await h.sessions.submitMessage('user-1', 's', 'and then this', false, 'stable-hot-chain-key-1', 'enqueue');
+  const next = await h.sessions.dequeueNextMessage('s', authority);
+  assert.equal(next?.prompt, 'and then this');
+  assert.equal(next?.execution, 2); assert.equal(h.session('s')?.['execution'], 2);
+});
+
+test('repeated Stops replay their receipt, and a Stop on a run already stopping changes nothing', async () => {
+  const h = harness(); h.seedSession('s', 'project-1', 'RUNNING');
+  h.firestore.seed('projects/project-1', { ...h.project(), activeSessionId: 's' });
+  const first = await h.sessions.cancel('user-1', 's', 'stable-stop-key-000001', 1);
+  const replayed = await h.sessions.cancel('user-1', 's', 'stable-stop-key-000001', 1);
+  assert.deepEqual(replayed, first);
+  assert.equal(first.cancelRequested, true); assert.ok(first.cancelRequestedAt instanceof Date);
+  const again = await h.sessions.cancel('user-1', 's', 'stable-another-stop-key-2', 1);
+  assert.equal(again.cancelRequested, true);
+  assert.equal(again.cancelRequestedAt?.getTime(), first.cancelRequestedAt?.getTime(), 'the first Stop keeps its timestamp');
+  assert.equal(h.session('s')?.['status'], 'RUNNING', 'the worker, not the API, ends the run');
+});
+
+test('STOPPED is written only for a run the user asked to stop, and the finished run clears its Stop request', async () => {
+  const h = harness(); h.seedSession('s', 'project-1', 'RUNNING');
+  h.firestore.seed('projects/project-1', { ...h.project(), activeSessionId: 's' });
+  const authority = { sessionId: 's', runnerId: 'runner-1', token: 'seed-token' };
+  await assert.rejects(h.sessions.finish('s', authority, { status: 'STOPPED' }), /asked it to stop/);
+  assert.equal(h.session('s')?.['status'], 'RUNNING');
+  await h.sessions.cancel('user-1', 's', 'stable-stop-key-000001', 1);
+  assert.equal(await h.sessions.finish('s', authority, { status: 'STOPPED' }), 'STOPPED');
+  const doc = h.session('s');
+  assert.equal(doc?.['status'], 'STOPPED'); assert.equal(doc?.['error'], undefined);
+  assert.equal(doc?.['cancelRequested'], undefined); assert.equal(doc?.['cancelRequestedAt'], undefined);
+  assert.equal((await h.sessions.readOwned('user-1', 's')).execution, 1, 'a session journaled before this change reads as run 1');
+  assert.equal(h.project()?.['activeSessionId'], null, 'a stopped session releases the project like any ended run');
+  const resumed = await h.sessions.appendPrompt('user-1', 's', 'carry on');
+  assert.equal(resumed.status, 'QUEUED'); assert.equal(resumed.execution, 2);
+});
+
+test('POST /cancel requires the run it is aimed at and reports the stop honestly', async (t) => {
+  const h = harness(); const published: { type: string; data: Record<string, unknown> }[] = [];
+  const app = await routeApp(h, async (_id, type, data) => { published.push({ type, data: data as Record<string, unknown> }); return { id: '1-0', type, data }; });
+  t.after(() => app.close());
+  const session = await h.sessions.create('user-1', 'project-1', { prompt: 'Build', model: 'model-1' });
+  const url = `/sessions/${session.id}/cancel`;
+  assert.equal((await app.inject({ method: 'POST', url, headers: authHeaders })).statusCode, 400, 'a Stop with no run named is refused');
+  const stale = await app.inject({ method: 'POST', url, headers: { ...authHeaders, 'idempotency-key': 'stable-stale-stop-key-1' }, payload: { execution: 2 } });
+  assert.equal(stale.statusCode, 409); assert.ok(JSON.stringify(stale.json()).includes('session/execution-changed'));
+  assert.equal(h.session(session.id)?.['status'], 'QUEUED');
+  const ok = await app.inject({ method: 'POST', url, headers: { ...authHeaders, 'idempotency-key': 'stable-real-stop-key-1' }, payload: { execution: 1 } });
+  assert.equal(ok.statusCode, 200);
+  assert.equal(ok.json().status, 'STOPPED'); assert.equal(ok.json().execution, 1); assert.equal(ok.json().error, undefined);
+  assert.deepEqual(published.map((event) => event.type), ['session.stopped']);
+  assert.equal(published[0]?.data['execution'], 1);
+
+  h.seedSession('running', 'project-1', 'RUNNING');
+  h.firestore.seed('projects/project-1', { ...h.project(), activeSessionId: 'running' });
+  const accepted = await app.inject({ method: 'POST', url: '/sessions/running/cancel', headers: { ...authHeaders, 'idempotency-key': 'stable-running-stop-key-1' }, payload: { execution: 1 } });
+  assert.equal(accepted.statusCode, 200, accepted.body);
+  assert.equal(accepted.json().status, 'RUNNING', 'accepting a Stop is not the same as having stopped');
+  assert.equal(accepted.json().cancelRequested, true); assert.equal(typeof accepted.json().cancelRequestedAt, 'string');
+  assert.deepEqual(published.at(-1)?.type, 'session.cancel_requested'); assert.equal(published.at(-1)?.data['execution'], 1);
 });

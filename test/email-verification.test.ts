@@ -84,7 +84,7 @@ test('an unverified user can still read, cancel and delete', async (t) => {
   assert.equal(list.statusCode, 200);
   assert.deepEqual(list.json(), { projects: [] });
   assert.equal((await h.app.inject({ method: 'DELETE', url: '/projects/p1', headers })).statusCode, 204);
-  assert.equal((await h.app.inject({ method: 'POST', url: '/sessions/s1/cancel', headers })).statusCode, 200);
+  assert.equal((await h.app.inject({ method: 'POST', url: '/sessions/s1/cancel', headers, payload: { execution: 1 } })).statusCode, 200);
   assert.equal((await h.app.inject({ method: 'DELETE', url: '/sessions/s1/queued-messages/m1', headers })).statusCode, 204);
   assert.equal((await h.app.inject({ method: 'PATCH', url: '/projects/p1/public-preview', headers, payload: { enabled: false } })).statusCode, 200);
 });

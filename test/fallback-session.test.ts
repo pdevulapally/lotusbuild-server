@@ -282,7 +282,7 @@ test('fallback consent racing explicit cancellation cannot resurrect a cancelled
   for (let attempt = 0; attempt < 4; attempt++) {
     const h = fixture(); const session = await h.create('p'); const paused = await h.pause(session);
     await Promise.allSettled([h.sessions.acceptFallback('u', session.id, 'race-consent-command', paused.input), h.sessions.cancel('u', session.id, 'race-cancel-command')]);
-    assert.equal((await h.sessions.readOwned('u', session.id)).status, 'FAILED');
+    assert.equal((await h.sessions.readOwned('u', session.id)).status, 'STOPPED');
     assert.equal(await h.sessions.claim('late-worker'), undefined);
     assert.equal(h.data.get(`users/u/usage/${h.registry.buildMeterKey}`)?.['consumed'], 1);
   }

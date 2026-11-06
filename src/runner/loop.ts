@@ -295,7 +295,7 @@ export class SessionRunner {
    * Never throws. Failing to withdraw is bounded by the handoff's own expiry,
    * and must not turn releasing a sandbox into a failure.
    */
-  async #endDesktop(sessionId: string, reason: DesktopEndReason, alsoUnannounced = false): Promise<void> {
+  async #endDesktop(sessionId: string, execution: number, reason: DesktopEndReason, alsoUnannounced = false): Promise<void> {
     const handoff = this.#deps.desktop;
     // A build with no desktop never touches Redis. Only a successor to a dead
     // runner has to look for an entry it did not write itself.
@@ -303,7 +303,7 @@ export class SessionRunner {
     try {
       const existed = await handoff.clear(sessionId);
       const announced = this.#desktops.delete(sessionId);
-      if (existed || announced) await this.#deps.events.append(sessionId, 'desktop.ended', { reason });
+      if (existed || announced) await this.#deps.events.append(sessionId, 'desktop.ended', { execution, reason });
     } catch (error) {
       this.#deps.log.warn({ sessionId, diagnostic: safeErrorDiagnostic(error) }, 'could not withdraw the desktop');
     }
@@ -409,8 +409,12 @@ export class SessionRunner {
     let pendingText = '';
     let firstText = true;
     let textTimer: ReturnType<typeof setTimeout> | undefined;
+    // Every event this worker journals names the run it belongs to; a
+    // hot-chained message advances it, so late events can never be mistaken
+    // for a later run's.
+    let execution = session.execution;
     const appendEvent = async (type: string, data: Record<string, unknown>): Promise<void> => {
-      try { await events.append(session.id, type, data, authority); }
+      try { await events.append(session.id, type, { execution, ...data }, authority); }
       catch (error) { log.error({ sessionId: session.id, type, diagnostic: safeErrorDiagnostic(error) }, 'session event was not published'); }
     };
     let textFlush = Promise.resolve();
@@ -513,7 +517,7 @@ export class SessionRunner {
       const abandoned = [...new Set([...session.reservationIds, ...session.specialistReservationIds])];
       if (session.sandboxId !== undefined || abandoned.length > 0) {
         // A runner that died with a desktop up cannot have withdrawn it.
-        await this.#endDesktop(session.id, 'sandbox-stopped', true);
+        await this.#endDesktop(session.id, execution, 'sandbox-stopped', true);
         try {
           await sandboxes.recover({ uid: session.ownerUid, platform: project.platform,
             externalSandboxId: session.sandboxId, reservationIds: abandoned, now: new Date(),
@@ -826,6 +830,7 @@ export class SessionRunner {
       let nextQueued = registry.fallback === undefined && !isContinuation ? await sessions.dequeueNextMessage(session.id, authority, signal) : undefined;
       while (nextQueued !== undefined) {
         turnCompleted = false;
+        execution = nextQueued.execution;
         signal.throwIfAborted();
         await publish('session.queued', { queuedMessageId: nextQueued.id });
         log.info(
@@ -911,7 +916,7 @@ export class SessionRunner {
       if (acquired !== undefined) {
         await this.#save(session, authority, project, entitlements, acquired, persists, restored, publish);
         saveCompleted = true;
-        await this.#letGo(session, acquired);
+        await this.#letGo(session, acquired, execution);
         acquired = undefined;
       } else saveCompleted = true;
 
@@ -955,7 +960,7 @@ export class SessionRunner {
         }
         if (acquired !== undefined) {
           await this.#save(session, authority, project, entitlements, acquired, persists, restored, publish, true);
-          await this.#letGo(session, acquired); acquired = undefined;
+          await this.#letGo(session, acquired, execution); acquired = undefined;
         }
         await sessions.pauseContinuation(authority, error.checkpoint, state, retryAt);
         await publish(retryAt === undefined ? 'session.idle' : 'session.queued', { fallback: state.status });
@@ -981,7 +986,7 @@ export class SessionRunner {
         // throw before it is released, and a failed session should not keep
         // offering a live view of it.
         await settleDesktop();
-        await this.#endDesktop(session.id, 'session-ended');
+        await this.#endDesktop(session.id, execution, 'session-ended');
         if (workspaceMayBeDirty && saveAttempted && !saveCompleted) throw new RunnerWorkError(error, 'workspace/save-failed');
         // Saved before the machine is discarded, even now: a build that failed
         // at step nine still wrote eight steps of a project the user is paying
@@ -1008,13 +1013,13 @@ export class SessionRunner {
             );
             if (workspaceMayBeDirty) throw new RunnerWorkError(error, 'workspace/save-failed');
             // No primary mutation was admitted: cleanup may dispose of this VM.
-            try { await this.#letGo(session, acquired); }
+            try { await this.#letGo(session, acquired, execution); }
             catch { throw new RunnerWorkError(error, 'workspace/save-and-cleanup-failed'); }
             acquired = undefined;
             throw new RunnerWorkError(error, 'workspace/save-failed-without-mutations');
           }
         }
-        try { await this.#letGo(session, acquired); }
+        try { await this.#letGo(session, acquired, execution); }
         catch { throw new RunnerWorkError(error, 'sandbox/cleanup-failed'); }
       }
       if (error instanceof AppError && error.code === 'session/input-persistence-unconfirmed') {
@@ -1029,6 +1034,22 @@ export class SessionRunner {
         if (turnCompleted) await sessions.finish(session.id, authority, { status: 'IDLE' });
         else await sessions.yieldForRecovery(session.id, authority);
         log.info({ sessionId: session.id }, 'session left recoverable after runner shutdown');
+        return;
+      }
+      // The user's Stop, carried out: resources are released above, so this
+      // is the confirmation — recorded as STOPPED, never as a failure.
+      const stopped = error instanceof AppError && error.code === 'session/cancelled';
+      if (stopped) {
+        try {
+          const durable = await sessions.readOwned(session.ownerUid, session.id);
+          const stopAfterMs = durable.cancelRequestedAt === undefined ? undefined : Math.max(0, Date.now() - durable.cancelRequestedAt.getTime());
+          await sessions.finish(session.id, authority, { status: 'STOPPED' });
+          await publish('session.stopped', { ...(stopAfterMs === undefined ? {} : { stopAfterMs }) });
+          log.info({ sessionId: session.id, execution, ...(stopAfterMs === undefined ? {} : { stopAfterMs }), path: session.recovered === true ? 'recovered' : 'live' }, 'session stopped');
+        } catch (cause) {
+          log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(cause) }, 'could not mark the session stopped');
+          throw new RunnerWorkError(error, 'session/finalization-failed');
+        }
         return;
       }
       try {
@@ -1167,11 +1188,11 @@ export class SessionRunner {
     }
   }
 
-  async #letGo(session: ClaimedSession, acquired: AcquiredSandbox): Promise<void> {
+  async #letGo(session: ClaimedSession, acquired: AcquiredSandbox, execution = session.execution): Promise<void> {
     const { sessions, sandboxes, log, runnerId } = this.#deps;
     const authority = { sessionId: session.id, runnerId, token: session.leaseToken };
     // The machine is about to stop, so the desktop on it is over.
-    await this.#endDesktop(session.id, 'session-ended');
+    await this.#endDesktop(session.id, execution, 'session-ended');
     await sandboxes.release({
       uid: session.ownerUid,
       acquired,

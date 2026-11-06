@@ -154,7 +154,7 @@ test('failed-save successor publishes and restores actual mutated workspace byte
   const restored = h.sandbox('restored');
   await h.persistence.restore(restored, h.provider, await h.projects.readOwned('u', 'p'));
   assert.equal(await restored.readFile('mutated.txt'), 'These workspace bytes must survive.');
-  assert.equal(h.record()['status'], 'FAILED'); // Existing user cancellation semantics.
+  assert.equal(h.record()['status'], 'STOPPED'); // A user stop is confirmed as STOPPED once the bytes are safe.
   assert.equal(h.data.get(`users/u/usage/${h.provider.concurrencyMeterKey}`)?.['reserved'], 0);
 });
 

@@ -218,7 +218,7 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
       } };
     },
   } } as unknown as Anthropic;
-  const session = { id: 's', projectId: 'p', ownerUid: 'u', model: entitlements.capabilities.stringList('ai.model.allowlist')[0],
+  const session = { id: 's', projectId: 'p', ownerUid: 'u', execution: 1, model: entitlements.capabilities.stringList('ai.model.allowlist')[0],
     effort: 'low', mode: 'build', leaseToken: 'lease', reservationIds: [], specialistReservationIds: [] };
   const sessions = {
     saveTaskContext: async () => {},
@@ -231,7 +231,7 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
     forgetSpecialistReservation: async () => {},
     appendAssistantMessage: async () => { if (mode === 'queue') shutdown.abort(); },
     dequeueNextMessage: async () => { events.push('dequeue'); },
-    yieldForRecovery: async () => { events.push('yield'); }, finish: async () => { events.push('finish'); return 'QUEUED'; },
+    readOwned: async () => session, yieldForRecovery: async () => { events.push('yield'); }, finish: async (_id: string, _lease: unknown, outcome: { status: string }) => { events.push(`finish:${outcome.status}`); return 'QUEUED'; },
   };
   const logs: { details: object; message: string }[] = [];
   const capture = (details: object, message: string) => { logs.push({ details, message }); };
@@ -263,7 +263,7 @@ test('detachment failure logs safe diagnostics while retaining existing cleanup 
   assert.ok(row);
   assert.deepEqual(row.details, { sessionId: 's', diagnostic: { category: 'error/runtime', statusCode: 503 } });
   assert.equal(inspect(h.logs, { depth: 10 }).includes(secret), false);
-  assert.ok(h.events.includes('finish'), 'I02 lifecycle propagation is deliberately unchanged');
+  assert.ok(h.events.some((event) => event.startsWith('finish:')), 'I02 lifecycle propagation is deliberately unchanged');
 });
 
 test('validation disposal callback excludes nested provider errors and command stderr', async () => {
@@ -303,18 +303,19 @@ test('heartbeat lease loss aborts active work and cannot finalize or publish a c
   await h.entered.promise; h.loseLease(); t.mock.timers.tick(60000);
   await assert.rejects(work, RunnerWorkError);
   assert.equal(h.signal()?.aborted, true);
-  assert.equal(h.events.includes('finish'), false);
+  assert.equal(h.events.some((event) => event.startsWith('finish:')), false);
   assert.equal(h.events.includes('yield'), false);
 });
 
-test('user cancellation reaches the active command, saves partial work and follows existing failure finalization', async () => {
+test('user cancellation reaches the active command, saves partial work and finishes STOPPED', async () => {
   const h = runnerFixture('command');
   const work = h.runner.runOnce();
   await h.entered.promise; h.cancel(); h.cancel(); await work;
   assert.equal(h.signal()?.aborted, true);
   assert.equal(h.calls(), 1);
   assert.ok(h.events.indexOf('save') < h.events.indexOf('terminate'));
-  assert.ok(h.events.includes('finish'));
+  assert.ok(h.events.includes('finish:STOPPED'), 'a user stop is confirmed as STOPPED after save and release');
+  assert.ok(h.events.indexOf('terminate') < h.events.indexOf('finish:STOPPED'), 'STOPPED is written only after the sandbox is released');
   assert.equal(h.events.includes('yield'), false);
   assert.equal(h.events.includes('dequeue'), false);
   assert.equal(h.data.get(`users/u/usage/${provider.concurrencyMeterKey}`)?.['reserved'], 0);
@@ -337,7 +338,7 @@ for (const mode of ['model', 'command', 'queue', 'save-failure'] as const) {
       assert.equal(h.events.includes('yield'), false);
     } else {
       assert.ok(h.events.indexOf('save') < h.events.indexOf('terminate'));
-      assert.ok(h.events.includes(mode === 'queue' ? 'finish' : 'yield'));
+      assert.ok(mode === 'queue' ? h.events.some((event) => event.startsWith('finish:')) : h.events.includes('yield'));
       assert.equal(h.data.get(`users/u/usage/${provider.concurrencyMeterKey}`)?.['reserved'], 0);
     }
     if (mode === 'model') {
@@ -369,7 +370,7 @@ test('a message that needs no tool is answered without starting a sandbox or a d
   // The reply itself, then the explicit answered outcome the ledger asks for: two cheap model calls, no machine.
   assert.equal(h.calls(), 2);
   assert.deepEqual(h.events.filter((event) => ['mutation', 'terminate', 'stop-commands', 'save', 'detach'].includes(event)), []);
-  assert.ok(h.events.includes('finish'));
+  assert.ok(h.events.some((event) => event.startsWith('finish:')));
   assert.equal([...h.data.values()].some((fields) => fields['meterKey'] === provider.concurrencyMeterKey), false, 'no sandbox capacity was ever held');
 });
 
@@ -403,7 +404,7 @@ test('cancelling a stream before the provider reported usage closes its holds at
   assert.deepEqual(open, [], 'nothing is left in flight for a reconciliation that can never come');
   const estimated = [...h.data.values()].filter((fields) => fields['usageEvidence'] === 'provider-usage-unavailable');
   assert.ok(estimated.length > 0 && estimated.every((fields) => fields['status'] === 'SETTLED' && fields['settledQuantity'] === fields['estimatedQuantity']));
-  assert.ok(h.events.includes('finish'));
+  assert.ok(h.events.some((event) => event.startsWith('finish:')));
 });
 
 test('a restarted worker never replays a turn whose execution already began', async () => {
@@ -411,7 +412,7 @@ test('a restarted worker never replays a turn whose execution already began', as
   const original = await h.sessions.claim();
   h.sessions.claim = async () => ({ ...original, executionStarted: true });
   await h.runner.runOnce();
-  assert.equal(h.calls(), 0); assert.equal(h.events.includes('finish'), true);
+  assert.equal(h.calls(), 0); assert.equal(h.events.some((event) => event.startsWith('finish:')), true);
   assert.equal(h.events.includes('dequeue'), false);
 });
 
@@ -420,7 +421,7 @@ test('a restarted worker preserves an unanswered request without calling the mod
   const original = await h.sessions.claim();
   h.sessions.claim = async () => ({ ...original, pendingInput: { id: 'request', kind: 'approval', prompt: 'Publish?' } });
   await h.runner.runOnce();
-  assert.equal(h.calls(), 0); assert.equal(h.events.includes('finish'), true);
+  assert.equal(h.calls(), 0); assert.equal(h.events.some((event) => event.startsWith('finish:')), true);
 });
 
 test('concurrency works several claims at once and never exceeds the slot count', async () => {
