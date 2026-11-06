@@ -162,6 +162,11 @@ function runnerFixture(options: {
   firstTool?: 'run_command' | 'open_in_browser';
   /** A durable user request for the desktop, as the session document would carry it. */
   desktopRequested?: { execution: number };
+  /** The request appears only after the run's first look at the session, as if it arrived mid-run and its notification was lost. */
+  desktopRequestedLater?: boolean;
+  heartbeatSeconds?: number;
+  /** Holds the final model step open so a heartbeat can fire inside the run. */
+  slowFinishMs?: number;
 }) {
   const firstTool = options.firstTool ?? (options.desktop ? 'open_in_browser' : 'run_command');
   const { db } = ledger();
@@ -193,16 +198,19 @@ function runnerFixture(options: {
       // The first step reaches for a tool, which is what starts the machine; the
       // 'model' marker is the generation that then runs against it.
       if (modelCalls > 1) order.push('model');
+      const hold = modelCalls > 1 && options.slowFinishMs !== undefined ? new Promise<void>((resolve) => setTimeout(resolve, options.slowFinishMs)) : Promise.resolve();
       systemPrompts.push(typeof params.system === 'string' ? params.system : JSON.stringify(params.system ?? ''));
-      return { on: () => {}, finalMessage: async () => ({ content: modelCalls === 1
+      return { on: () => {}, finalMessage: async () => ({ ...(await hold.then(() => ({}))), content: modelCalls === 1
         ? [{ type: 'tool_use', id: 'look', name: firstTool, input: firstTool === 'run_command' ? { command: 'true' } : { url: 'http://127.0.0.1:5173' } }]
         : [{ type: 'tool_use', id: 'done', name: 'finish_task', input: { outcome: 'blocked', summary: 'Fixture turn complete.', evidence: [] } }],
       usage: { input_tokens: 2, output_tokens: 1 }, stop_reason: 'tool_use' }) }; },
   } } as unknown as Anthropic;
   const session = { id: 's', projectId: 'p', ownerUid: 'u', execution: 1, model: entitlements.capabilities.stringList('ai.model.allowlist')[0],
     effort: 'low', mode: 'build', leaseToken: 'lease', reservationIds: [], specialistReservationIds: [],
-    ...(options.desktopRequested === undefined ? {} : { desktopRequested: { ...options.desktopRequested, at: new Date() } }) };
+    ...(options.desktopRequested === undefined || options.desktopRequestedLater === true ? {} : { desktopRequested: { ...options.desktopRequested, at: new Date() } }) };
   const clearedRequests: number[] = [];
+  let reads = 0;
+  let requestCleared = false;
   const sessions = {
     saveTaskContext: async () => {}, requireWorkspaceSalvage: async () => {}, claim: async () => session, heartbeat: async () => {}, assertPersistenceLease: async () => { if (cancelled) throw new AppError({ code: 'session/cancelled', statusCode: 409, message: 'Cancelled by user' }); }, markExecutionStarted: async () => {},
     attachSandbox: async () => {}, detachSandbox: async () => {}, drainSteerMessage: async () => undefined,
@@ -211,8 +219,13 @@ function runnerFixture(options: {
       metering.reserve({ ...input, uid: 'u', entitlements, now: new Date() }),
     forgetSpecialistReservation: async () => {},
     appendAssistantMessage: async () => {}, dequeueNextMessage: async () => undefined,
-    readOwned: async () => session, yieldForRecovery: async () => {}, finish: async () => { order.push('finish'); return 'IDLE'; },
-    clearDesktopRequest: async () => { clearedRequests.push(1); order.push('clearDesktopRequest'); },
+    readOwned: async () => {
+      reads++;
+      if (options.desktopRequestedLater === true && options.desktopRequested !== undefined && reads > 1 && !requestCleared) return { ...session, desktopRequested: { ...options.desktopRequested, at: new Date() } };
+      return session;
+    },
+    yieldForRecovery: async () => {}, finish: async () => { order.push('finish'); return 'IDLE'; },
+    clearDesktopRequest: async (_authority: unknown, execution: number) => { clearedRequests.push(execution); requestCleared = true; order.push('clearDesktopRequest'); },
   };
   const handoffPort: DesktopHandoffPort = {
     publish: async (sessionId, handoff, ttl) => {
@@ -233,7 +246,7 @@ function runnerFixture(options: {
       append: async (_id: string, type: string, data: Record<string, unknown>) => { emitted.push({ type, data }); order.push(type); } },
     limits: { maxSteps: 3, maxOutputTokens: 10, toolOutputMaxChars: 4096, maxSpecialistConsultations: 0, specialistMaxSteps: 1,
       commandTimeoutMs: 1000, previewReadyTimeoutSeconds: 1 },
-    heartbeatSeconds: 60, messageHistoryLimit: 10, log: { info: capture, warn: capture, error: capture },
+    heartbeatSeconds: options.heartbeatSeconds ?? 60, messageHistoryLimit: 10, log: { info: capture, warn: capture, error: capture },
     ...(options.desktopStartTimeoutMs === undefined ? {} : { desktopStartTimeoutMs: options.desktopStartTimeoutMs }),
     ...(options.desktopStartGraceMs === undefined ? {} : { desktopStartGraceMs: options.desktopStartGraceMs }),
     ...(options.withoutHandoffPort === true ? {} : { desktop: handoffPort }),
@@ -457,7 +470,7 @@ test('a durable user request for this run starts the desktop once, even if the n
   const h = runnerFixture({ desktop: true, firstTool: 'run_command', desktopRequested: { execution: 1 } });
   await h.runner.runOnce();
   assert.equal(h.order.filter((step) => step === 'startDesktop').length, 1, h.diagnostics());
-  assert.equal(h.clearedRequests.length, 1);
+  assert.deepEqual(h.clearedRequests, [1], 'only this run\'s request is cleared');
   const at = (name: string) => h.order.indexOf(name);
   assert.ok(at('startDesktop') < at('publish') && at('publish') < at('desktop.ready') && at('desktop.ready') < at('model'), h.diagnostics());
 });
@@ -476,4 +489,12 @@ test('an agent screen tool and a user request arriving together start one deskto
   await run;
   assert.equal(h.order.filter((step) => step === 'startDesktop').length, 1, h.diagnostics());
   assert.equal(h.emitted.filter((event) => event.type === 'desktop.ready').length, 1);
+});
+
+test('a request that arrives mid-run with its notification lost is found at the next heartbeat', async () => {
+  const h = runnerFixture({ desktop: true, firstTool: 'run_command', desktopRequested: { execution: 1 }, desktopRequestedLater: true, heartbeatSeconds: 0.02, slowFinishMs: 120 });
+  await h.runner.runOnce();
+  assert.equal(h.order.filter((step) => step === 'startDesktop').length, 1, h.diagnostics());
+  assert.deepEqual(h.clearedRequests, [1]);
+  assert.ok(h.types().includes('desktop.ready'), h.diagnostics());
 });

@@ -426,6 +426,7 @@ export class SessionRunner {
         stopWork(error instanceof Error ? error : new Error(String(error)));
         log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(leaseLost) }, 'lost the lease on this session');
       });
+      onHeartbeat?.();
     }, this.#deps.heartbeatSeconds * 1000);
 
     let unsubscribeCancel: (() => void) | undefined;
@@ -512,6 +513,7 @@ export class SessionRunner {
     let desktopAbort: AbortController | undefined;
     let desktopStart: Promise<boolean> | undefined;
     let onDesktopRequested: (() => void) | undefined;
+    let onHeartbeat: (() => void) | undefined;
     let sandboxProvider: SandboxProvider | undefined;
     // A desktop still starting when the session is over is withdrawn, never
     // announced: the user must not be shown a screen for work that has ended.
@@ -773,16 +775,25 @@ export class SessionRunner {
       };
       const desktopOffered = sandboxProvider.desktop !== undefined;
       // A user's request for the desktop is durable on the session; the Redis
-      // notification only hurries it along. Only a request naming this run counts.
-      const honourDesktopRequest = async (): Promise<void> => {
-        const durable = await sessions.readOwned(session.ownerUid, session.id);
-        if (durable.desktopRequested === undefined) return;
-        if (durable.desktopRequested.execution !== execution) return;
-        const ready = await ensureDesktop();
-        try { await sessions.clearDesktopRequest(authority); } catch (error) { log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'could not clear the desktop request'); }
-        if (!ready) log.warn({ sessionId: session.id, execution }, 'the desktop the user asked for could not be started');
+      // notification only hurries it along, and every heartbeat re-reads it so a
+      // lost notification costs one heartbeat, as with Stop. Only a request
+      // naming this run counts, and only that request is cleared afterwards.
+      let honouring: Promise<void> | undefined;
+      const honourDesktopRequest = (): Promise<void> => {
+        honouring ??= (async () => {
+          try {
+            const durable = await sessions.readOwned(session.ownerUid, session.id);
+            if (durable.desktopRequested?.execution !== execution) return;
+            const requested = execution;
+            const ready = await ensureDesktop();
+            try { await sessions.clearDesktopRequest(authority, requested); } catch (error) { log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'could not clear the desktop request'); }
+            if (!ready) log.warn({ sessionId: session.id, execution }, 'the desktop the user asked for could not be started');
+          } finally { honouring = undefined; }
+        })();
+        return honouring;
       };
       onDesktopRequested = () => { void honourDesktopRequest().catch((error: unknown) => log.warn({ sessionId: session.id, diagnostic: safeErrorDiagnostic(error) }, 'desktop request could not be honoured')); };
+      onHeartbeat = onDesktopRequested;
       const desktopReady = desktopOffered;
       const toolCall = async (name: string, input: Record<string, unknown>, callId?: string) => {
         await sessions.assertPersistenceLease(authority);

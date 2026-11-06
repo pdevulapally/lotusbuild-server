@@ -1369,25 +1369,38 @@ export class SessionRepository {
     });
   }
 
-  /** The owner wants to see this run's desktop. Only a live run can show one; the request names the run so a later run never inherits it. */
-  async requestDesktop(uid: string, sessionId: string): Promise<{ execution: number; alreadyRequested: boolean }> {
+  /**
+   * The owner wants to see this run's desktop. Only a live run can show one, the
+   * caller names the run it is looking at (a stale tab must not start a desktop
+   * in a newer run), and a provider without a desktop is refused rather than
+   * acknowledged. The request is stored on the session so a lost notification
+   * cannot lose it.
+   */
+  async requestDesktop(uid: string, sessionId: string, expectedExecution: number): Promise<{ execution: number; alreadyRequested: boolean }> {
+    const { registry } = await this.#configuration.get();
     const ref = this.#ref(sessionId);
     return this.#firestore.runTransaction(async (transaction) => {
       const snapshot = await transaction.get(ref);
       const current = parseSession(sessionId, snapshot.data() ?? {}, ref.path);
       if (!snapshot.exists || current.ownerUid !== uid) throw new AppError({ code: 'session/not-found', statusCode: 404, message: 'No such session.' });
-      await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId, true);
+      const project = await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId, true);
+      if (registry.sandboxProviders.get(project.platform)?.desktop === undefined) {
+        throw new AppError({ code: 'desktop/unsupported', statusCode: 409, message: 'This project runs without a desktop.' });
+      }
       if (current.status !== 'RUNNING') {
         throw new AppError({ code: 'desktop/no-active-run', statusCode: 409, message: 'The desktop can be started while the agent is working. Send a message to start a run.' });
       }
+      assertSameExecution(current, expectedExecution);
       if (current.desktopRequested?.execution === current.execution) return { execution: current.execution, alreadyRequested: true };
       transaction.update(ref, { desktopRequested: { execution: current.execution, at: FieldValue.serverTimestamp() }, updatedAt: FieldValue.serverTimestamp() });
       return { execution: current.execution, alreadyRequested: false };
     });
   }
 
-  async clearDesktopRequest(authority: SessionLease): Promise<void> {
-    await this.#withLease(authority.sessionId, authority, (tx, ref) => {
+  /** Settles a request, but only the one for `execution`: a late handler must not clear a newer run's request. */
+  async clearDesktopRequest(authority: SessionLease, execution: number): Promise<void> {
+    await this.#withLease(authority.sessionId, authority, (tx, ref, session) => {
+      if (session.desktopRequested?.execution !== execution) return;
       tx.update(ref, { desktopRequested: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() });
     });
   }

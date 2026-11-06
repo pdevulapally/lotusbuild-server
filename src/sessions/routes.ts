@@ -512,19 +512,24 @@ export function registerSessionRoutes(
   );
 
   // The user wants to watch this run's desktop. The request is recorded on the
-  // session (durable, aimed at the current run) and the event hurries the live
-  // runner; a runner that missed the event finds the request on the session.
-  app.post<{ Params: { sessionId: string } }>(
+  // session (durable, aimed at the run the caller named) and the event hurries
+  // the live runner; a runner that missed the event finds the request on the
+  // session at its next heartbeat. Every accepted request is announced, so a
+  // repeat after a lost notification is not silently swallowed.
+  app.post<{ Params: { sessionId: string }; Body: { execution: number } }>(
     '/sessions/:sessionId/desktop',
     {
       preHandler: [app.requireAuth, app.enforceRateLimit('write')],
-      schema: { params: { type: 'object', required: ['sessionId'], additionalProperties: false, properties: { sessionId: { type: 'string', pattern: documentId } } } },
+      schema: {
+        params: { type: 'object', required: ['sessionId'], additionalProperties: false, properties: { sessionId: { type: 'string', pattern: documentId } } },
+        body: { type: 'object', required: ['execution'], additionalProperties: false, properties: { execution: { type: 'integer', minimum: 1 } } },
+      },
     },
     async (request, reply) => {
       const user = authenticatedUser(request);
       const { sessionId } = request.params;
-      const result = await sessions.requestDesktop(user.uid, sessionId);
-      if (!result.alreadyRequested) publish(request.log, sessionId, 'desktop.requested', { sessionId, execution: result.execution });
+      const result = await sessions.requestDesktop(user.uid, sessionId, request.body.execution);
+      publish(request.log, sessionId, 'desktop.requested', { sessionId, execution: result.execution });
       return reply.code(202).send({ sessionId, execution: result.execution, requested: true });
     },
   );
