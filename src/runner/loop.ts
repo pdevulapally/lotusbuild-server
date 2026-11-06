@@ -574,7 +574,11 @@ export class SessionRunner {
         }
       }
       const onAdmissionFailure = async (error: unknown, checkpoint: ContinuationCheckpoint): Promise<void> => {
-        if (registry.fallback === undefined || !persists) return;
+        // Without durable persistence a checkpoint cannot restore workspace
+        // state — unless nothing was ever provisioned, where the transcript
+        // alone is enough to continue. Persistence-less users (e.g. the free
+        // plan) can still switch models when no sandbox exists to lose.
+        if (registry.fallback === undefined || (!persists && acquired !== undefined)) return;
         if (!tokenLimit(error, registry, inFallback ? 'fallback' : 'premium') && !(isContinuation && capacityFailure(error))) return;
         try { serializeCheckpoint(checkpoint, registry.fallback.maxCheckpointBytes); }
         catch { throw new AppError({ code: 'fallback/checkpoint-unavailable', statusCode: 409, message: 'Saved files were preserved, but this task contains context that cannot safely switch models. No action will be replayed.' }); }
@@ -900,7 +904,10 @@ export class SessionRunner {
     } catch (error) {
       if (error instanceof RunnerWorkError) throw error;
       if (error instanceof ContinuationPause) {
-        if (project === undefined || entitlements === undefined || sandboxProvider === undefined || sourceRegistry?.fallback === undefined) throw new RunnerWorkError(error, 'fallback/checkpoint-context-missing');
+        if (project === undefined || entitlements === undefined || sourceRegistry?.fallback === undefined) throw new RunnerWorkError(error, 'fallback/checkpoint-context-missing');
+        // A session that never acquired a sandbox still has a provider for the
+        // verification step; only persistence-free tasks take this path.
+        const sandbox = sandboxProvider ?? await sandboxes.providerFor(project.platform);
         const policy = sourceRegistry.fallback;
         let state: FallbackState;
         let retryAt: Date | undefined;
@@ -912,7 +919,7 @@ export class SessionRunner {
         } else {
           try {
             requireFallbackPolicy(sourceRegistry, entitlements);
-            const offer = await verifyFallbackModel(this.#providers().get(policy.provider), policy, error.checkpoint, sandboxProvider, session.effort, this.#deps.limits.maxOutputTokens, signal);
+            const offer = await verifyFallbackModel(this.#providers().get(policy.provider), policy, error.checkpoint, sandbox, session.effort, this.#deps.limits.maxOutputTokens, signal);
             const inputLimit = entitlements.meterLimits.get(policy.inputTokenMeterKey);
             const outputLimit = entitlements.meterLimits.get(policy.outputTokenMeterKey);
             if (inputLimit === undefined || outputLimit === undefined || offer.inputTokens > inputLimit.hardLimit || offer.maxOutputTokens > outputLimit.hardLimit) throw new AppError({ code: 'fallback/allowance-too-small', statusCode: 409, message: 'The configured fallback allowance cannot accommodate this task.' });
