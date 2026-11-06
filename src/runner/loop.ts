@@ -675,6 +675,7 @@ export class SessionRunner {
           return;
         }
         execution = started; // The pending turn is a new run; everything from here names it.
+        summary?.begin(session.id, started);
       }
 
       await publish('session.running', {
