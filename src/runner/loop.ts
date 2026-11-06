@@ -627,10 +627,14 @@ export class SessionRunner {
       });
 
       signal.throwIfAborted();
-      if (session.queuedTurnPending === true && !await sessions.startPendingTurn(session.id, authority, signal)) {
-        const status = await sessions.finish(session.id, authority, { status: 'IDLE' });
-        await publish(status === 'QUEUED' ? 'session.queued' : 'session.idle', {});
-        return;
+      if (session.queuedTurnPending === true) {
+        const started = await sessions.startPendingTurn(session.id, authority, signal);
+        if (started === undefined) {
+          const status = await sessions.finish(session.id, authority, { status: 'IDLE' });
+          await publish(status === 'QUEUED' ? 'session.queued' : 'session.idle', {});
+          return;
+        }
+        execution = started; // The pending turn is a new run; everything from here names it.
       }
 
       await publish('session.running', {

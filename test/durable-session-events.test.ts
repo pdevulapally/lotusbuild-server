@@ -121,6 +121,9 @@ test('stale worker progress cannot overwrite the successor journal or publish a 
   await assert.rejects(events.append('s', 'agent.step', {}, { sessionId: 's', runnerId: 'predecessor', token: 'old-token' }), { code: 'session/lease-lost' });
   await assert.rejects(events.append('s', 'session.failed', {}), /Obsolete/);
   await assert.rejects(events.append('s', 'session.stopped', {}), /Obsolete/);
+  h.data.set('sessions/s', { ...h.data.get('sessions/s'), execution: 2 });
+  await assert.rejects(events.append('s', 'agent.text', { execution: 1, delta: 'late' }, { sessionId: 's', runnerId: 'successor', token: 'new-token' }), /Obsolete run/);
+  await assert.rejects(events.append('s', 'agent.text', { execution: 3, delta: 'impossible' }, { sessionId: 's', runnerId: 'successor', token: 'new-token' }), /Obsolete run/);
   assert.equal((await events.history('s', undefined)).length, 0);
   await events.append('s', 'agent.step', {}, { sessionId: 's', runnerId: 'successor', token: 'new-token' });
   assert.equal((await events.history('s', undefined)).length, 1);

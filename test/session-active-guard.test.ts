@@ -734,7 +734,7 @@ test('shutdown blocks pending-turn adoption and new claims without consuming or 
   await assert.rejects(h.sessions.startPendingTurn('session-a', current, AbortSignal.abort()));
   assert.equal(h.charges(), before);
   assert.equal(h.session('session-a')?.['queuedTurnPending'], true);
-  assert.equal(await h.sessions.startPendingTurn('session-a', current), true);
+  assert.notEqual(await h.sessions.startPendingTurn('session-a', current), undefined);
 });
 
 test('shutdown observed inside queue adoption rolls back the charge and preserves the prompt', async (t) => {
@@ -1106,7 +1106,7 @@ test('a message accepted after the last dequeue is scheduled and charged exactly
   const next = await h.sessions.claim('runner-2');
   assert.equal(next?.queuedTurnPending, true);
   const newLease = authority(h, created.id, 'runner-2');
-  assert.equal(await h.sessions.startPendingTurn(created.id, newLease), true);
+  assert.notEqual(await h.sessions.startPendingTurn(created.id, newLease), undefined);
   assert.equal(h.charges(), 2);
   await assert.rejects(h.sessions.startPendingTurn(created.id, newLease), /no pending turn/);
   assert.equal(h.charges(), 2);
@@ -1191,7 +1191,7 @@ test('steering accepted after the last step is scheduled without an additional b
   await h.sessions.queueSteerMessage('user-1', created.id, 'Late correction');
   assert.equal(await h.sessions.finish(created.id, authority(h, created.id), { status: 'IDLE' }), 'QUEUED');
   await h.sessions.claim('runner-2');
-  assert.equal(await h.sessions.startPendingTurn(created.id, authority(h, created.id, 'runner-2')), true);
+  assert.notEqual(await h.sessions.startPendingTurn(created.id, authority(h, created.id, 'runner-2')), undefined);
   assert.equal(h.charges(), 1);
   assert.equal((await h.sessions.listMessages('user-1', created.id, 100)).at(-1)?.content, 'Late correction');
 });
@@ -1418,7 +1418,6 @@ test('POST /cancel requires the run it is aimed at and reports the stop honestly
   t.after(() => app.close());
   const session = await h.sessions.create('user-1', 'project-1', { prompt: 'Build', model: 'model-1' });
   const url = `/sessions/${session.id}/cancel`;
-  assert.equal((await app.inject({ method: 'POST', url, headers: authHeaders })).statusCode, 400, 'a Stop with no run named is refused');
   const stale = await app.inject({ method: 'POST', url, headers: { ...authHeaders, 'idempotency-key': 'stable-stale-stop-key-1' }, payload: { execution: 2 } });
   assert.equal(stale.statusCode, 409); assert.ok(JSON.stringify(stale.json()).includes('session/execution-changed'));
   assert.equal(h.session(session.id)?.['status'], 'QUEUED');
@@ -1435,4 +1434,34 @@ test('POST /cancel requires the run it is aimed at and reports the stop honestly
   assert.equal(accepted.json().status, 'RUNNING', 'accepting a Stop is not the same as having stopped');
   assert.equal(accepted.json().cancelRequested, true); assert.equal(typeof accepted.json().cancelRequestedAt, 'string');
   assert.deepEqual(published.at(-1)?.type, 'session.cancel_requested'); assert.equal(published.at(-1)?.data['execution'], 1);
+  const replayed = await app.inject({ method: 'POST', url: '/sessions/running/cancel', headers: { ...authHeaders, 'idempotency-key': 'stable-running-stop-key-1' }, payload: { execution: 1 } });
+  assert.equal(replayed.statusCode, 200); assert.deepEqual(replayed.json(), accepted.json());
+  assert.equal(published.filter((event) => event.type === 'session.cancel_requested').length, 1, 'a replayed Stop is not announced twice');
+
+  // An older tab that does not know run numbers can still stop the current run.
+  h.seedSession('older-tab', 'project-1', 'RUNNING');
+  h.firestore.seed('projects/project-1', { ...h.project(), activeSessionId: 'older-tab' });
+  const legacy = await app.inject({ method: 'POST', url: '/sessions/older-tab/cancel', headers: { ...authHeaders, 'idempotency-key': 'stable-legacy-stop-key-1' } });
+  assert.equal(legacy.statusCode, 200, legacy.body); assert.equal(legacy.json().cancelRequested, true);
+});
+
+test('a retried Stop that lands after a newer run started is refused, not reported as that run stopping', async () => {
+  const h = harness();
+  const created = await h.sessions.create('user-1', 'project-1', { prompt: 'build', model: 'model-1' });
+  const first = await h.sessions.cancel('user-1', created.id, 'stable-retried-stop-key', 1);
+  assert.equal(first.status, 'STOPPED');
+  const resumed = await h.sessions.appendPrompt('user-1', created.id, 'carry on');
+  assert.equal(resumed.execution, 2);
+  await assert.rejects(h.sessions.cancel('user-1', created.id, 'stable-retried-stop-key', 1), { code: 'session/execution-changed' });
+  assert.equal(h.session(created.id)?.['status'], 'QUEUED'); assert.equal(h.session(created.id)?.['cancelRequested'], undefined);
+});
+
+test('starting the pending turn reports the run it starts', async () => {
+  const h = harness(); h.seedSession('s', 'project-1', 'RUNNING');
+  h.firestore.seed('projects/project-1', { ...h.project(), activeSessionId: 's' });
+  const authority = { sessionId: 's', runnerId: 'runner-1', token: 'seed-token' };
+  await h.sessions.submitMessage('user-1', 's', 'and then this', false, 'stable-pending-turn-key-1', 'enqueue');
+  h.firestore.seed('sessions/s', { ...h.session('s'), queuedTurnPending: true });
+  assert.equal(await h.sessions.startPendingTurn('s', authority), 2);
+  assert.equal(h.session('s')?.['execution'], 2);
 });

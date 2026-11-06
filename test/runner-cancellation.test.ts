@@ -172,6 +172,7 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
   const entered = deferred<void>();
   const events: string[] = [];
   const textEvents: string[] = [];
+  const journal: { type: string; data: Record<string, unknown> }[] = [];
   let activeSignal: AbortSignal | undefined;
   let cancelListener: ((event: { type: string }) => void) | undefined;
   let leaseValid = true; let cancelled = false;
@@ -231,6 +232,7 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
     forgetSpecialistReservation: async () => {},
     appendAssistantMessage: async () => { if (mode === 'queue') shutdown.abort(); },
     dequeueNextMessage: async () => { events.push('dequeue'); },
+    startPendingTurn: async () => { events.push('start-pending'); return 2; },
     readOwned: async () => session, yieldForRecovery: async () => { events.push('yield'); }, finish: async (_id: string, _lease: unknown, outcome: { status: string }) => { events.push(`finish:${outcome.status}`); return 'QUEUED'; },
   };
   const logs: { details: object; message: string }[] = [];
@@ -244,12 +246,12 @@ function runnerFixture(mode: 'model' | 'command' | 'queue' | 'save-failure' | 'v
       if (!leaseValid) throw new Error('Lease authority lost');
       if (mode === 'save-failure') throw new Error('Storage unavailable');
       return { bytes: 1, committed: true };
-    } }, events: { subscribe: async (_id: string, listener: typeof cancelListener) => { cancelListener = listener; return () => {}; }, append: async (_id: string, type: string, data: Record<string, unknown>) => { if (type === 'agent.text') textEvents.push(String(data.delta)); } },
+    } }, events: { subscribe: async (_id: string, listener: typeof cancelListener) => { cancelListener = listener; return () => {}; }, append: async (_id: string, type: string, data: Record<string, unknown>) => { journal.push({ type, data }); if (type === 'agent.text') textEvents.push(String(data.delta)); } },
     limits: { maxSteps: 3, maxOutputTokens: 10, toolOutputMaxChars: 4096, maxSpecialistConsultations: mode === 'validation' ? 1 : 0,
       specialistMaxSteps: mode === 'validation' ? 2 : 1, commandTimeoutMs: 1000, previewReadyTimeoutSeconds: 1 }, heartbeatSeconds: 60, messageHistoryLimit: 10,
     log: { info: capture, warn: capture, error: capture },
   } as unknown as RunnerDependencies;
-  return { runner: new SessionRunner(deps), shutdown, entered, events, textEvents, data, logs, sessions, running, adapter, signal: () => activeSignal, calls: () => calls,
+  return { runner: new SessionRunner(deps), shutdown, entered, events, textEvents, journal, session, data, logs, sessions, running, adapter, signal: () => activeSignal, calls: () => calls,
     cancel: () => { cancelled = true; cancelListener?.({ type: 'session.cancel_requested' }); }, loseLease: () => { leaseValid = false; } };
 }
 
@@ -489,4 +491,15 @@ test('shutdown drains every active slot and reports a failure that happened whil
   slow.resolve();
   await assert.rejects(loop, (error) => error instanceof RunnerWorkError && error.secondaryStage === 'workspace/save-failed');
   assert.equal(started, 2);
+});
+
+test('a pending turn runs as the next numbered run, and every event it writes names that run', async () => {
+  const h = runnerFixture('reply');
+  Object.assign(h.session as Record<string, unknown>, { queuedTurnPending: true });
+  await h.runner.runOnce();
+  assert.ok(h.events.includes('start-pending'));
+  const running = h.journal.find((event) => event.type === 'session.running');
+  assert.equal(running?.data['execution'], 2, 'session.running names the run startPendingTurn started, not the one that ended');
+  assert.ok(h.journal.length >= 2);
+  assert.deepEqual(h.journal.filter((event) => event.data['execution'] !== 2).map((event) => event.type), [], 'no event of the new turn carries the old run number');
 });

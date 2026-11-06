@@ -194,6 +194,17 @@ export interface SteerMessage {
   readonly attachments: readonly AttachmentRef[];
 }
 
+function assertSameExecution(current: BuildSession, expectedExecution: number | undefined): void {
+  if (expectedExecution !== undefined && current.execution !== expectedExecution) {
+    throw new AppError({
+      code: 'session/execution-changed',
+      statusCode: 409,
+      message: 'A newer run has started since this Stop was requested, so it was not applied.',
+      details: { execution: current.execution, requested: expectedExecution },
+    });
+  }
+}
+
 export interface QueuedMessage {
   readonly id: string;
   readonly sessionId: string;
@@ -914,7 +925,8 @@ export class SessionRepository {
   }
 
   /** Start work accepted during finalization, after claiming and recovering old resources. */
-  async startPendingTurn(sessionId: string, authority: SessionLease, signal?: AbortSignal): Promise<boolean> {
+  /** Starts the turn queued behind an ended run; resolves to the run number it starts, or undefined when nothing is left to start. */
+  async startPendingTurn(sessionId: string, authority: SessionLease, signal?: AbortSignal): Promise<number | undefined> {
     signal?.throwIfAborted();
     const ref = this.#ref(sessionId);
     return this.#firestore.runTransaction(async (transaction) => {
@@ -926,7 +938,7 @@ export class SessionRepository {
         ? { prompt: session.pendingSteer, attachments: session.pendingSteerAttachments ?? [] }
         : next === undefined ? undefined : parseQueuedMessage(next.id, sessionId, next.data(), next.ref.path);
       const prompt = pending?.prompt;
-      if (prompt === undefined) return false; // The owner removed the last queued message.
+      if (prompt === undefined) return undefined; // The owner removed the last queued message.
       const entitlements = await this.#entitlements.forUser(session.ownerUid);
       const project = await this.#projects.readOwnedInTransaction(transaction, session.ownerUid, session.projectId);
       assertBuildAllowed(entitlements, project.platform, session.model);
@@ -943,7 +955,7 @@ export class SessionRepository {
       });
       transaction.update(ref, { queuedTurnPending: FieldValue.delete(), fallback: FieldValue.delete(), pendingSteer: FieldValue.delete(),
         execution: session.execution + 1, messageCount: FieldValue.increment(1), updatedAt: FieldValue.serverTimestamp() });
-      return true;
+      return session.execution + 1;
     });
   }
 
@@ -972,6 +984,9 @@ export class SessionRepository {
 
     const accepted = await commandTransaction({ db: this.#firestore, parent: ref, uid, key: commandId, input: ['cancel', expectedExecution ?? null], decode: async (_value, transaction) => {
       const snapshot = await transaction.get(ref); const current = parseSession(sessionId, snapshot.data() ?? {}, ref.path);
+      // A replayed receipt is read against the run it was aimed at too: a retry
+      // that lands after a newer run started must not report that run as stopped.
+      assertSameExecution(current, expectedExecution);
       await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId, true); return current;
     }, work: async (transaction) => {
       const snapshot = await transaction.get(ref);
@@ -992,14 +1007,7 @@ export class SessionRepository {
       }
 
       const project = await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId, true);
-      if (expectedExecution !== undefined && current.execution !== expectedExecution) {
-        throw new AppError({
-          code: 'session/execution-changed',
-          statusCode: 409,
-          message: 'A newer run has started since this Stop was requested, so it was not applied.',
-          details: { execution: current.execution, requested: expectedExecution },
-        });
-      }
+      assertSameExecution(current, expectedExecution);
       if (current.status === 'IDLE' && (current.pendingInput !== undefined || (current.fallback !== undefined && current.fallback.status !== 'COMPLETED'))) {
         await this.#projects.readOwnedInTransaction(transaction, uid, current.projectId);
         transaction.delete(ref.collection('continuations').doc('active'));

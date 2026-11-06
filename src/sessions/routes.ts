@@ -460,7 +460,7 @@ export function registerSessionRoutes(
     },
   );
 
-  app.post<{ Params: { sessionId: string }; Body: { execution: number } }>(
+  app.post<{ Params: { sessionId: string }; Body: { execution?: number } | null }>(
     '/sessions/:sessionId/cancel',
 
     {
@@ -473,9 +473,9 @@ export function registerSessionRoutes(
           properties: { sessionId: { type: 'string', pattern: documentId } },
         },
         // The run the user is looking at. A Stop aimed at an earlier run is refused, not redirected.
+        // A client that predates run numbers may omit it; that Stop applies to the current run as before.
         body: {
-          type: 'object',
-          required: ['execution'],
+          type: ['object', 'null'],
           additionalProperties: false,
           properties: { execution: { type: 'integer', minimum: 1 } },
         },
@@ -485,9 +485,12 @@ export function registerSessionRoutes(
       const user = authenticatedUser(request);
       const session = await sessions.cancel(user.uid, request.params.sessionId,
         mutation<BuildSession>(user.uid, `POST /sessions/${request.params.sessionId}/cancel`,
-          commandKey(request.headers['idempotency-key'], true), { execution: request.body.execution }, (value) => ({ statusCode: 200, body: toResponse(value) })),
-        request.body.execution);
+          commandKey(request.headers['idempotency-key'], true), { execution: request.body?.execution ?? null }, (value) => ({ statusCode: 200, body: toResponse(value) })),
+        request.body?.execution);
+      if (request.body?.execution === undefined) request.log.warn({ sessionId: session.id, execution: session.execution }, 'stop requested without a run number (older client)');
 
+      // A replayed Stop already told the runner and the journal once.
+      if (commandWasReplayed(session)) return reply.code(200).send(toResponse(session));
       if (session.status === 'STOPPED') {
         publish(request.log, session.id, 'session.stopped', { execution: session.execution, stopAfterMs: 0 });
       } else if (session.cancelRequested === true) {
