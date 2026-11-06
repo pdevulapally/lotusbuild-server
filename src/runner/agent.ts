@@ -195,6 +195,23 @@ class UsageAccumulator {
   snapshot(): AuthoritativeUsage {
     return { input: this.#input, output: this.#output };
   }
+
+  /** False until the provider has reported any usage at all. */
+  get observed(): boolean {
+    return this.#input !== undefined || this.#output !== undefined;
+  }
+}
+
+/**
+ * A provider that refused the request outright — 4xx before a single stream
+ * event — processed nothing, so nothing was consumed. Leaving the holds open
+ * would make the session unfinalisable (recovery never guesses usage); the
+ * refusal is the error the user sees instead. Timeouts, rate limits and
+ * server errors are not refusals: the provider may have worked.
+ */
+function rejectedBeforeDispatch(error: unknown): boolean {
+  const status = typeof error === 'object' && error !== null ? (error as { status?: unknown }).status : undefined;
+  return typeof status === 'number' && status >= 400 && status < 500 && status !== 408 && status !== 429;
 }
 
 export interface UnresolvedBlocker {
@@ -745,7 +762,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
     // already reported. There is no path that charges both.
     const spend: AuthoritativeUsage =
       message === undefined
-        ? providerDispatchStarted ? usage.snapshot() : { input: 0, output: 0 }
+        ? providerDispatchStarted && (usage.observed || !rejectedBeforeDispatch(callError)) ? usage.snapshot() : { input: 0, output: 0 }
         : {
             input: total(
               message.usage.input_tokens,
