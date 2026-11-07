@@ -3,6 +3,7 @@ import { TaskTracker, compactTaskConversation, type TaskContext } from './task-c
 import { timed, startTiming } from '../diagnostics/timing.ts';
 import { contextFingerprint, retainCheckpointImages, type AdmissionBoundary, type ContinuationCheckpoint } from './continuation.ts';
 import type { CallAdmission } from './call-admission.ts';
+import type { ReservationKind } from '../metering/service.ts';
 import type { Skill } from '../skills/model.ts';
 import { skillCatalogue, skillInstructionsText } from '../skills/prompt.ts';
 import type { ImageMediaType } from '../attachments/store.ts';
@@ -114,6 +115,15 @@ export interface SpecialistReview {
  * The durable record of specialist token holds, kept on the session document so
  * a hold outlives the process that took it.
  */
+/**
+ * The cache TTL every agent request asks for. `ephemeral` without a `ttl` is the
+ * provider's 5-minute cache; nothing in this runtime requests the 1-hour one. Named
+ * here, beside the request, because admission prices prompt tokens at this TTL's
+ * write weight and settlement reads an undivided cache figure at it: the request
+ * is the evidence of which cache was written, so changing the TTL changes both.
+ */
+export const promptCacheTtl: '5m' | '1h' = '5m';
+
 export interface SpecialistReservations {
   /**
    * Takes the hold and records it against the session in one commit, so a hold
@@ -124,6 +134,7 @@ export interface SpecialistReservations {
     readonly quantity: number;
     readonly operationId: string;
     readonly attributes?: Readonly<Record<string, string>>;
+    readonly kind?: ReservationKind;
   }): Promise<{ readonly id: string }>;
   forget(reservationId: string): Promise<void>;
 }
@@ -775,7 +786,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
         // again on every step. Caching the last cacheable block means each step
         // writes the prefix once and the next step reads it at a fraction of the
         // rate — the same tokens, most of the cost removed.
-        cache_control: { type: 'ephemeral' as const },
+        cache_control: { type: 'ephemeral' as const, ...(promptCacheTtl === '5m' ? {} : { ttl: promptCacheTtl }) },
       };
       // Only the generation SDK invocation crosses this boundary, not admission,
       // parameter preparation or the marker. A synchronous SDK throw is uncertain.

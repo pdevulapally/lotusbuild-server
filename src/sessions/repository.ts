@@ -24,7 +24,7 @@ import {
 import type { ConfigurationStore } from '../entitlements/store.ts';
 import { AppError } from '../http/errors.ts';
 import { mapMutation, type Mutation } from '../http/idempotency.ts';
-import type { MeteringService, Reservation } from '../metering/service.ts';
+import type { MeteringService, Reservation, ReservationKind } from '../metering/service.ts';
 import { createHash, randomUUID } from 'node:crypto';
 
 import {
@@ -1599,6 +1599,7 @@ export class SessionRepository {
       readonly operationId: string;
       readonly now: Date;
       readonly attributes?: Readonly<Record<string, string>>;
+      readonly kind?: ReservationKind;
     },
   ): Promise<Reservation> {
     const ref = this.#ref(sessionId);
@@ -1617,6 +1618,7 @@ export class SessionRepository {
         operationId: input.operationId,
         now: input.now,
         ...(input.attributes === undefined ? {} : { attributes: input.attributes }),
+        ...(input.kind === undefined ? {} : { kind: input.kind }),
       });
       transaction.update(ref, {
         specialistReservationIds: FieldValue.arrayUnion(reservation.id),

@@ -35,6 +35,15 @@ export interface Consumption {
 /** Strings only: these are read back by settlement and must round-trip exactly. */
 export type ReservationAttributes = Readonly<Record<string, string>>;
 
+/**
+ * Durable identity of a Unified AI Token hold, written on the reservation when it
+ * is taken. Recovery, overrun and opening-period rules read this field, never the
+ * live registry switch: a hold opened while the switch was on must still settle
+ * correctly after the switch is turned off, or under a release that predates it.
+ */
+export const unifiedHoldKind = 'ai.unified';
+export type ReservationKind = typeof unifiedHoldKind;
+
 export interface Reservation {
   readonly id: string;
   readonly meterKey: string;
@@ -96,6 +105,11 @@ export interface AiCallEvidence {
 }
 
 export function periodRecordId(periodStart: Date): string { return periodStart.toISOString().slice(0, 10); }
+
+function isAiCallEvidence(value: unknown): value is AiCallEvidence {
+  return typeof value === 'object' && value !== null && typeof (value as AiCallEvidence).model === 'string'
+    && typeof (value as AiCallEvidence).raw === 'object' && typeof (value as AiCallEvidence).complete === 'boolean';
+}
 
 /**
  * Records what a user has spent against their plan's meters.
@@ -534,6 +548,7 @@ export class MeteringService {
       readonly now: Date;
       /** Facts the hold was priced on (model, rate-table version), stored so settlement reads them back rather than guessing. */
       readonly attributes?: ReservationAttributes;
+      readonly kind?: ReservationKind;
     },
   ): Promise<Reservation> {
     const { meter, ref: usageRef, state, periodStart } = await this.#availableIn(transaction, input);
@@ -553,6 +568,7 @@ export class MeteringService {
       operationId: input.operationId,
       openedPeriodStart: Timestamp.fromDate(periodStart),
       ...(input.attributes === undefined ? {} : { attributes: input.attributes }),
+      ...(input.kind === undefined ? {} : { kind: input.kind }),
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     });
@@ -609,6 +625,7 @@ export class MeteringService {
     readonly operationId: string;
     readonly now: Date;
     readonly attributes?: ReservationAttributes;
+    readonly kind?: ReservationKind;
   }): Promise<Reservation> {
     return this.#firestore.runTransaction((transaction) => this.reserveIn(transaction, input));
   }
@@ -961,18 +978,40 @@ export class MeteringService {
     const fields = await this.reservationRecord(uid, id);
     if (fields['status'] !== 'OPEN') return false;
     if (fields['inFlight'] !== true || typeof fields['observedQuantity'] === 'number') return false;
-    if (fields['sandboxExternalId'] !== undefined || !await this.#isTokenMeter(fields['meterKey'])) {
+    if (fields['sandboxExternalId'] !== undefined || !await this.#isTokenHold(fields)) {
       throw new Error(`Reservation ${id} is not a model-token hold and cannot settle at its estimate.`);
     }
     const estimated = integerField(fields, 'estimatedQuantity', `reservation ${id}`, { min: 1 });
+    // Partial figures the call reported before it was cut off stay with the hold as
+    // evidence marked incomplete; the estimate is what is charged, never the partial.
+    const kept = evidence ?? (isAiCallEvidence(fields['partialEvidence']) ? fields['partialEvidence'] : undefined);
     await this.recordObservedUsage(uid, id, estimated, 'provider-usage-unavailable');
-    return this.settle({ uid, reservationId: id, actualQuantity: estimated, now, ...(evidence === undefined ? {} : { evidence }) });
+    return this.settle({ uid, reservationId: id, actualQuantity: estimated, now, ...(kept === undefined ? {} : { evidence: kept }) });
   }
 
-  async #isTokenMeter(meterKey: unknown): Promise<boolean> {
+  /**
+   * Keeps what the provider reported about a call that did not finish reporting,
+   * without treating it as the call's consumption: `observedQuantity` stays unset,
+   * so recovery still knows the usage is unknown, and the figures are there for
+   * the audit and for the eventual settlement's evidence. Refused on a closed hold.
+   */
+  async recordPartialUsage(uid: string, id: string, evidence: AiCallEvidence): Promise<void> {
+    if (evidence.complete) throw new Error('Partial evidence cannot be marked complete.');
+    const ref = this.#reservationRef(uid, id);
+    await this.#firestore.runTransaction(async (tx) => {
+      const snapshot = await tx.get(ref);
+      if (!snapshot.exists) throw new Error('Reservation is missing.');
+      if (snapshot.data()?.['status'] !== 'OPEN') return;
+      tx.update(ref, { partialEvidence: evidence, updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+
+  /** A hold recovery may settle at its estimate: a legacy token-meter hold, or a unified hold by its durable kind. */
+  async #isTokenHold(fields: Record<string, unknown>): Promise<boolean> {
+    if (fields['kind'] === unifiedHoldKind) return true;
+    const meterKey = fields['meterKey'];
     const { registry } = await this.#configuration.get();
     return typeof meterKey === 'string' && [registry.inputTokenMeterKey, registry.outputTokenMeterKey,
-      ...(registry.aiUnified === undefined ? [] : [registry.aiUnified.meterKey]),
       ...(registry.fallback === undefined ? [] : [registry.fallback.inputTokenMeterKey, registry.fallback.outputTokenMeterKey])].includes(meterKey);
   }
 
@@ -989,13 +1028,13 @@ export class MeteringService {
     const fields = await this.reservationRecord(uid, id);
     if (fields['status'] !== 'OPEN') return false;
     if (options.unreportable === true && fields['inFlight'] === true && typeof fields['observedQuantity'] !== 'number'
-      && fields['sandboxExternalId'] === undefined && await this.#isTokenMeter(fields['meterKey'])) {
+      && fields['sandboxExternalId'] === undefined && await this.#isTokenHold(fields)) {
       return this.settleUnobserved(uid, id, now);
     }
     if (typeof fields['observedQuantity'] === 'number') {
       const { registry } = await this.#configuration.get();
       return this.settle({ uid, reservationId: id, actualQuantity: fields['observedQuantity'], now,
-        recordOverrun: fields['meterKey'] === registry.inputTokenMeterKey || fields['meterKey'] === registry.aiUnified?.meterKey });
+        recordOverrun: fields['meterKey'] === registry.inputTokenMeterKey || fields['kind'] === unifiedHoldKind });
     }
     return this.release(uid, id, now);
   }
@@ -1062,7 +1101,7 @@ export class MeteringService {
       // the opening period's record is the durable statement of what it cost.
       // Legacy meters keep counting a late settlement in the live window, as
       // they always have, so a rollback finds nothing changed under it.
-      const pinned = meterKey === registry.aiUnified?.meterKey && opened.getTime() < periodStart.getTime();
+      const pinned = fields['kind'] === unifiedHoldKind && opened.getTime() < periodStart.getTime();
 
       if (state.reserved < estimatedQuantity) {
         // Not a limit problem: the ledger disagrees with itself, and carrying on

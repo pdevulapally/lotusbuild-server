@@ -14,6 +14,9 @@ import { ProjectRepository } from '../src/projects/repository.ts';
 import { SessionRepository } from '../src/sessions/repository.ts';
 import type { UserRepository } from '../src/users/repository.ts';
 import { createCallAdmission, unifiedEstimate } from '../src/runner/call-admission.ts';
+import { promptWeightCeiling, tierFor } from '../src/entitlements/rates.ts';
+import { unifiedHoldKind } from '../src/metering/service.ts';
+import { promptCacheTtl } from '../src/runner/agent.ts';
 import { runAgentTurn } from '../src/runner/agent.ts';
 import { fallbackLaneRegistry, unifiedAdmissionFor } from '../src/runner/loop.ts';
 import { AppError } from '../src/http/errors.ts';
@@ -49,6 +52,8 @@ interface ProviderScript {
   readonly legacy?: boolean;
   readonly planKey?: string;
   readonly countedInput?: number;
+  /** Archived rate tables by version; defaults to the current table alone. */
+  readonly archive?: ReadonlyMap<string, AiRateTable>;
   /** Scripted provider replies, one per call in order; a call past the end gets the default reply. */
   readonly responses?: readonly { readonly content: ContentBlock[]; readonly usage: Record<string, unknown>; readonly stop_reason: string }[];
 }
@@ -62,7 +67,7 @@ async function unifiedFixture(provider: ProviderScript = {}) {
   const rates = provider.rates ?? v1;
   const configuration = {
     get: async () => ({ registry, plans, rates }),
-    ratesByVersion: async (version: string) => { if (version === rates.version) return rates; throw new Error(`no archived table ${version}`); },
+    ratesByVersion: async (version: string) => { const table = provider.archive?.get(version) ?? (version === rates.version ? rates : undefined); if (table === undefined) throw new Error(`no archived table ${version}`); return table; },
   } as unknown as ConfigurationStore;
   const entitlementService = { forUser: async () => entitlements } as unknown as EntitlementService;
   const metering = new MeteringService(db, configuration);
@@ -138,6 +143,11 @@ async function unifiedFixture(provider: ProviderScript = {}) {
     records, usage, period, limit, preConsume, streamed, calls: () => calls, setRejectAuthorization: (n: number) => { rejectAuthorization = n; } };
 }
 
+/** The fixture with an explicit archive of rate tables by version; `current` is what admission prices with. */
+async function unifiedFixtureWithRatesByVersion(archive: ReadonlyMap<string, AiRateTable>, current: AiRateTable) {
+  return unifiedFixture({ rates: current, archive });
+}
+
 const haiku = 'claude-haiku-4-5';
 // Business's first allowed model is Haiku: 10 counted prompt tokens at the 5m-write weight (5/8) plus 20 output at 5/2 = 56.25 → 57.
 const expectedEstimate = 57;
@@ -170,6 +180,7 @@ test('C2/C7: one unified hold is taken and marked in flight before the provider 
   assert.equal(hold['estimatedQuantity'], expectedEstimate);
   assert.equal(hold['operationId'], 'model-unified:s');
   assert.deepEqual(hold['attributes'], { model: haiku, rateVersion: 'v1' });
+  assert.equal(hold['kind'], unifiedHoldKind, 'durable identity, independent of the registry switch');
   // Haiku: 7×1/2 + 40×1/20 + 16×5/8 + 0×1 + 3×5/2 = 3.5 + 2 + 10 + 0 + 7.5 = 23.
   assert.equal(hold['status'], 'SETTLED');
   assert.equal(hold['settledQuantity'], 23);
@@ -213,9 +224,11 @@ test('C4/C5: Haiku, Sonnet and Opus convert at their own weights; cache and outp
   // One ceiling over the whole call, not per category: 15 reads at 1/10 and 1 output at 5 on Sonnet = 6.5 → 7, never 2 + 5 = 7 by accident of category rounding; 3 reads alone = 0.3 → 1.
   assert.equal(unifiedFor(v1, 'claude-sonnet-5', { cacheRead: 15, output: 1 })!.unified, 7);
   assert.equal(unifiedFor(v1, 'claude-sonnet-5', { cacheRead: 3 })!.unified, 1);
-  // An undivided cache-creation figure: shadow reading at 5m, active reading at the higher 1h weight.
+  // An undivided cache-creation figure is read at the TTL the request asked for; the agent asks for 5m, so shadow and active agree.
+  assert.equal(promptCacheTtl, '5m');
   assert.equal(unifiedFor(v1, 'claude-haiku-4-5', { cacheCreation: 800 })!.unified, 500);
-  assert.equal(unifiedFor(v1, 'claude-haiku-4-5', { cacheCreation: 800 }, { undividedCacheWrite: '1h' })!.unified, 800);
+  assert.equal(unifiedFor(v1, 'claude-haiku-4-5', { cacheCreation: 800 }, { undividedCacheWrite: promptCacheTtl })!.unified, 500);
+  assert.equal(unifiedFor(v1, 'claude-haiku-4-5', { cacheCreation: 800 }, { undividedCacheWrite: '1h' })!.unified, 800, 'a 1h request would read it at 1h');
   // An unpriced model is undefined, never a default weight.
   assert.equal(unifiedFor(v1, 'claude-unknown', bare), undefined);
 });
@@ -244,9 +257,29 @@ test('C8: a stream interrupted after message_start keeps the hold open with part
   assert.equal(hold['status'], 'OPEN');
   assert.equal(hold['inFlight'], true);
   assert.equal(hold['observedQuantity'], undefined, 'a partial figure is never journalled as the call\'s usage');
+  assert.deepEqual(hold['partialEvidence'], { model: haiku, raw: { input: 7, cacheRead: 40, cacheCreation5m: 16, cacheCreation1h: 0 }, complete: false, unified: 16, tier: 0, rateVersion: 'v1' },
+    'what the provider did report is kept on the open hold');
   assert.equal(h.usage(unifiedMeterKey)?.['reserved'], expectedEstimate);
   assert.equal(h.usage(unifiedMeterKey)?.['consumed'], 0);
   assert.ok(h.problems.some((problem) => problem.what === 'model usage reconciliation required'));
+  // Recovery, once the worker is proven gone, settles at the estimate and carries the partial evidence into the settled record.
+  assert.equal(await h.metering.reconcile('u', h.records()[0]!.id, new Date(), { unreportable: true }), true);
+  const settled = h.records()[0]!.fields;
+  assert.equal(settled['settledQuantity'], expectedEstimate);
+  assert.deepEqual((settled['evidence'] as { raw: unknown; complete: boolean }).raw, { input: 7, cacheRead: 40, cacheCreation5m: 16, cacheCreation1h: 0 });
+  assert.equal((settled['evidence'] as { complete: boolean }).complete, false);
+  assert.equal(h.period(unifiedMeterKey, new Date().toISOString().slice(0, 7) + '-01')?.['unifiedPartial'], 16);
+  assert.equal(h.period(unifiedMeterKey, new Date().toISOString().slice(0, 7) + '-01')?.['unified'], undefined);
+});
+
+test('C8b: partial evidence is refused on a closed hold and can never be marked complete', async () => {
+  const h = await unifiedFixture();
+  const admitted = await h.begin();
+  const id = h.records()[0]!.id;
+  await assert.rejects(h.metering.recordPartialUsage('u', id, { model: haiku, raw: { input: 1 }, complete: true }), /cannot be marked complete/);
+  await admitted.settle({ input: 7, output: 3, raw: { input: 7, output: 3 } });
+  await h.metering.recordPartialUsage('u', id, { model: haiku, raw: { input: 1 }, complete: false });
+  assert.equal(h.records()[0]!.fields['partialEvidence'], undefined, 'a settled hold is not rewritten');
 });
 
 // 9. Cancellation before dispatch and after dispatch.
@@ -430,7 +463,7 @@ test('C15: two concurrent reservations for the last available capacity admit exa
 test('C16: a unified hold opened in March and settled in April returns its capacity without consuming April, and is attributed to March', async () => {
   const h = await unifiedFixture();
   const hold = await h.db.runTransaction((tx: Transaction) => h.metering.reserveIn(tx, { uid: 'u', entitlements: h.entitlements, meterKey: unifiedMeterKey, quantity: 100, operationId: 'op', now: march,
-    attributes: { model: haiku, rateVersion: 'v1' } }));
+    kind: unifiedHoldKind, attributes: { model: haiku, rateVersion: 'v1' } }));
   assert.deepEqual(h.usage(unifiedMeterKey)?.['periodStart'], Timestamp.fromDate(new Date('2026-03-01T00:00:00Z')));
   // Across the boundary the hold still counts against capacity: April cannot hand out the same 100 twice.
   await assert.rejects(h.metering.assertAvailable({ uid: 'u', entitlements: h.entitlements, meterKey: unifiedMeterKey, quantity: h.limit - 99, now: april }), { code: 'usage/limit-reached' });
@@ -448,8 +481,13 @@ test('C16: a unified hold opened in March and settled in April returns its capac
   // Idempotent: a repeated late settlement changes nothing.
   assert.equal(await h.metering.settle({ uid: 'u', reservationId: hold.id, actualQuantity: 60, recordOverrun: true, now: april }), false);
   assert.equal(h.period(unifiedMeterKey, '2026-03-01')!['settledLate'], 60);
+  // Identity is the persisted kind, not the meter: a hold on this meter lacking it follows legacy attribution.
+  const unkinded = await h.db.runTransaction((tx: Transaction) => h.metering.reserveIn(tx, { uid: 'u', entitlements: h.entitlements, meterKey: unifiedMeterKey, quantity: 10, operationId: 'op', now: march }));
+  await h.metering.settle({ uid: 'u', reservationId: unkinded.id, actualQuantity: 10, now: april });
+  assert.equal(h.usage(unifiedMeterKey)?.['consumed'], 10);
+  h.data.get(`users/u/usage/${unifiedMeterKey}`)!['consumed'] = 0;
   // A hold settled within its own month still counts in the live window as before.
-  const same = await h.db.runTransaction((tx: Transaction) => h.metering.reserveIn(tx, { uid: 'u', entitlements: h.entitlements, meterKey: unifiedMeterKey, quantity: 50, operationId: 'op', now: april }));
+  const same = await h.db.runTransaction((tx: Transaction) => h.metering.reserveIn(tx, { uid: 'u', entitlements: h.entitlements, meterKey: unifiedMeterKey, quantity: 50, operationId: 'op', now: april, kind: unifiedHoldKind }));
   await h.metering.settle({ uid: 'u', reservationId: same.id, actualQuantity: 50, now: april });
   assert.equal(h.usage(unifiedMeterKey)?.['consumed'], 50);
   assert.equal(h.period(unifiedMeterKey, '2026-04-01')?.['settled'], 50);
@@ -457,7 +495,7 @@ test('C16: a unified hold opened in March and settled in April returns its capac
 
 test('C16b: concurrent March holds settling on both sides of the boundary keep reserved and consumed exact', async () => {
   const h = await unifiedFixture();
-  const reserve = (now: Date) => h.db.runTransaction((tx: Transaction) => h.metering.reserveIn(tx, { uid: 'u', entitlements: h.entitlements, meterKey: unifiedMeterKey, quantity: 100, operationId: 'op', now }));
+  const reserve = (now: Date) => h.db.runTransaction((tx: Transaction) => h.metering.reserveIn(tx, { uid: 'u', entitlements: h.entitlements, meterKey: unifiedMeterKey, quantity: 100, operationId: 'op', now, kind: unifiedHoldKind }));
   const [a, b, c] = await Promise.all([reserve(march), reserve(march), reserve(march)]);
   assert.equal(h.usage(unifiedMeterKey)?.['reserved'], 300);
   await h.metering.settle({ uid: 'u', reservationId: a!.id, actualQuantity: 70, now: march });
@@ -550,7 +588,7 @@ test('C19: the switch on without a usable rate table fails closed; invalid polic
   assert.deepEqual(h.order, []);
 });
 
-test('C19b: a hold settles only under the rate-table version it was admitted with', async () => {
+test('C19b: archived rate tables resolve by their own version; a missing, malformed or mislabelled archive is an error, never another table', async () => {
   const documents = new Map<string, Record<string, unknown>>([['config/registry', unifiedRegistryDocument as unknown as Record<string, unknown>],
     ['config/aiRates', { ...aiRatesV1Document, version: 'v2' }], ['config/aiRates/versions/v1', aiRatesV1Document],
     ['config/aiRates/versions/bad', { version: 'bad' }], ['config/aiRates/versions/mismatch', { ...aiRatesV1Document, version: 'other' }]]);
@@ -564,13 +602,57 @@ test('C19b: a hold settles only under the rate-table version it was admitted wit
   await assert.rejects(store.ratesByVersion('bad'), /referenceUnit/);
   await assert.rejects(store.ratesByVersion('mismatch'), /carries version/);
   await assert.rejects(store.ratesByVersion('../registry'), /not a valid document id/);
-  // An unavailable archived table leaves the hold open rather than re-pricing it.
+});
+
+test('C19c: settlement prices a hold under the version persisted on it, even after the current table moved on', async () => {
+  // Admitted under v1; by settlement the current table is v2 with doubled Haiku weights. The hold must settle at v1 figures.
+  const v2 = parseAiRateTable({ ...aiRatesV1Document, version: 'v2', models: { ...aiRatesV1Document.models,
+    'claude-haiku-4-5': { tiers: [{ maxInputTokens: null, input: { num: 1, den: 1 }, output: { num: 5, den: 1 }, cacheWrite5m: { num: 5, den: 4 }, cacheWrite1h: { num: 2, den: 1 }, cacheRead: { num: 1, den: 10 } }] } } }, 'test');
   const h = await unifiedFixture();
   const admitted = await h.begin();
-  h.data.get(`users/u/reservations/${h.records()[0]!.id}`)!['attributes'] = { model: haiku, rateVersion: 'v0' };
-  (h.admission as unknown as { unified?: unknown }).unified = undefined;
+  const stored = h.records()[0]!.fields;
+  assert.deepEqual(stored['attributes'], { model: haiku, rateVersion: 'v1' });
+  // The table rolls over while the call is in flight: current is v2, v1 is archived.
+  const configuration = h.admission as unknown as { unified?: { rates: AiRateTable; ratesByVersion: (v: string) => Promise<AiRateTable> } };
+  void configuration;
+  const archive = new Map<string, AiRateTable>([['v1', v1], ['v2', v2]]);
+  const swapped = await unifiedFixtureWithRatesByVersion(archive, v2);
+  const admittedSwapped = await swapped.begin();
+  // Rewrite the persisted version to v1 to model a hold admitted before the rollover.
+  swapped.data.get(`users/u/reservations/${swapped.records()[0]!.id}`)!['attributes'] = { model: haiku, rateVersion: 'v1' };
+  await admittedSwapped.settle({ input: 7, output: 3, raw: { input: 7, output: 3 } });
+  const settled = swapped.records()[0]!.fields;
+  assert.equal(settled['status'], 'SETTLED');
+  assert.equal(settled['settledQuantity'], 11, 'v1 Haiku: 3.5 + 7.5 = 11, not v2\'s 7 + 15 = 22');
+  assert.equal((settled['evidence'] as { rateVersion: string }).rateVersion, 'v1');
   await admitted.settle({ input: 7, output: 3, raw: { input: 7, output: 3 } });
-  assert.equal(h.records()[0]!.fields['status'], 'SETTLED', 'settlement converts with the version captured at admission, which this fixture holds');
+  assert.equal(h.records()[0]!.fields['settledQuantity'], 11);
+});
+
+test('C19d: a hold whose persisted version is unavailable, or whose attributes are missing or name another model, stays open and is never repriced', async () => {
+  for (const attributes of [{ model: haiku, rateVersion: 'v0' }, { model: 'claude-opus-5', rateVersion: 'v1' }, undefined]) {
+    const h = await unifiedFixture();
+    const admitted = await h.begin();
+    const id = h.records()[0]!.id;
+    const record = h.data.get(`users/u/reservations/${id}`)!;
+    if (attributes === undefined) delete record['attributes']; else record['attributes'] = attributes;
+    await admitted.settle({ input: 7, output: 3, raw: { input: 7, output: 3 } });
+    const after = h.records()[0]!.fields;
+    assert.equal(after['status'], 'OPEN', `attributes ${JSON.stringify(attributes)} must not settle`);
+    assert.equal(after['observedQuantity'], undefined);
+    assert.equal(h.usage(unifiedMeterKey)?.['consumed'], 0);
+    assert.equal(h.usage(unifiedMeterKey)?.['reserved'], expectedEstimate);
+    assert.ok(h.problems.some((problem) => problem.what === 'model usage reconciliation required'), 'the operator is told');
+  }
+});
+
+test('C19e: a ratesByVersion that answers with a differently versioned table is refused', async () => {
+  const wrong = parseAiRateTable({ ...aiRatesV1Document, version: 'v9' }, 'test');
+  const h = await unifiedFixtureWithRatesByVersion(new Map([['v1', wrong]]), v1);
+  const admitted = await h.begin();
+  await admitted.settle({ input: 7, output: 3, raw: { input: 7, output: 3 } });
+  assert.equal(h.records()[0]!.fields['status'], 'OPEN');
+  assert.ok(h.problems.some((problem) => /not the v1 this hold was admitted under/.test(problem.error.message)));
 });
 
 // 20. Inactive mode preserves existing behaviour.
@@ -612,6 +694,85 @@ test('C22: builds remain unlimited by count under unified admission', async () =
   }
   assert.equal(data.get(`users/u/usage/${registry.buildMeterKey}`)?.['consumed'], 12);
   assert.equal(data.get(`users/u/usage/${unifiedMeterKey}`), undefined, 'starting a build spends no unified tokens; the first call does');
+});
+
+// Estimate is an upper bound for any valid table.
+test('C-UB: the estimate is never below what settlement can charge for the counted prompt, whatever order the table puts the prompt weights in', () => {
+  // The counterexample that failed before the fix: plain input weighted above the 5m cache write.
+  const inverted = parseAiRateTable({ version: 'x', referenceUnit: 'ref', models: { m: { tiers: [{ maxInputTokens: null,
+    input: { num: 2, den: 1 }, output: { num: 1, den: 1 }, cacheWrite5m: { num: 1, den: 1 }, cacheWrite1h: { num: 3, den: 1 }, cacheRead: { num: 1, den: 10 } }] } } }, 'test');
+  const estimate = unifiedEstimate(inverted, 'm', 100, 10);
+  assert.equal(estimate, 210, 'every counted prompt token at the heaviest prompt weight (input, 2) plus output');
+  for (const raw of [{ input: 100, output: 10 }, { cacheRead: 100, output: 10 }, { cacheCreation5m: 100, output: 10 }, { cacheCreation: 100, output: 10 }, { input: 50, cacheRead: 30, cacheCreation5m: 20, output: 10 }]) {
+    assert.ok(unifiedFor(inverted, 'm', raw, { undividedCacheWrite: promptCacheTtl })!.unified <= estimate, JSON.stringify(raw));
+  }
+  // The ceiling is the max of the three prompt weights for the requested TTL.
+  const tier = tierFor(inverted, 'm', 100)!;
+  assert.deepEqual(promptWeightCeiling(tier, '5m'), { num: 2, den: 1 });
+  assert.deepEqual(promptWeightCeiling(tier, '1h'), { num: 3, den: 1 });
+  // Randomised: for every tier of every model in v1 and the inverted table, random raw usage whose prompt
+  // total equals the counted prompt and whose output is within the ceiling never exceeds the estimate.
+  let seed = 7;
+  const random = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  for (const table of [v1, inverted]) for (const model of table.models.keys()) for (let i = 0; i < 200; i++) {
+    const counted = 1 + Math.floor(random() * 50_000), maxOut = 1 + Math.floor(random() * 8000);
+    const split = [random(), random(), random()].map((x) => x * counted);
+    const a = Math.floor(split[0]!), b = Math.floor(split[1]!), c = Math.max(0, counted - a - b);
+    const raw = random() < 0.5 ? { input: a, cacheRead: b, cacheCreation5m: c, output: Math.floor(random() * maxOut) } : { cacheCreation: counted, output: maxOut };
+    const prompt = (raw.input ?? 0) + (raw.cacheRead ?? 0) + (raw.cacheCreation5m ?? 0) + (raw.cacheCreation ?? 0);
+    if (prompt > counted) continue;
+    assert.ok(unifiedFor(table, model, raw, { undividedCacheWrite: promptCacheTtl })!.unified <= unifiedEstimate(table, model, counted, maxOut), `${table.version} ${model} ${JSON.stringify(raw)}`);
+  }
+});
+
+// Switch-off: unified holds survive the registry switch being removed.
+test('C-SO: unified holds opened while the switch was on still recover, record overruns and pin to their opening period after the switch is removed', async () => {
+  const { db, data } = ledger();
+  const unified = parseRegistry(unifiedRegistryDocument, 'registry');
+  const legacy = parseRegistry(registryDocument, 'registry');
+  let current = { registry: unified, plans: plansFor(unified), rates: v1 as AiRateTable | undefined };
+  const metering = new MeteringService(db, { get: async () => current } as unknown as ConfigurationStore);
+  const entitlements = entitlementsOf(current.plans, 'business');
+  const reserve = (now: Date, quantity = 100) => db.runTransaction((tx: Transaction) => metering.reserveIn(tx, { uid: 'u', entitlements, meterKey: unifiedMeterKey, quantity, operationId: 'model-unified:s', now,
+    kind: unifiedHoldKind, attributes: { model: haiku, rateVersion: 'v1' } }));
+  const open = await reserve(march);          // in flight, nothing observed
+  const observed = await reserve(march);      // in flight, usage journalled
+  const overrun = await reserve(march);       // in flight, usage above the estimate
+  const crossMonth = await reserve(march);    // settled after the month turns
+  await metering.markInFlight('u', [open.id, observed.id, overrun.id, crossMonth.id]);
+  await metering.recordObservedUsage('u', observed.id, 40);
+  await metering.recordObservedUsage('u', overrun.id, 150);
+  await metering.recordPartialUsage('u', open.id, { model: haiku, raw: { input: 7 }, complete: false, unified: 4, tier: 0, rateVersion: 'v1' });
+  // The switch is turned off (and the rate table removed) with all four holds open.
+  current = { registry: legacy, plans: plansFor(legacy), rates: undefined };
+  assert.equal(current.registry.aiUnified, undefined);
+  // Token recovery: proven-dead worker settles the silent hold at its estimate, carrying the partial evidence.
+  await assert.rejects(metering.release('u', open.id), { code: 'usage/reconciliation-required' });
+  assert.equal(await metering.reconcile('u', open.id, march, { unreportable: true }), true);
+  const openRecord = data.get(`users/u/reservations/${open.id}`)!;
+  assert.equal(openRecord['settledQuantity'], 100);
+  assert.deepEqual((openRecord['evidence'] as { raw: unknown }).raw, { input: 7 });
+  // Observed usage settles at the figure; overrun is recorded for the unified hold without the switch.
+  assert.equal(await metering.reconcile('u', observed.id, march), true);
+  assert.equal(data.get(`users/u/reservations/${observed.id}`)!['settledQuantity'], 40);
+  assert.equal(await metering.reconcile('u', overrun.id, march), true);
+  const overrunRecord = data.get(`users/u/reservations/${overrun.id}`)!;
+  assert.deepEqual([overrunRecord['settledQuantity'], overrunRecord['overrunQuantity']], [150, 50]);
+  assert.equal(data.get(`users/u/usage/${unifiedMeterKey}`)!['consumed'], 290);
+  assert.equal(data.get(`users/u/usage/${unifiedMeterKey}`)!['reserved'], 100);
+  // Opening-period attribution across the month boundary still holds without the switch.
+  await metering.recordObservedUsage('u', crossMonth.id, 60);
+  assert.equal(await metering.reconcile('u', crossMonth.id, april), true);
+  const live = data.get(`users/u/usage/${unifiedMeterKey}`)!;
+  assert.equal(live['reserved'], 0);
+  assert.equal(live['consumed'], 0, 'April window: March\'s settlements rolled off and the late one never entered');
+  assert.equal(data.get(`users/u/usage/${unifiedMeterKey}/periods/2026-03-01`)!['settledLate'], 60);
+  assert.equal(data.get(`users/u/usage/${unifiedMeterKey}/periods/2026-03-01`)!['settled'], 290);
+  assert.equal(data.get(`users/u/usage/${unifiedMeterKey}/periods/2026-04-01`), undefined);
+  // A legacy hold on the same ledger is untouched by any of this.
+  const legacyHold = await db.runTransaction((tx: Transaction) => metering.reserveIn(tx, { uid: 'u', entitlements, meterKey: legacy.inputTokenMeterKey, quantity: 10, operationId: 'model-input:s', now: march }));
+  await metering.settle({ uid: 'u', reservationId: legacyHold.id, actualQuantity: 10, now: april });
+  assert.equal(data.get(`users/u/usage/${legacy.inputTokenMeterKey}`)!['consumed'], 10, 'legacy late settlement still counts in the live window');
 });
 
 // Randomised ledger invariants.
