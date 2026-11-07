@@ -49,6 +49,8 @@ interface ProviderScript {
   readonly legacy?: boolean;
   readonly planKey?: string;
   readonly countedInput?: number;
+  /** Scripted provider replies, one per call in order; a call past the end gets the default reply. */
+  readonly responses?: readonly { readonly content: ContentBlock[]; readonly usage: Record<string, unknown>; readonly stop_reason: string }[];
 }
 
 /** Real admission, agent, fenced session reservations, metering and session repository; fake only the ledger and SDK. */
@@ -75,10 +77,15 @@ async function unifiedFixture(provider: ProviderScript = {}) {
   const problems: { error: Error; what: string }[] = [];
   const onProblem = (error: Error, what: string) => { problems.push({ error, what }); };
   const order: string[] = [];
+  let calls = 0;
+  const streamed: { tools: readonly string[] }[] = [];
   const sdk = {
     countTokens: async () => ({ input_tokens: provider.countedInput ?? 10 }),
     stream: (params?: { tools?: readonly { name?: string }[] }) => {
       order.push('stream');
+      const scripted = provider.responses?.[calls];
+      calls++;
+      streamed.push({ tools: (params?.tools ?? []).map((tool) => tool.name ?? '') });
       if (provider.throwBeforeStream !== undefined) throw provider.throwBeforeStream;
       const listeners: ((event: MessageStreamEvent) => void)[] = [];
       return {
@@ -87,6 +94,7 @@ async function unifiedFixture(provider: ProviderScript = {}) {
           for (const event of provider.events ?? []) for (const listener of listeners) listener(event);
           if (provider.stopDuringCall === true) controller.abort(new AppError({ code: 'session/cancelled', statusCode: 409, message: 'Stopped.' }));
           if (provider.abortAfterEvents === true || provider.stopDuringCall === true) throw new Error('Request was aborted.');
+          if (scripted !== undefined) return scripted;
           const finish = params?.tools?.some((tool) => tool.name === 'finish_task');
           return {
             content: [{ type: 'text', text: 'Done', citations: null }, ...(finish ? [{ type: 'tool_use' as const, id: 'finish', name: 'finish_task', input: { outcome: 'answered', summary: 'Done', evidence: [] }, caller: { type: 'direct' as const } }] : [])],
@@ -127,7 +135,7 @@ async function unifiedFixture(provider: ProviderScript = {}) {
   const preConsume = (consumed: number, now = new Date()) => data.set(`users/u/usage/${unifiedMeterKey}`, { meterKey: unifiedMeterKey, consumed, reserved: 0,
     periodStart: Timestamp.fromDate(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))), updatedAt: Timestamp.now() });
   return { db, data, metering, registry, plans, entitlements, sessions, authority, session, controller, problems, order, admission, begin, run,
-    records, usage, period, limit, preConsume, setRejectAuthorization: (n: number) => { rejectAuthorization = n; } };
+    records, usage, period, limit, preConsume, streamed, calls: () => calls, setRejectAuthorization: (n: number) => { rejectAuthorization = n; } };
 }
 
 const haiku = 'claude-haiku-4-5';
@@ -310,6 +318,56 @@ test('C12: under unified admission a shared output reservation is ignored — ea
   await admitted.settle({ input: 7, output: 3, raw: { input: 7, output: 3 } });
   assert.equal(h.records().length, 1);
   assert.equal(h.records()[0]!.fields['settledQuantity'], 11); // 3.5 + 7.5
+});
+
+test('C12b: a specialist consultation under unified admission is three logical calls, three unified holds, no shared output hold, each settled once', async () => {
+  const toolUse = (id: string, name: string, input: Record<string, unknown>): ContentBlock => ({ type: 'tool_use', id, name, input, caller: { type: 'direct' } } as unknown as ContentBlock);
+  const usageOf = (input: number, output: number) => ({ input_tokens: input, output_tokens: output });
+  const h = await unifiedFixture({ responses: [
+    // Primary asks the security specialist.
+    { content: [toolUse('c1', 'consult_specialist', { role: 'security', question: 'Inspect the project for ownership checks.' })], usage: usageOf(100, 10), stop_reason: 'tool_use' },
+    // The specialist answers with its review.
+    { content: [toolUse('r1', 'submit_review', { verdict: 'ok', summary: 'No concerns.', findings: [] })], usage: usageOf(200, 20), stop_reason: 'tool_use' },
+    // Primary finishes.
+    { content: [{ type: 'text', text: 'Done', citations: null } as ContentBlock, toolUse('f1', 'finish_task', { outcome: 'answered', summary: 'Done', evidence: ['c1'] })], usage: usageOf(300, 30), stop_reason: 'tool_use' },
+  ] });
+  await h.run();
+  assert.equal(h.calls(), 3);
+  assert.ok(h.streamed[1]!.tools.includes('submit_review'), 'the second call was the specialist');
+  const holds = h.records();
+  assert.equal(holds.length, 3, 'one unified hold per logical call, none shared');
+  for (const hold of holds) {
+    assert.equal(hold.fields['meterKey'], unifiedMeterKey);
+    assert.equal(hold.fields['status'], 'SETTLED');
+    assert.equal(hold.fields['operationId'], 'model-unified:s');
+    assert.equal((hold.fields['evidence'] as { complete: boolean }).complete, true);
+  }
+  assert.ok(!holds.some((hold) => String(hold.fields['operationId']).startsWith('specialist:')), 'no shared specialist output hold exists in unified mode');
+  // Haiku: (100/2 + 10×5/2) + (200/2 + 20×5/2) + (300/2 + 30×5/2) = 75 + 150 + 225.
+  assert.deepEqual(holds.map((hold) => hold.fields['settledQuantity']).sort((a, b) => Number(a) - Number(b)), [75, 150, 225]);
+  assert.equal(h.usage(unifiedMeterKey)?.['consumed'], 450);
+  assert.equal(h.usage(unifiedMeterKey)?.['reserved'], 0);
+  assert.equal(h.usage(h.registry.outputTokenMeterKey), undefined);
+  assert.deepEqual(h.problems, []);
+  assert.deepEqual(h.data.get('sessions/s')?.['specialistReservationIds'] ?? [], [], 'every hold was forgotten from the session after settling');
+});
+
+test('C12c: in legacy mode the same consultation still takes the shared specialist output hold and settles it once', async () => {
+  const toolUse = (id: string, name: string, input: Record<string, unknown>): ContentBlock => ({ type: 'tool_use', id, name, input, caller: { type: 'direct' } } as unknown as ContentBlock);
+  const usageOf = (input: number, output: number) => ({ input_tokens: input, output_tokens: output });
+  // Legacy output holds are bounded by maxOutputTokens (20): a legacy call cannot overrun its output hold.
+  const h = await unifiedFixture({ legacy: true, responses: [
+    { content: [toolUse('c1', 'consult_specialist', { role: 'security', question: 'Inspect the project.' })], usage: usageOf(100, 10), stop_reason: 'tool_use' },
+    { content: [toolUse('r1', 'submit_review', { verdict: 'ok', summary: 'No concerns.', findings: [] })], usage: usageOf(200, 20), stop_reason: 'tool_use' },
+    { content: [{ type: 'text', text: 'Done', citations: null } as ContentBlock, toolUse('f1', 'finish_task', { outcome: 'answered', summary: 'Done', evidence: ['c1'] })], usage: usageOf(300, 15), stop_reason: 'tool_use' },
+  ] });
+  await h.run();
+  const shared = h.records().filter((hold) => String(hold.fields['operationId']).startsWith('specialist:'));
+  assert.equal(shared.length, 1);
+  assert.deepEqual([shared[0]!.fields['status'], shared[0]!.fields['settledQuantity']], ['SETTLED', 20]);
+  assert.equal(h.usage(h.registry.outputTokenMeterKey)?.['consumed'], 45);
+  assert.equal(h.usage(h.registry.inputTokenMeterKey)?.['consumed'], 600);
+  assert.equal(h.usage(unifiedMeterKey), undefined);
 });
 
 // 13. Fallback lane.
