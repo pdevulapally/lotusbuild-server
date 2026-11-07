@@ -23,14 +23,17 @@ export interface CallAdmission {
 /**
  * Shadow accounting only: the raw categories are always kept; the unified figure is added when a rate
  * table knows the model and the conversion succeeds. A conversion failure is recorded as its absence,
- * never allowed to fail the settlement of a real hold.
+ * never allowed to fail the settlement of a real hold. The call is complete only when the provider's
+ * authoritative output figure arrived: `message_start` already states every prompt category, so an
+ * interrupted call lacks exactly its output, and its figure is known usage, not the call's total.
  */
 export function shadowEvidence(rates: AiRateTable | undefined, model: string, raw: RawUsage): AiCallEvidence {
-  if (rates === undefined) return { model, raw };
+  const complete = raw.output !== undefined;
+  if (rates === undefined) return { model, raw, complete };
   try {
-    return { model, raw, ...(unifiedFor(rates, model, raw) ?? {}) };
+    return { model, raw, complete, ...(unifiedFor(rates, model, raw) ?? {}) };
   } catch {
-    return { model, raw };
+    return { model, raw, complete };
   }
 }
 

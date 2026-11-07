@@ -123,7 +123,7 @@ test('a settled hold keeps its opening period, its evidence, and a durable perio
   const hold = await f.reserve(march);
   const reservationPath = `users/u/reservations/${hold.id}`;
   assert.deepEqual(f.record(reservationPath)?.['openedPeriodStart'], Timestamp.fromDate(new Date('2026-03-01T00:00:00Z')));
-  const evidence = { model: 'claude-sonnet-5', raw: { input: 60, output: 9 }, rateVersion: 'v1', unified: 105, tier: 0 };
+  const evidence = { model: 'claude-sonnet-5', raw: { input: 60, output: 9 }, complete: true, rateVersion: 'v1', unified: 105, tier: 0 };
   assert.equal(await f.metering.settle({ uid: 'u', reservationId: hold.id, actualQuantity: 60, recordOverrun: true, now: march, evidence }), true);
   assert.deepEqual(f.record(reservationPath)?.['evidence'], evidence);
   const period = f.record(`users/u/usage/${f.meterKey}/periods/2026-03-01`);
@@ -163,12 +163,12 @@ import { shadowEvidence } from '../src/runner/call-admission.ts';
 
 test('shadow evidence never fails a settlement: conversion problems just leave the unified figure absent', () => {
   const raw = { input: 60, output: 9 };
-  assert.deepEqual(shadowEvidence(undefined, 'claude-sonnet-5', raw), { model: 'claude-sonnet-5', raw });
-  assert.deepEqual(shadowEvidence(v1, 'retired-model', raw), { model: 'retired-model', raw });
-  assert.deepEqual(shadowEvidence(v1, 'claude-sonnet-5', raw), { model: 'claude-sonnet-5', raw, unified: 105, tier: 0, rateVersion: 'v1' });
+  assert.deepEqual(shadowEvidence(undefined, 'claude-sonnet-5', raw), { model: 'claude-sonnet-5', raw, complete: true });
+  assert.deepEqual(shadowEvidence(v1, 'retired-model', raw), { model: 'retired-model', raw, complete: true });
+  assert.deepEqual(shadowEvidence(v1, 'claude-sonnet-5', raw), { model: 'claude-sonnet-5', raw, complete: true, unified: 105, tier: 0, rateVersion: 'v1' });
   const overflow = { input: Number.MAX_SAFE_INTEGER };
   assert.throws(() => unifiedFor(v1, 'claude-opus-5', overflow));
-  assert.deepEqual(shadowEvidence(v1, 'claude-opus-5', overflow), { model: 'claude-opus-5', raw: overflow });
+  assert.deepEqual(shadowEvidence(v1, 'claude-opus-5', overflow), { model: 'claude-opus-5', raw: overflow, complete: false });
 });
 
 test('restated usage overwrites by category and never lets a cache-creation total coexist with its breakdown', () => {
@@ -236,4 +236,27 @@ test('a period-record write that fails fails the whole settlement, which then re
   // A release attempted after settlement is likewise a no-op: the hold cannot be returned twice.
   assert.equal(await metering.release('u', hold.id), false);
   assert.deepEqual([live()['reserved'], live()['consumed']], [0, 60]);
+});
+
+test('an interrupted call is recorded as partial: its known usage stays on the hold but never enters the definitive period total', async () => {
+  const f = meteringFixture();
+  // Interrupted after message_start: prompt categories known, output never reported.
+  const partial = shadowEvidence(v1, 'claude-haiku-4-5', { input: 7, cacheRead: 40, cacheCreation: 16 });
+  assert.deepEqual(partial, { model: 'claude-haiku-4-5', raw: { input: 7, cacheRead: 40, cacheCreation: 16 }, complete: false, unified: 16, tier: 0, rateVersion: 'v1' });
+  // Interrupted after message_delta: the authoritative output total arrived, so the call is complete even though it was cancelled.
+  assert.equal(shadowEvidence(v1, 'claude-haiku-4-5', { input: 7, cacheRead: 40, cacheCreation: 16, output: 3 }).complete, true);
+  const complete = shadowEvidence(v1, 'claude-sonnet-5', { input: 60, output: 9 });
+
+  const first = await f.reserve(march);
+  const second = await f.reserve(march);
+  assert.equal(await f.metering.settle({ uid: 'u', reservationId: first.id, actualQuantity: 60, recordOverrun: true, now: march, evidence: complete }), true);
+  assert.equal(await f.metering.settle({ uid: 'u', reservationId: second.id, actualQuantity: 63, recordOverrun: true, now: march, evidence: partial }), true);
+  // The hold keeps the partial figure and says so; the audit trail loses nothing.
+  assert.deepEqual(f.record(`users/u/reservations/${second.id}`)?.['evidence'], partial);
+  // The period's definitive total is exactly the complete calls (105), neither understated by omitting
+  // a complete call nor polluted by the partial one; the partial figure is aggregated apart.
+  const period = f.record(`users/u/usage/${f.meterKey}/periods/2026-03-01`);
+  assert.deepEqual([period?.['unified'], period?.['unifiedPartial'], period?.['settled']], [105, 16, 123]);
+  // Today's meters are unaffected either way.
+  assert.equal(f.record(`users/u/usage/${f.meterKey}`)?.['consumed'], 123);
 });

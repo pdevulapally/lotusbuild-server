@@ -77,10 +77,15 @@ interface CloseOutcome {
   readonly overrunQuantity?: number;
 }
 
-/** Shadow unified-token evidence for one logical AI call, recorded once on the call's input hold. */
+/**
+ * Shadow unified-token evidence for one logical AI call, recorded once on the call's input hold.
+ * `complete` says whether the provider reported every billed category; a call interrupted before
+ * its authoritative output figure is `complete: false`, and its `unified` is the known usage only.
+ */
 export interface AiCallEvidence {
   readonly model: string;
   readonly raw: RawUsage;
+  readonly complete: boolean;
   readonly rateVersion?: string;
   readonly unified?: number;
   readonly tier?: number;
@@ -1040,7 +1045,9 @@ export class MeteringService {
           periodStart: Timestamp.fromDate(opened),
           [late ? 'settledLate' : 'settled']: FieldValue.increment(outcome.settledQuantity),
           ...(outcome.overrunQuantity ? { overrunInfo: FieldValue.increment(outcome.overrunQuantity) } : {}),
-          ...(evidence?.unified === undefined ? {} : { unified: FieldValue.increment(evidence.unified) }),
+          // Only a complete call enters the definitive unified total; a partial figure is
+          // kept apart so the complete aggregate is never understated or overstated by it.
+          ...(evidence?.unified === undefined ? {} : { [evidence.complete ? 'unified' : 'unifiedPartial']: FieldValue.increment(evidence.unified) }),
           updatedAt: FieldValue.serverTimestamp(),
         }, { merge: true });
       }

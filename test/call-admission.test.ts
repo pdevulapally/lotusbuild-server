@@ -455,8 +455,9 @@ test('a real streamed call settles the same quantities as before and records its
   assert.deepEqual(input.map((record) => [record.fields['status'], record.fields['settledQuantity']]), [['SETTLED', 63]]);
   assert.deepEqual(output.map((record) => [record.fields['status'], record.fields['settledQuantity']]), [['SETTLED', 3]]);
   // Shadow evidence: once, on the input hold, with exactly the categories the provider reported.
-  const evidence = input[0]!.fields['evidence'] as { model: string; raw: unknown; unified?: number; rateVersion?: string; tier?: number };
+  const evidence = input[0]!.fields['evidence'] as { model: string; raw: unknown; complete: boolean; unified?: number; rateVersion?: string; tier?: number };
   assert.equal(evidence.model, 'claude-haiku-4-5');
+  assert.equal(evidence.complete, true);
   assert.deepEqual(evidence.raw, { input: 7, cacheRead: 40, cacheCreation5m: 16, cacheCreation1h: 0, output: 3 });
   // Haiku 4.5 at Sonnet-input parity: 7/2 + 40/20 + 16*5/8 + 0 + 3*5/2 = 23 exactly.
   assert.deepEqual([evidence.unified, evidence.rateVersion, evidence.tier], [23, 'v1', 0]);
@@ -472,10 +473,13 @@ test('a call interrupted after message_start settles the prompt it reported, wit
   await assert.rejects(h.run(), /aborted/);
   const input = h.records().filter((record) => record.fields['meterKey'] === h.registry.inputTokenMeterKey);
   assert.deepEqual(input.map((record) => [record.fields['status'], record.fields['settledQuantity']]), [['SETTLED', 63]]);
-  const evidence = input[0]!.fields['evidence'] as { raw: unknown; unified?: number };
+  const evidence = input[0]!.fields['evidence'] as { raw: unknown; complete: boolean; unified?: number };
   // No TTL breakdown was reported, so the total stays one undivided category; the provisional output count is not evidence.
   assert.deepEqual(evidence.raw, { input: 7, cacheRead: 40, cacheCreation: 16 });
-  assert.equal(evidence.unified, 16); // ceil(3.5 + 2 + 10)
+  // Known usage only: the output was never reported, so the figure is partial and stays out of the definitive total.
+  assert.deepEqual([evidence.unified, evidence.complete], [16, false]); // ceil(3.5 + 2 + 10)
+  const period = h.data.get(`users/u/usage/${h.registry.inputTokenMeterKey}/periods/${new Date().toISOString().slice(0, 7)}-01`);
+  assert.deepEqual([period?.['unified'], period?.['unifiedPartial']], [undefined, 16]);
   const output = h.records().filter((record) => record.fields['meterKey'] === h.registry.outputTokenMeterKey);
   assert.equal(output.length, 1);
   assert.equal(output[0]!.fields['evidence'], undefined);
