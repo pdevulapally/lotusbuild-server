@@ -2,7 +2,7 @@ import { timed } from '../diagnostics/timing.ts';
 import type { Firestore } from 'firebase-admin/firestore';
 
 import { type Cached, cached } from '../support/cache.ts';
-import { aiRatesDocumentPath, parseAiRateTable, type AiRateTable } from './rates.ts';
+import { aiRatesDocumentPath, aiRatesVersionPath, parseAiRateTable, type AiRateTable } from './rates.ts';
 import { DocumentShapeError } from '../support/documents.ts';
 import {
   type Plan,
@@ -37,8 +37,12 @@ export interface Configuration {
  */
 export class ConfigurationStore {
   readonly #entry: Cached<Configuration>;
+  readonly #firestore: Firestore;
+  /** Archived tables never change once written, so one read per version per process is enough. */
+  readonly #archivedRates = new Map<string, Promise<AiRateTable>>();
 
   constructor(firestore: Firestore, ttlMs: number) {
+    this.#firestore = firestore;
     this.#entry = cached(ttlMs, async (): Promise<Configuration> => {
       const [registrySnapshot, planSnapshots, ratesSnapshot] = await timed('configuration.firestore', () => Promise.all([
         firestore.doc(registryDocumentPath).get(),
@@ -104,6 +108,30 @@ export class ConfigurationStore {
 
   get(): Promise<Configuration> {
     return timed('configuration.get', () => this.#entry.get());
+  }
+
+  /**
+   * The rate table a hold was admitted under, by version: the current table when
+   * it still carries that version, otherwise the archived copy. A version found
+   * nowhere is an error the caller must surface, never a different table — the
+   * reservation says what it was priced at, and settlement may not re-price it.
+   */
+  async ratesByVersion(version: string): Promise<AiRateTable> {
+    const { rates } = await this.get();
+    if (rates !== undefined && rates.version === version) return rates;
+    let pending = this.#archivedRates.get(version);
+    if (pending === undefined) {
+      const path = aiRatesVersionPath(version);
+      pending = this.#firestore.doc(path).get().then((snapshot) => {
+        if (!snapshot.exists) throw new DocumentShapeError(`${path} does not exist: the rate table this hold was admitted under is unavailable.`);
+        const table = parseAiRateTable(snapshot.data() ?? {}, path);
+        if (table.version !== version) throw new DocumentShapeError(`${path} carries version "${table.version}", not "${version}".`);
+        return table;
+      });
+      pending.catch(() => this.#archivedRates.delete(version));
+      this.#archivedRates.set(version, pending);
+    }
+    return pending;
   }
 
   /** Forces the next read to reload, after configuration is edited by hand. */

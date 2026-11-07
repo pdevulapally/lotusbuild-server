@@ -32,6 +32,9 @@ export interface Consumption {
   readonly periodStart: Date;
 }
 
+/** Strings only: these are read back by settlement and must round-trip exactly. */
+export type ReservationAttributes = Readonly<Record<string, string>>;
+
 export interface Reservation {
   readonly id: string;
   readonly meterKey: string;
@@ -529,6 +532,8 @@ export class MeteringService {
       readonly quantity: number;
       readonly operationId: string;
       readonly now: Date;
+      /** Facts the hold was priced on (model, rate-table version), stored so settlement reads them back rather than guessing. */
+      readonly attributes?: ReservationAttributes;
     },
   ): Promise<Reservation> {
     const { meter, ref: usageRef, state, periodStart } = await this.#availableIn(transaction, input);
@@ -547,6 +552,7 @@ export class MeteringService {
       status: 'OPEN',
       operationId: input.operationId,
       openedPeriodStart: Timestamp.fromDate(periodStart),
+      ...(input.attributes === undefined ? {} : { attributes: input.attributes }),
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     });
@@ -602,6 +608,7 @@ export class MeteringService {
     readonly quantity: number;
     readonly operationId: string;
     readonly now: Date;
+    readonly attributes?: ReservationAttributes;
   }): Promise<Reservation> {
     return this.#firestore.runTransaction((transaction) => this.reserveIn(transaction, input));
   }
@@ -950,7 +957,7 @@ export class MeteringService {
    * recovery once it has proven the dispatching worker is gone (see `reconcile`).
    * Resource holds and holds on any other meter are refused.
    */
-  async settleUnobserved(uid: string, id: string, now: Date = new Date()): Promise<boolean> {
+  async settleUnobserved(uid: string, id: string, now: Date = new Date(), evidence?: AiCallEvidence): Promise<boolean> {
     const fields = await this.reservationRecord(uid, id);
     if (fields['status'] !== 'OPEN') return false;
     if (fields['inFlight'] !== true || typeof fields['observedQuantity'] === 'number') return false;
@@ -959,12 +966,13 @@ export class MeteringService {
     }
     const estimated = integerField(fields, 'estimatedQuantity', `reservation ${id}`, { min: 1 });
     await this.recordObservedUsage(uid, id, estimated, 'provider-usage-unavailable');
-    return this.settle({ uid, reservationId: id, actualQuantity: estimated, now });
+    return this.settle({ uid, reservationId: id, actualQuantity: estimated, now, ...(evidence === undefined ? {} : { evidence }) });
   }
 
   async #isTokenMeter(meterKey: unknown): Promise<boolean> {
     const { registry } = await this.#configuration.get();
     return typeof meterKey === 'string' && [registry.inputTokenMeterKey, registry.outputTokenMeterKey,
+      ...(registry.aiUnified === undefined ? [] : [registry.aiUnified.meterKey]),
       ...(registry.fallback === undefined ? [] : [registry.fallback.inputTokenMeterKey, registry.fallback.outputTokenMeterKey])].includes(meterKey);
   }
 
@@ -987,7 +995,7 @@ export class MeteringService {
     if (typeof fields['observedQuantity'] === 'number') {
       const { registry } = await this.#configuration.get();
       return this.settle({ uid, reservationId: id, actualQuantity: fields['observedQuantity'], now,
-        recordOverrun: fields['meterKey'] === registry.inputTokenMeterKey });
+        recordOverrun: fields['meterKey'] === registry.inputTokenMeterKey || fields['meterKey'] === registry.aiUnified?.meterKey });
     }
     return this.release(uid, id, now);
   }
@@ -1047,6 +1055,14 @@ export class MeteringService {
       const usage = await transaction.get(usageRef);
       const periodStart = periodStartFor(meter, now);
       const state = this.#state(usage, periodStart, usageRef.path);
+      const opened = fields['openedPeriodStart'] instanceof Timestamp ? (fields['openedPeriodStart'] as Timestamp).toDate() : periodStart;
+      // Unified tokens are attributed to the period the call was admitted in. A
+      // hold that outlived its month returns its capacity (reserved carries
+      // across the boundary) but adds nothing to the new month's consumption;
+      // the opening period's record is the durable statement of what it cost.
+      // Legacy meters keep counting a late settlement in the live window, as
+      // they always have, so a rollback finds nothing changed under it.
+      const pinned = meterKey === registry.aiUnified?.meterKey && opened.getTime() < periodStart.getTime();
 
       if (state.reserved < estimatedQuantity) {
         // Not a limit problem: the ledger disagrees with itself, and carrying on
@@ -1058,6 +1074,17 @@ export class MeteringService {
       }
 
       const outcome = apply(meter, estimatedQuantity, transaction, usageRef, state, periodStart);
+      if (pinned && outcome.status === 'SETTLED') {
+        // Overwrite what `apply` just set for the live window: the capacity comes
+        // back, the consumption stays with the opening period.
+        transaction.set(usageRef, {
+          meterKey: meter.key,
+          consumed: state.consumed,
+          reserved: state.reserved - estimatedQuantity,
+          periodStart: Timestamp.fromDate(periodStart),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      }
       transaction.update(reservationRef, {
         status: outcome.status,
         ...(outcome.settledQuantity === undefined
@@ -1071,7 +1098,6 @@ export class MeteringService {
       // unchanged). A hold opened in an earlier period is recorded as settled
       // late against that period; live-meter attribution stays as it is until PR C.
       if (outcome.status === 'SETTLED' && outcome.settledQuantity !== undefined && meter.kind === 'COUNTER') {
-        const opened = fields['openedPeriodStart'] instanceof Timestamp ? (fields['openedPeriodStart'] as Timestamp).toDate() : periodStart;
         const late = opened.getTime() < periodStart.getTime();
         const periodRef = this.#firestore.doc(`${usageRef.path}/periods/${periodRecordId(opened)}`);
         transaction.set(periodRef, {

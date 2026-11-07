@@ -11,6 +11,11 @@ import { EntitlementConfigError } from './values.ts';
  * admin script. PR A only reads the current document.
  */
 export const aiRatesDocumentPath = 'config/aiRates';
+/** Where a superseded table of the given version is archived, so a hold admitted under it settles under it. */
+export function aiRatesVersionPath(version: string): string {
+  if (!/^[A-Za-z0-9_.-]+$/.test(version)) throw new EntitlementConfigError(`Rate table version "${version}" is not a valid document id.`);
+  return `${aiRatesDocumentPath}/versions/${version}`;
+}
 
 export interface Rational { readonly num: number; readonly den: number }
 
@@ -95,7 +100,7 @@ export interface UnifiedConversion {
  * Cache creation without a TTL breakdown is priced at the 5-minute write rate,
  * the lower of the two. Returns undefined for a model the table does not price.
  */
-export function unifiedFor(table: AiRateTable, modelId: string, usage: RawUsage): UnifiedConversion | undefined {
+export function unifiedFor(table: AiRateTable, modelId: string, usage: RawUsage, options: { readonly undividedCacheWrite?: '5m' | '1h' } = {}): UnifiedConversion | undefined {
   const tiers = table.models.get(modelId);
   if (tiers === undefined) return undefined;
   const prompt = (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheCreation5m ?? 0) + (usage.cacheCreation1h ?? 0) + (usage.cacheCreation ?? 0);
@@ -103,7 +108,10 @@ export function unifiedFor(table: AiRateTable, modelId: string, usage: RawUsage)
   const tier = tiers[tierIndex]!;
   const parts: readonly [number | undefined, Rational][] = [
     [usage.input, tier.input], [usage.output, tier.output], [usage.cacheRead, tier.cacheRead],
-    [usage.cacheCreation5m, tier.cacheWrite5m], [usage.cacheCreation1h, tier.cacheWrite1h], [usage.cacheCreation, tier.cacheWrite5m],
+    [usage.cacheCreation5m, tier.cacheWrite5m], [usage.cacheCreation1h, tier.cacheWrite1h],
+    // Shadow accounting keeps PR A's 5-minute reading of an undivided figure; active admission asks for the 1-hour
+    // weight, the higher of the two, so a payload without a TTL breakdown can never under-charge.
+    [usage.cacheCreation, options.undividedCacheWrite === '1h' ? tier.cacheWrite1h : tier.cacheWrite5m],
   ];
   // Sum of fractions over a common denominator, then one ceiling.
   let numerator = 0n, denominator = 1n;

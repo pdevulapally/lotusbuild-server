@@ -123,6 +123,7 @@ export interface SpecialistReservations {
     readonly meterKey: string;
     readonly quantity: number;
     readonly operationId: string;
+    readonly attributes?: Readonly<Record<string, string>>;
   }): Promise<{ readonly id: string }>;
   forget(reservationId: string): Promise<void>;
 }
@@ -1110,9 +1111,13 @@ async function consultSpecialist(
   call.assertStillOurs();
   call.signal.throwIfAborted();
   const ceiling = call.limits.specialistMaxSteps * call.limits.maxOutputTokens;
-  let reservation;
+  // Under unified admission every step of the specialist's loop takes its own hold
+  // covering input and output, so there is no shared output hold to take or settle:
+  // a logical call is then accounted for exactly once, by its own admission.
+  const sharesOutputHold = call.registry.aiUnified === undefined;
+  let reservation: { readonly id: string } | undefined;
   try {
-    reservation = await call.reservations.take({
+    if (sharesOutputHold) reservation = await call.reservations.take({
       meterKey: call.registry.outputTokenMeterKey,
       quantity: ceiling,
       operationId: `specialist:${call.session.id}:${call.specialist.key}`,
@@ -1168,7 +1173,7 @@ async function consultSpecialist(
 
     const outcome = await runModelLoop({
       admission: call.admission,
-      outputReservationId: reservation.id,
+      ...(reservation === undefined ? {} : { outputReservationId: reservation.id }),
       anthropic: call.anthropic,
       model: call.session.model,
       effort: call.session.effort,
@@ -1217,6 +1222,10 @@ async function consultSpecialist(
 
   let settled = false;
   let settlementError: unknown;
+  if (reservation === undefined) {
+    if (primary !== undefined) throw primary;
+    return answer!;
+  }
   try {
     if (unknownOutput) throw new Error('Specialist output usage requires reconciliation; the hold remains open.');
     await call.metering.recordObservedUsage(call.session.ownerUid, reservation.id, spent);

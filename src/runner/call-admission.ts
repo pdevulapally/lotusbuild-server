@@ -4,6 +4,7 @@ import type Anthropic from '@anthropic-ai/sdk';
 import type { MessageCountTokensParams } from '@anthropic-ai/sdk/resources/messages';
 import type { AiCallEvidence, MeteringService } from '../metering/service.ts';
 import { unifiedFor, type AiRateTable, type RawUsage } from '../entitlements/rates.ts';
+import { EntitlementConfigError } from '../entitlements/values.ts';
 import type { AuthoritativeUsage, SpecialistReservations, ProblemReporter } from './agent.ts';
 import { modelOutputConfig, type ModelResolver } from '../models/catalog.ts';
 import type { TokenCount } from '../models/provider.ts';
@@ -39,6 +40,27 @@ export function shadowEvidence(rates: AiRateTable | undefined, model: string, ra
   }
 }
 
+export interface UnifiedAdmission {
+  readonly meterKey: string;
+  readonly rates: AiRateTable;
+  readonly ratesByVersion: (version: string) => Promise<AiRateTable>;
+}
+
+/** Fields a unified hold is priced on; read back at settlement, never recomputed. */
+export const unifiedHoldAttributes = { model: 'model', rateVersion: 'rateVersion' } as const;
+
+/**
+ * What one call can cost at most, in unified tokens: every counted prompt token at the
+ * 5-minute cache-write weight (the highest weight a prompt token carries — plain input and
+ * cache reads are cheaper, and the agent writes only 5-minute cache entries) plus the output
+ * ceiling at the output weight. One ceiling over the whole figure, like settlement.
+ */
+export function unifiedEstimate(table: AiRateTable, model: string, inputTokens: number, maxOutputTokens: number): number {
+  const conversion = unifiedFor(table, model, { cacheCreation5m: inputTokens, output: maxOutputTokens });
+  if (conversion === undefined) throw new EntitlementConfigError(`Model "${model}" has no entry in rate table ${table.version}, so the call cannot be admitted.`);
+  return Math.max(1, conversion.unified);
+}
+
 export function createCallAdmission(deps: {
   readonly anthropic: Anthropic;
   /** Provider-specific input count; defaults to Anthropic's count_tokens. An estimate is still reserved in full and settled from authoritative usage. */
@@ -55,7 +77,17 @@ export function createCallAdmission(deps: {
   readonly onProblem: ProblemReporter;
   /** Unified-token rate table for shadow accounting; absent until seeded. */
   readonly rates?: AiRateTable;
+  /**
+   * Unified AI Token admission. Present means every call takes one hold on this
+   * meter, priced by `rates` at admission and settled by the table of the same
+   * version; the legacy input/output holds are not taken. Absent is today's
+   * behaviour. Chosen by the caller from the registry's `aiUnified` policy.
+   */
+  readonly unified?: UnifiedAdmission;
 }): CallAdmission {
+  if (deps.unified !== undefined && deps.unified.rates.models.size === 0) {
+    throw new EntitlementConfigError(`Rate table ${deps.unified.rates.version} prices no model; unified admission cannot start.`);
+  }
   return {
     async begin(input) {
       input.signal.throwIfAborted();
@@ -76,6 +108,9 @@ export function createCallAdmission(deps: {
         throw new Error('The model provider returned no usable input-token estimate.');
       }
       if (deps.maxInputTokens !== undefined && count.inputTokens > deps.maxInputTokens) throw new AppError({ code: 'fallback/context-exceeded', statusCode: 409, message: 'The task now exceeds the verified fallback context window.' });
+      if (deps.unified !== undefined) {
+        return beginUnified(deps, deps.unified, input, params, maxOutputTokens, count.inputTokens);
+      }
       const holds: { id: string; kind: 'input' | 'output' }[] = [];
       const settle = async (usage: AuthoritativeUsage): Promise<void> => {
         const failures: unknown[] = [];
@@ -142,4 +177,73 @@ export function createCallAdmission(deps: {
       return { settle, params, maxOutputTokens };
     },
   };
+}
+
+type AdmissionDeps = Parameters<typeof createCallAdmission>[0];
+type Admitted = Awaited<ReturnType<CallAdmission['begin']>>;
+
+/**
+ * One hold per logical call. Pre-dispatch: the hold is taken for the estimate,
+ * the lease and entitlement re-checked, and the hold marked in flight; only then
+ * does the caller generate. Settlement converts the provider's authoritative raw
+ * categories with the table of the version recorded on the hold, journals the
+ * figure, and settles once; an overrun above the estimate is recorded, never
+ * dropped, never allowed to go negative. A call whose figures are incomplete
+ * (interrupted before output, or an undivided cache figure) stays open for
+ * reconciliation exactly as a legacy hold would: estimate only on a proven Stop
+ * or dead worker, never guessed here.
+ */
+async function beginUnified(deps: AdmissionDeps, unified: UnifiedAdmission,
+  input: Parameters<CallAdmission['begin']>[0], params: Admitted['params'], maxOutputTokens: number, inputTokens: number): Promise<Admitted> {
+  const model = input.params.model;
+  const estimate = unifiedEstimate(unified.rates, model, inputTokens, maxOutputTokens);
+  let hold: { readonly id: string } | undefined;
+  const settle = async (usage: AuthoritativeUsage): Promise<void> => {
+    if (hold === undefined) return;
+    const id = hold.id;
+    const raw = usage.raw;
+    const knownZero = raw === undefined && usage.input === 0 && usage.output === 0;
+    const complete = raw !== undefined && raw.input !== undefined && raw.output !== undefined;
+    if (!knownZero && !complete) {
+      const reason: unknown = input.signal.aborted ? input.signal.reason : undefined;
+      if (!(reason instanceof AppError && reason.code === 'session/cancelled')) {
+        deps.onProblem(new Error('Authoritative usage is unavailable; the unified hold remains open.'), 'model usage reconciliation required');
+        return;
+      }
+      // Stopped by the user before the provider finished reporting: settles at the
+      // estimate, keeping whatever partial figures arrived as evidence marked partial.
+      await deps.metering.settleUnobserved(deps.uid, id, new Date(), raw === undefined ? undefined : shadowEvidence(unified.rates, model, raw));
+      await deps.reservations.forget(id);
+      return;
+    }
+    let actual = 0;
+    let evidence: AiCallEvidence | undefined;
+    if (!knownZero && raw !== undefined) {
+      const table = await unified.ratesByVersion(unified.rates.version);
+      const conversion = unifiedFor(table, model, raw, { undividedCacheWrite: '1h' });
+      if (conversion === undefined) {
+        deps.onProblem(new EntitlementConfigError(`Model "${model}" is absent from rate table ${table.version}; the unified hold remains open.`), 'model usage reconciliation required');
+        return;
+      }
+      actual = conversion.unified;
+      evidence = { model, raw, complete: true, ...conversion };
+    }
+    await deps.metering.recordObservedUsage(deps.uid, id, actual);
+    await deps.metering.settle({ uid: deps.uid, reservationId: id, actualQuantity: actual, recordOverrun: true, now: new Date(),
+      ...(evidence === undefined ? {} : { evidence }) });
+    await deps.reservations.forget(id);
+  };
+  try {
+    hold = await deps.reservations.take({ meterKey: unified.meterKey, quantity: estimate, operationId: `model-unified:${deps.sessionId}`,
+      attributes: { [unifiedHoldAttributes.model]: model, [unifiedHoldAttributes.rateVersion]: unified.rates.version } });
+    await deps.authorize();
+    input.signal.throwIfAborted();
+    await deps.metering.markInFlight(deps.uid, [hold.id]);
+    input.signal.throwIfAborted();
+  } catch (cause) {
+    try { await settle({ input: 0, output: 0 }); }
+    catch { deps.onProblem(new Error('Known-undispatched model usage reconciliation failed.'), 'closing an undispatched model call'); }
+    throw cause;
+  }
+  return { settle, params, maxOutputTokens };
 }

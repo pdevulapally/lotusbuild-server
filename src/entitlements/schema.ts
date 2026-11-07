@@ -137,8 +137,23 @@ export interface SpecialistDefinition {
   readonly validation: boolean;
 }
 
+/**
+ * Unified AI Token admission: one monthly counter every AI call reserves against
+ * and settles to, converted from raw provider usage by the versioned rate table.
+ * Present means the mode is on for every user; absent, which is how every
+ * registry written before it existed reads, means the legacy input/output
+ * meters admit calls exactly as before. The switch lives here, in reviewed
+ * configuration, so turning it on is a migration step and never an environment
+ * variable a deployment can carry by accident.
+ */
+export interface AiUnifiedPolicy {
+  readonly meterKey: string;
+}
+
 export interface Registry {
   readonly fallback?: FallbackPolicy;
+  /** Unified AI Token mode; absent keeps the legacy per-category admission. */
+  readonly aiUnified?: AiUnifiedPolicy;
   /** Applied when a user has no subscription. Configuration, not a fallback. */
   readonly defaultPlanKey: string;
   /** Which meter records sandbox wall-clock time, for the allowance invariant. */
@@ -485,8 +500,12 @@ export function parseRegistry(fields: Fields, where: string): Registry {
   }
 
   const fallback = parseFallbackPolicy(fields['fallback'], `${where}.fallback`, meters, [inputTokenMeterKey, outputTokenMeterKey, buildMeterKey, sandboxTimeMeterKey, storageMeterKey]);
+  const aiUnified = parseAiUnifiedPolicy(fields['aiUnified'], `${where}.aiUnified`, meters,
+    [inputTokenMeterKey, outputTokenMeterKey, buildMeterKey, sandboxTimeMeterKey, storageMeterKey,
+      ...(fallback === undefined ? [] : [fallback.inputTokenMeterKey, fallback.outputTokenMeterKey])]);
   return {
     ...(fallback === undefined ? {} : { fallback }),
+    ...(aiUnified === undefined ? {} : { aiUnified }),
     defaultPlanKey,
     sandboxTimeMeterKey,
     buildMeterKey,
@@ -527,6 +546,20 @@ function parsePlanPrice(fields: Fields, where: string): PlanPrice | undefined {
     currency: stringField(price, 'currency', at),
     interval: enumField(price, 'interval', at, billingIntervals),
   };
+}
+
+/** Absent is legacy mode. Present must name a declared monthly COUNTER that no other role already spends. */
+export function parseAiUnifiedPolicy(value: unknown, where: string, meters: ReadonlyMap<string, MeterDefinition>, reservedMeterKeys: readonly string[]): AiUnifiedPolicy | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'object' || value === null) throw new DocumentShapeError(`${where} must be an object when present.`);
+  const meterKey = stringField(value as Fields, 'meterKey', where);
+  const meter = meters.get(meterKey);
+  if (meter === undefined) throw new DocumentShapeError(`${where}.meterKey "${meterKey}" is not a declared meter.`);
+  if (meter.kind !== 'COUNTER' || meter.resetPeriod !== 'MONTHLY') {
+    throw new DocumentShapeError(`${where}.meterKey "${meterKey}" must be a MONTHLY COUNTER; unified tokens are a monthly allowance spent per call.`);
+  }
+  if (reservedMeterKeys.includes(meterKey)) throw new DocumentShapeError(`${where}.meterKey "${meterKey}" is already spent by another role and cannot also carry unified tokens.`);
+  return { meterKey };
 }
 
 export function parsePlan(fields: Fields, where: string, registry: Registry): Plan {

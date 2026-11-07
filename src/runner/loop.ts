@@ -2,7 +2,35 @@ import { timingContext, timed, observeMethods, timingTraceId, startTiming, summa
 import { ContinuationPause, serializeCheckpoint, type ContinuationCheckpoint } from './continuation.ts';
 import { requireFallbackPolicy, tokenLimit, verifyFallbackModel, quotaMetadata as quotaDescription, type FallbackState, type FallbackOffer } from '../sessions/fallback.ts';
 import type { Registry } from '../entitlements/schema.ts';
-import { createCallAdmission } from './call-admission.ts';
+import { createCallAdmission, type UnifiedAdmission } from './call-admission.ts';
+import { EntitlementConfigError } from '../entitlements/values.ts';
+import { aiRatesDocumentPath, type AiRateTable } from '../entitlements/rates.ts';
+import type { FallbackPolicy } from '../entitlements/fallback.ts';
+
+/**
+ * The registry an execution on the fallback lane runs under: the policy's own
+ * token meters, and never unified admission. The fallback lane is a separate,
+ * bounded allowance by design (PR C leaves that product decision as it is), so
+ * its calls keep the legacy holds and its specialists their shared output hold.
+ */
+export function fallbackLaneRegistry(registry: Registry, policy: FallbackPolicy): Registry {
+  const { aiUnified: _premiumOnly, ...lane } = registry;
+  return { ...lane, inputTokenMeterKey: policy.inputTokenMeterKey, outputTokenMeterKey: policy.outputTokenMeterKey };
+}
+
+/**
+ * Unified admission for an execution, or undefined in legacy mode. With the
+ * switch on and no rate table there is nothing that can price a call, so this
+ * fails closed before any provider work rather than quietly admitting under the
+ * legacy meters.
+ */
+export function unifiedAdmissionFor(registry: Registry, rates: AiRateTable | undefined, ratesByVersion: UnifiedAdmission['ratesByVersion']): UnifiedAdmission | undefined {
+  if (registry.aiUnified === undefined) return undefined;
+  if (rates === undefined) {
+    throw new EntitlementConfigError(`Unified AI Token admission is enabled (aiUnified.meterKey "${registry.aiUnified.meterKey}") but ${aiRatesDocumentPath} is absent, so no model call can be admitted.`);
+  }
+  return { meterKey: registry.aiUnified.meterKey, rates, ratesByVersion };
+}
 import type { AttachmentReader } from '../attachments/store.ts';
 import { mentionedSkills } from '../skills/prompt.ts';
 import type { SkillSource } from '../skills/repository.ts';
@@ -664,7 +692,7 @@ export class SessionRunner {
           selectedOffer = await verifyFallbackModel(fallbackProvider, policy, resumed, await sandboxes.providerFor(project.platform), session.effort, activeLimits.maxOutputTokens, signal);
           activeSession = { ...session, model: selectedOffer.model, effort: selectedOffer.effort };
           activeLimits = { ...activeLimits, maxOutputTokens: selectedOffer.maxOutputTokens };
-          executionRegistry = { ...registry, inputTokenMeterKey: policy.inputTokenMeterKey, outputTokenMeterKey: policy.outputTokenMeterKey };
+          executionRegistry = fallbackLaneRegistry(registry, policy);
         }
       }
       const onAdmissionFailure = async (error: unknown, checkpoint: ContinuationCheckpoint): Promise<void> => {
@@ -681,6 +709,7 @@ export class SessionRunner {
       };
       const activeClient = fallbackProvider?.client ?? this.#deps.anthropic;
       const activeProvider = fallbackProvider;
+      const unified = unifiedAdmissionFor(executionRegistry, rates, (version) => this.#deps.configuration.ratesByVersion(version));
       const admission = createCallAdmission({
         models: activeProvider?.models ?? this.#deps.models,
         anthropic: this.#deps.anthropic, uid: session.ownerUid, sessionId: session.id,
@@ -689,6 +718,7 @@ export class SessionRunner {
         ...(selectedOffer === undefined ? {} : { maxInputTokens: selectedOffer.maxInputTokens }),
         metering: this.#deps.metering, reservations: tokenReservations,
         ...(rates === undefined ? {} : { rates }),
+        ...(unified === undefined ? {} : { unified }),
         authorize: async () => {
           await sessions.assertPersistenceLease(authority);
           const latest = await this.#deps.entitlements.forUser(session.ownerUid, new Date(), true);
