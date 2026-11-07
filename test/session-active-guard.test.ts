@@ -428,6 +428,12 @@ function harness(projectIds: readonly string[] = ['project-1'], options: { deskt
       transaction.set(meterRef as unknown as DocumentReference, { consumed: consumed + 1 });
       return { meterKey: 'builds.started', consumed: consumed + 1, periodStart: new Date() };
     },
+    recordIn: async (transaction: Transaction) => {
+      const snapshot = await transaction.get(meterRef as unknown as DocumentReference);
+      const consumed = (snapshot.data()?.['consumed'] as number | undefined) ?? 0;
+      transaction.set(meterRef as unknown as DocumentReference, { consumed: consumed + 1 });
+      return { meterKey: 'builds.started', consumed: consumed + 1, periodStart: new Date() };
+    },
     refundIn: async (transaction: Transaction) => {
       const snapshot = await transaction.get(meterRef as unknown as DocumentReference);
       const consumed = (snapshot.data()?.['consumed'] as number | undefined) ?? 0;

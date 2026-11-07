@@ -1,4 +1,5 @@
 import type { RawUsage } from '../entitlements/rates.ts';
+import { unlimitedPresentation } from '../entitlements/schema.ts';
 import {
   type DocumentReference,
   type DocumentSnapshot,
@@ -127,13 +128,7 @@ export class MeteringService {
     entitlements: UserEntitlements,
     meterKey: string,
   ): Promise<{ meter: MeterDefinition; limit: MeterLimit }> {
-    const { registry } = await this.#configuration.get();
-    const meter = registry.meters.get(meterKey);
-    if (meter === undefined) {
-      throw new EntitlementConfigError(
-        `Meter "${meterKey}" is not declared in the registry, so it cannot be charged.`,
-      );
-    }
+    const meter = await this.#resolveMeter(meterKey);
     const limit = entitlements.meterLimits.get(meterKey);
     if (limit === undefined) {
       // Absent would mean unlimited if we let it, which is the one reading a
@@ -154,6 +149,17 @@ export class MeteringService {
    * hold taken before the boundary is still holding real capacity after it, and
    * zeroing it would hand the same capacity out twice.
    */
+  async #resolveMeter(meterKey: string): Promise<MeterDefinition> {
+    const { registry } = await this.#configuration.get();
+    const meter = registry.meters.get(meterKey);
+    if (meter === undefined) {
+      throw new EntitlementConfigError(
+        `Meter "${meterKey}" is not declared in the registry, so it cannot be charged.`,
+      );
+    }
+    return meter;
+  }
+
   #state(snapshot: DocumentSnapshot, periodStart: Date, path: string): UsageState {
     if (!snapshot.exists) {
       return { consumed: 0, reserved: 0 };
@@ -258,6 +264,31 @@ export class MeteringService {
   }
 
   /**
+   * Counts a COUNTER meter without admitting against any limit: the figure is
+   * history, not an allowance. Builds are counted this way — unlimited by count,
+   * bounded only by the paid resources each build consumes — so no plan limit row
+   * is required and none is consulted.
+   */
+  async recordIn(transaction: Transaction, input: {
+    readonly uid: string; readonly meterKey: string; readonly quantity: number; readonly now: Date;
+  }): Promise<Consumption> {
+    this.#assertPositive(input.quantity, input.meterKey);
+    const meter = await this.#resolveMeter(input.meterKey);
+    if (meter.kind !== 'COUNTER') throw new EntitlementConfigError(`Meter "${meter.key}" is a ${meter.kind}, which is held and released rather than counted.`);
+    const ref = this.#usageRef(input.uid, input.meterKey);
+    const snapshot = await transaction.get(ref);
+    const periodStart = periodStartFor(meter, input.now);
+    const state = this.#state(snapshot, periodStart, ref.path);
+    const after = state.consumed + input.quantity;
+    if (!Number.isSafeInteger(after)) throw new Error(`Counter "${meter.key}" would exceed the safe integer range.`);
+    transaction.set(ref, {
+      meterKey: meter.key, consumed: after, reserved: state.reserved,
+      periodStart: Timestamp.fromDate(periodStart), updatedAt: FieldValue.serverTimestamp(),
+    });
+    return { meterKey: meter.key, consumed: after, periodStart };
+  }
+
+  /**
    * Decrements a counter meter inside the caller's transaction, e.g. when an unstarted
    * operation is cancelled before claiming any runner time.
    */
@@ -273,7 +304,8 @@ export class MeteringService {
     },
   ): Promise<Consumption> {
     this.#assertPositive(input.quantity, input.meterKey);
-    const { meter } = await this.#resolve(input.entitlements, input.meterKey);
+    // A refund returns what was counted; it needs the meter, never the plan's limit.
+    const meter = await this.#resolveMeter(input.meterKey);
     if (meter.kind !== 'COUNTER') {
       throw new EntitlementConfigError(
         `Meter "${meter.key}" is a ${meter.kind}, which is released rather than refunded.`,
@@ -337,7 +369,9 @@ export class MeteringService {
     const summaries: MeterUsageSummary[] = [];
 
     for (const [meterKey, meter] of registry.meters) {
-      const limit = entitlements.meterLimits.get(meterKey);
+      // Builds are counted, never capped: shown as used-so-far with no limit,
+      // whatever limit row an older plan document may still carry.
+      const limit = meterKey === registry.buildMeterKey ? unlimitedPresentation(meterKey) : entitlements.meterLimits.get(meterKey);
       if (limit === undefined) {
         continue;
       }
