@@ -11,6 +11,11 @@ import { EntitlementConfigError } from './values.ts';
  * admin script. PR A only reads the current document.
  */
 export const aiRatesDocumentPath = 'config/aiRates';
+/** Where a superseded table of the given version is archived, so a hold admitted under it settles under it. */
+export function aiRatesVersionPath(version: string): string {
+  if (!/^[A-Za-z0-9_.-]+$/.test(version)) throw new EntitlementConfigError(`Rate table version "${version}" is not a valid document id.`);
+  return `${aiRatesDocumentPath}/versions/${version}`;
+}
 
 export interface Rational { readonly num: number; readonly den: number }
 
@@ -95,7 +100,10 @@ export interface UnifiedConversion {
  * Cache creation without a TTL breakdown is priced at the 5-minute write rate,
  * the lower of the two. Returns undefined for a model the table does not price.
  */
-export function unifiedFor(table: AiRateTable, modelId: string, usage: RawUsage): UnifiedConversion | undefined {
+export function unifiedFor(table: AiRateTable, modelId: string, usage: RawUsage, options: { readonly undividedCacheWrite?: '5m' | '1h' } = {}): UnifiedConversion | undefined {
+  // `undividedCacheWrite`: which write weight prices cache creation the provider reported without a
+  // TTL breakdown. Shadow accounting passes nothing (PR A's 5-minute reading); active settlement
+  // passes the TTL the request asked for, since the request is the evidence of which cache was written.
   const tiers = table.models.get(modelId);
   if (tiers === undefined) return undefined;
   const prompt = (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheCreation5m ?? 0) + (usage.cacheCreation1h ?? 0) + (usage.cacheCreation ?? 0);
@@ -103,7 +111,8 @@ export function unifiedFor(table: AiRateTable, modelId: string, usage: RawUsage)
   const tier = tiers[tierIndex]!;
   const parts: readonly [number | undefined, Rational][] = [
     [usage.input, tier.input], [usage.output, tier.output], [usage.cacheRead, tier.cacheRead],
-    [usage.cacheCreation5m, tier.cacheWrite5m], [usage.cacheCreation1h, tier.cacheWrite1h], [usage.cacheCreation, tier.cacheWrite5m],
+    [usage.cacheCreation5m, tier.cacheWrite5m], [usage.cacheCreation1h, tier.cacheWrite1h],
+    [usage.cacheCreation, options.undividedCacheWrite === '1h' ? tier.cacheWrite1h : tier.cacheWrite5m],
   ];
   // Sum of fractions over a common denominator, then one ceiling.
   let numerator = 0n, denominator = 1n;
@@ -134,3 +143,21 @@ export const aiRatesV1Document = {
     'claude-opus-5': { tiers: [{ maxInputTokens: null, input: r(5, 2), output: r(25, 2), cacheWrite5m: r(25, 8), cacheWrite1h: r(5), cacheRead: r(1, 4) }] },
   },
 } as const;
+
+/** The tier a prompt of this many tokens is priced in. */
+export function tierFor(table: AiRateTable, modelId: string, promptTokens: number): AiRateTier | undefined {
+  const tiers = table.models.get(modelId);
+  return tiers?.find((tier) => tier.maxInputTokens === null || promptTokens <= tier.maxInputTokens);
+}
+
+/**
+ * The heaviest weight a prompt token can carry in this tier, given the cache TTL
+ * the request asks for: it arrives as plain input, a cache read, or a cache write
+ * at that TTL. Whatever the table says about their order, reserving every counted
+ * prompt token at this weight is an upper bound on what settlement can charge for
+ * the prompt, undivided cache figures included (they are read at the same TTL).
+ */
+export function promptWeightCeiling(tier: AiRateTier, cacheTtl: '5m' | '1h'): Rational {
+  const candidates = [tier.input, tier.cacheRead, cacheTtl === '1h' ? tier.cacheWrite1h : tier.cacheWrite5m];
+  return candidates.reduce((best, weight) => (weight.num * best.den > best.num * weight.den ? weight : best));
+}

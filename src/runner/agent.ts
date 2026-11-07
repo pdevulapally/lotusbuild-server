@@ -3,6 +3,7 @@ import { TaskTracker, compactTaskConversation, type TaskContext } from './task-c
 import { timed, startTiming } from '../diagnostics/timing.ts';
 import { contextFingerprint, retainCheckpointImages, type AdmissionBoundary, type ContinuationCheckpoint } from './continuation.ts';
 import type { CallAdmission } from './call-admission.ts';
+import type { ReservationKind } from '../metering/service.ts';
 import type { Skill } from '../skills/model.ts';
 import { skillCatalogue, skillInstructionsText } from '../skills/prompt.ts';
 import type { ImageMediaType } from '../attachments/store.ts';
@@ -114,6 +115,15 @@ export interface SpecialistReview {
  * The durable record of specialist token holds, kept on the session document so
  * a hold outlives the process that took it.
  */
+/**
+ * The cache TTL every agent request asks for. `ephemeral` without a `ttl` is the
+ * provider's 5-minute cache; nothing in this runtime requests the 1-hour one. Named
+ * here, beside the request, because admission prices prompt tokens at this TTL's
+ * write weight and settlement reads an undivided cache figure at it: the request
+ * is the evidence of which cache was written, so changing the TTL changes both.
+ */
+export const promptCacheTtl: '5m' | '1h' = '5m';
+
 export interface SpecialistReservations {
   /**
    * Takes the hold and records it against the session in one commit, so a hold
@@ -123,6 +133,8 @@ export interface SpecialistReservations {
     readonly meterKey: string;
     readonly quantity: number;
     readonly operationId: string;
+    readonly attributes?: Readonly<Record<string, string>>;
+    readonly kind?: ReservationKind;
   }): Promise<{ readonly id: string }>;
   forget(reservationId: string): Promise<void>;
 }
@@ -774,7 +786,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
         // again on every step. Caching the last cacheable block means each step
         // writes the prefix once and the next step reads it at a fraction of the
         // rate — the same tokens, most of the cost removed.
-        cache_control: { type: 'ephemeral' as const },
+        cache_control: { type: 'ephemeral' as const, ...(promptCacheTtl === '5m' ? {} : { ttl: promptCacheTtl }) },
       };
       // Only the generation SDK invocation crosses this boundary, not admission,
       // parameter preparation or the marker. A synchronous SDK throw is uncertain.
@@ -1110,9 +1122,13 @@ async function consultSpecialist(
   call.assertStillOurs();
   call.signal.throwIfAborted();
   const ceiling = call.limits.specialistMaxSteps * call.limits.maxOutputTokens;
-  let reservation;
+  // Under unified admission every step of the specialist's loop takes its own hold
+  // covering input and output, so there is no shared output hold to take or settle:
+  // a logical call is then accounted for exactly once, by its own admission.
+  const sharesOutputHold = call.registry.aiUnified === undefined;
+  let reservation: { readonly id: string } | undefined;
   try {
-    reservation = await call.reservations.take({
+    if (sharesOutputHold) reservation = await call.reservations.take({
       meterKey: call.registry.outputTokenMeterKey,
       quantity: ceiling,
       operationId: `specialist:${call.session.id}:${call.specialist.key}`,
@@ -1168,7 +1184,7 @@ async function consultSpecialist(
 
     const outcome = await runModelLoop({
       admission: call.admission,
-      outputReservationId: reservation.id,
+      ...(reservation === undefined ? {} : { outputReservationId: reservation.id }),
       anthropic: call.anthropic,
       model: call.session.model,
       effort: call.session.effort,
@@ -1217,6 +1233,10 @@ async function consultSpecialist(
 
   let settled = false;
   let settlementError: unknown;
+  if (reservation === undefined) {
+    if (primary !== undefined) throw primary;
+    return answer!;
+  }
   try {
     if (unknownOutput) throw new Error('Specialist output usage requires reconciliation; the hold remains open.');
     await call.metering.recordObservedUsage(call.session.ownerUid, reservation.id, spent);

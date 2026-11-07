@@ -38,6 +38,9 @@ export const registryDocument = {
   meters: [
     { key: "ai.tokens.input", unit: "tokens", kind: "COUNTER", resetPeriod: "MONTHLY", label: "Input tokens" },
     { key: "ai.tokens.output", unit: "tokens", kind: "COUNTER", resetPeriod: "MONTHLY", label: "Output tokens" },
+    // Declared ahead of use. The registry's `aiUnified` switch is deliberately absent here: admission
+    // stays on the input/output meters until the reviewed migration sets `aiUnified: { meterKey: "ai.unified" }`.
+    { key: "ai.unified", unit: "tokens", kind: "COUNTER", resetPeriod: "MONTHLY", label: "AI tokens" },
     { key: "sandbox.seconds", unit: "seconds", kind: "COUNTER", resetPeriod: "MONTHLY", label: "Sandbox time" },
     { key: "sandbox.concurrent.mobile", unit: "count", kind: "GAUGE", resetPeriod: "NEVER", label: "Concurrent mobile sandboxes" },
     { key: "sandbox.concurrent.web", unit: "count", kind: "GAUGE", resetPeriod: "NEVER", label: "Concurrent web sandboxes" },
@@ -183,6 +186,7 @@ export const planDocuments = [
     ],
     meterLimits: [
       { meterKey: "ai.tokens.output", includedAllowance: 30000, hardLimit: 30000, overageEnabled: false },
+      { meterKey: "ai.unified", includedAllowance: 225000, hardLimit: 225000, overageEnabled: false },
       { meterKey: "sandbox.seconds", includedAllowance: 3600, hardLimit: 3600, overageEnabled: false },
       { meterKey: "sandbox.concurrent.mobile", includedAllowance: 0, hardLimit: 0, overageEnabled: false },
       { meterKey: "sandbox.concurrent.web", includedAllowance: 1, hardLimit: 1, overageEnabled: false },
@@ -219,6 +223,7 @@ export const planDocuments = [
     meterLimits: [
       { meterKey: "ai.tokens.input", includedAllowance: 1200000, hardLimit: 2000000, overageEnabled: true },
       { meterKey: "ai.tokens.output", includedAllowance: 200000, hardLimit: 400000, overageEnabled: true },
+      { meterKey: "ai.unified", includedAllowance: 2200000, hardLimit: 2200000, overageEnabled: false },
       { meterKey: "sandbox.seconds", includedAllowance: 36000, hardLimit: 72000, overageEnabled: true },
       { meterKey: "sandbox.concurrent.mobile", includedAllowance: 1, hardLimit: 1, overageEnabled: false },
       { meterKey: "sandbox.concurrent.web", includedAllowance: 3, hardLimit: 3, overageEnabled: false },
@@ -256,6 +261,7 @@ export const planDocuments = [
     meterLimits: [
       { meterKey: "ai.tokens.input", includedAllowance: 3000000, hardLimit: 6000000, overageEnabled: true },
       { meterKey: "ai.tokens.output", includedAllowance: 500000, hardLimit: 1000000, overageEnabled: true },
+      { meterKey: "ai.unified", includedAllowance: 5500000, hardLimit: 5500000, overageEnabled: false },
       { meterKey: "sandbox.seconds", includedAllowance: 108000, hardLimit: 216000, overageEnabled: true },
       { meterKey: "sandbox.concurrent.mobile", includedAllowance: 2, hardLimit: 2, overageEnabled: false },
       { meterKey: "sandbox.concurrent.web", includedAllowance: 10, hardLimit: 10, overageEnabled: false },

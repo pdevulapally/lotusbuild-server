@@ -24,7 +24,7 @@ import {
 import type { ConfigurationStore } from '../entitlements/store.ts';
 import { AppError } from '../http/errors.ts';
 import { mapMutation, type Mutation } from '../http/idempotency.ts';
-import type { MeteringService, Reservation } from '../metering/service.ts';
+import type { MeteringService, Reservation, ReservationKind } from '../metering/service.ts';
 import { createHash, randomUUID } from 'node:crypto';
 
 import {
@@ -1308,8 +1308,13 @@ export class SessionRepository {
       let fallback: FallbackState = { ...state, status: 'QUEUED', lane: input.lane ?? 'fallback', reason: input.lane === 'premium' ? 'Queued for the original model.' : 'Queued for the configured free-to-user model.', consent: input.lane !== 'premium' };
       let retryAt: Date | undefined;
       try {
-        await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: inputMeterKey, quantity: inputQuantity, now });
-        await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: outputMeterKey, quantity: outputQuantity, now });
+        if (input.lane === 'premium' && registry.aiUnified !== undefined) {
+          // Unified admission: the first call must find at least one unified token free.
+          await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: registry.aiUnified.meterKey, quantity: 1, now });
+        } else {
+          await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: inputMeterKey, quantity: inputQuantity, now });
+          await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: outputMeterKey, quantity: outputQuantity, now });
+        }
         await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: registry.storageMeterKey, quantity: 0, now });
         await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: registry.sandboxTimeMeterKey, quantity: provider.timeoutSeconds, now });
         await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: provider.concurrencyMeterKey, quantity: 1, now });
@@ -1593,6 +1598,8 @@ export class SessionRepository {
       readonly quantity: number;
       readonly operationId: string;
       readonly now: Date;
+      readonly attributes?: Readonly<Record<string, string>>;
+      readonly kind?: ReservationKind;
     },
   ): Promise<Reservation> {
     const ref = this.#ref(sessionId);
@@ -1610,6 +1617,8 @@ export class SessionRepository {
         quantity: input.quantity,
         operationId: input.operationId,
         now: input.now,
+        ...(input.attributes === undefined ? {} : { attributes: input.attributes }),
+        ...(input.kind === undefined ? {} : { kind: input.kind }),
       });
       transaction.update(ref, {
         specialistReservationIds: FieldValue.arrayUnion(reservation.id),
