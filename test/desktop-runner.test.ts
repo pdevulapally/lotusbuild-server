@@ -1,4 +1,5 @@
 import { AppError } from '../src/http/errors.ts';
+import { RestoreError, type RestoreResult } from '../src/projects/persistence.ts';
 import assert from 'node:assert/strict';
 import { fixtureModels } from './support/models.ts';
 import test from 'node:test';
@@ -156,7 +157,7 @@ function runnerFixture(options: {
   desktopStartTimeoutMs?: number;
   desktopStartGraceMs?: number;
   withoutHandoffPort?: boolean;
-  restore?: () => Promise<string>;
+  restore?: () => Promise<string | RestoreResult>;
   publishHandoff?: () => Promise<void>;
   /** The tool the first model step reaches for; a screen tool is what brings the desktop up. */
   firstTool?: 'run_command' | 'open_in_browser';
@@ -237,8 +238,8 @@ function runnerFixture(options: {
     },
     clear: async (sessionId) => { handoffCalls.push({ call: 'clear', sessionId }); order.push('clear'); return true; },
   };
-  const logs: { message: string }[] = [];
-  const capture = (_details: object, message: string) => { logs.push({ message }); };
+  const logs: { message: string; details: Record<string, unknown> }[] = [];
+  const capture = (details: object, message: string) => { logs.push({ message, details: details as Record<string, unknown> }); };
   const deps = { models: fixtureModels, runnerId: 'runner', anthropic, sessions, metering, configuration,
     entitlements: { forUser: async () => entitlements },
     projects: { readOwned: async () => ({ id: 'p', platform: 'web', ownerUid: 'u', name: 'Fixture', snapshot: { kind: 'none' } }) },
@@ -526,4 +527,25 @@ test('a desktop still starting when the run ends is settled before the machine i
   release({ host: 'late.e2b.test', token: 'late' });
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(h.handoffCalls.filter((call) => call.call === 'publish'), [], 'a start aborted by cleanup never publishes a handoff');
+});
+
+test('a restore that fails mid-download still leaves its transfer evidence in the run summary', async () => {
+  const restoreError = new RestoreError({ exitCode: 22, stderr: 'curl: (22) 403', phase: 'download', evidence: { observedBytes: 512, httpCode: 403 } });
+  const h = runnerFixture({ desktop: true, restore: async () => { throw restoreError; } });
+  await h.runner.runOnce();
+  // The failure itself is exactly as before.
+  assert.deepEqual(h.emitted.filter((event) => event.type === 'session.failed').map((event) => event.data.error), [restoreError.message]);
+  assert.ok(!h.order.includes('save'), 'a workspace whose history was never restored is not saved');
+  const summary = h.logs.find((entry) => entry.message === 'run summary')!.details;
+  assert.deepEqual([summary['restoreOutcome'], summary['restorePhase'], summary['restoreObservedBytes'], summary['restoreHttpCode'], summary['restoreArchiveBytes']],
+    ['failed', 'download', 512, 403, undefined]);
+});
+
+test('a restore whose archive is shorter than the record is noted and warned about, and the run proceeds', async () => {
+  const h = runnerFixture({ desktop: true, restore: async () => ({ outcome: 'restored' as const, observedBytes: 1024, httpCode: 200, archiveBytes: 1024 }) });
+  await h.runner.runOnce();
+  assert.ok(h.types().includes('project.restored'));
+  const summary = h.logs.find((entry) => entry.message === 'run summary')!.details;
+  assert.deepEqual([summary['restoreOutcome'], summary['restoreObservedBytes'], summary['restoreArchiveBytes'], summary['restoreBytesMatch']], ['restored', 1024, 1024, false]);
+  assert.ok(h.logs.some((entry) => entry.message.includes('restored archive size differs')));
 });

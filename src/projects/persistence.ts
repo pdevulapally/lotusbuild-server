@@ -17,8 +17,46 @@ const archivePath = '/tmp/lotusbuild-repo.tar.gz';
 const urlPath = '/tmp/lotusbuild-url';
 
 export type RestoreOutcome = 'restored' | 'initialised';
-/** What a restore did, with the transfer evidence the download itself reported. */
-export interface RestoreResult { readonly outcome: RestoreOutcome; readonly observedBytes?: number; readonly httpCode?: number }
+/**
+ * The transfer evidence a restore produces: what the download itself reported
+ * and what landed on disk. Either may be absent when the step that produces it
+ * never ran, which is recorded as absence, never as zero.
+ */
+export interface RestoreEvidence { readonly observedBytes?: number; readonly httpCode?: number; readonly archiveBytes?: number }
+/** What a restore did, with its transfer evidence. */
+export interface RestoreResult extends RestoreEvidence { readonly outcome: RestoreOutcome }
+/** Where a restore stopped: before the archive was fully downloaded, or after, while unpacking it. */
+export type RestorePhase = 'download' | 'extract';
+
+/**
+ * The persistence failure a restore raises: the same code, message and details
+ * as any other, carrying the evidence the attempt did produce so a failed or
+ * partial download still accounts for the bytes it moved.
+ */
+export class RestoreError extends AppError {
+  readonly phase: RestorePhase;
+  readonly evidence: RestoreEvidence;
+  constructor(args: { exitCode: number; stderr: string; phase: RestorePhase; evidence: RestoreEvidence }) {
+    super({ code: 'project/persistence-failed', statusCode: 500, message: 'The project could not be saved or restored.',
+      details: { exitCode: args.exitCode, stderr: args.stderr.slice(0, 500) } });
+    this.name = 'RestoreError';
+    this.phase = args.phase;
+    this.evidence = args.evidence;
+  }
+}
+
+const evidenceLine = /restore_evidence (\d+) (\d{3})/;
+const archiveLine = /restore_archive (\d+)/;
+
+/** Reads the evidence lines out of whatever the restore script printed before it stopped. */
+export function restoreEvidenceOf(stdout: string): RestoreEvidence {
+  const download = evidenceLine.exec(stdout);
+  const archive = archiveLine.exec(stdout);
+  return {
+    ...(download === null ? {} : { observedBytes: Number(download[1]), httpCode: Number(download[2]) }),
+    ...(archive === null ? {} : { archiveBytes: Number(archive[1]) }),
+  };
+}
 
 export interface SaveOutcome {
   readonly bytes: number;
@@ -159,16 +197,17 @@ export class ProjectPersistence {
     // bearer credential, and an argument is visible to every process in the
     // sandbox through /proc.
     await sandbox.writeFile(urlPath, url);
-    const stdout = await this.#run(
-      sandbox,
-      provider,
+    const outcome = await sandbox.runCommand(
       [
         'set -eu',
         `url=$(cat ${urlPath})`,
         `rm -f ${urlPath}`,
-        // The download reports what it actually transferred: the evidence a
-        // transfer charge may later settle against, never the estimate.
+        // The download reports what it actually transferred — curl prints this
+        // line after a failed transfer too — which is the evidence a transfer
+        // charge may later settle against, never the estimate.
         `curl -sfL -o ${archivePath} -w 'restore_evidence %{size_download} %{http_code}\\n' "$url"`,
+        // What actually landed, to cross-check against the download and the record.
+        `echo "restore_archive $(stat -c %s ${archivePath})"`,
         // Only .git is in the archive; the working tree comes back from it.
         `tar -xzf ${archivePath} -C .`,
         `rm -f ${archivePath}`,
@@ -177,10 +216,16 @@ export class ProjectPersistence {
         'if git rev-parse --verify HEAD >/dev/null 2>&1; then git reset --hard HEAD >/dev/null; fi',
         '',
       ].join('\n'),
-      this.#gitEnv(),
+      { cwd: provider.workdir, timeoutMs: this.#commandTimeoutMs, envs: this.#gitEnv() },
     );
-    const evidence = /restore_evidence (\d+) (\d{3})/.exec(stdout);
-    return evidence === null ? { outcome: 'restored' } : { outcome: 'restored', observedBytes: Number(evidence[1]), httpCode: Number(evidence[2]) };
+    const evidence = restoreEvidenceOf(outcome.stdout);
+    if (outcome.exitCode !== 0) {
+      // The archive line is printed only once curl has succeeded, so its absence
+      // places the failure in the download; after it, only unpacking can fail.
+      throw new RestoreError({ exitCode: outcome.exitCode, stderr: outcome.stderr, evidence,
+        phase: evidence.archiveBytes === undefined ? 'download' : 'extract' });
+    }
+    return { outcome: 'restored', ...evidence };
   }
 
   /**

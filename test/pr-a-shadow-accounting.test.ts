@@ -4,7 +4,8 @@ import type { Firestore } from 'firebase-admin/firestore';
 import type { ConfigurationStore as ConfigurationStoreType } from '../src/entitlements/store.ts';
 import { aiRatesV1Document, parseAiRateTable, unifiedFor } from '../src/entitlements/rates.ts';
 import { ConfigurationStore } from '../src/entitlements/store.ts';
-import { rawUsageOf } from '../src/runner/agent.ts';
+import { mergeRawUsage, rawUsageOf } from '../src/runner/agent.ts';
+import { restoreCrossCheck, restoreEvidenceFields } from '../src/runner/loop.ts';
 import { registryDocument, planDocuments } from '../src/seed/config.ts';
 
 const v1 = parseAiRateTable(aiRatesV1Document, 'test');
@@ -168,4 +169,71 @@ test('shadow evidence never fails a settlement: conversion problems just leave t
   const overflow = { input: Number.MAX_SAFE_INTEGER };
   assert.throws(() => unifiedFor(v1, 'claude-opus-5', overflow));
   assert.deepEqual(shadowEvidence(v1, 'claude-opus-5', overflow), { model: 'claude-opus-5', raw: overflow });
+});
+
+test('restated usage overwrites by category and never lets a cache-creation total coexist with its breakdown', () => {
+  assert.deepEqual(mergeRawUsage(undefined, { input: 5 }), { input: 5 });
+  assert.deepEqual(mergeRawUsage({ input: 5, cacheRead: 3 }, undefined), { input: 5, cacheRead: 3 });
+  // A later event that restates nothing about cache creation leaves the earlier split alone.
+  assert.deepEqual(mergeRawUsage({ input: 5, cacheCreation5m: 4, cacheCreation1h: 1 }, { output: 9 }), { input: 5, cacheCreation5m: 4, cacheCreation1h: 1, output: 9 });
+  // One that restates it as a total replaces the split outright, so nothing is counted twice.
+  assert.deepEqual(mergeRawUsage({ input: 5, cacheCreation5m: 4, cacheCreation1h: 1 }, { cacheCreation: 5, output: 9 }), { input: 5, cacheCreation: 5, output: 9 });
+  assert.deepEqual(mergeRawUsage({ cacheCreation: 5 }, { cacheCreation5m: 5 }), { cacheCreation5m: 5 });
+});
+
+test('restore evidence becomes summary fields only for what was reported, and the cross-check is decided only with a download figure', () => {
+  assert.deepEqual(restoreEvidenceFields({}), {});
+  assert.deepEqual(restoreEvidenceFields({ observedBytes: 10, httpCode: 200, archiveBytes: 10 }), { restoreObservedBytes: 10, restoreHttpCode: 200, restoreArchiveBytes: 10 });
+  assert.deepEqual(restoreCrossCheck(4096, { outcome: 'initialised' }), {});
+  assert.deepEqual(restoreCrossCheck(4096, { outcome: 'restored' }), {});
+  assert.deepEqual(restoreCrossCheck(4096, { outcome: 'restored', observedBytes: 4096, httpCode: 200, archiveBytes: 4096 }), { restoreBytesMatch: true });
+  assert.deepEqual(restoreCrossCheck(4096, { outcome: 'restored', observedBytes: 4096, httpCode: 200 }), { restoreBytesMatch: true });
+  // A download shorter than the record, or an archive shorter than the download, is a mismatch to investigate, never a charge.
+  assert.deepEqual(restoreCrossCheck(4096, { outcome: 'restored', observedBytes: 1024, httpCode: 200, archiveBytes: 1024 }), { restoreBytesMatch: false });
+  assert.deepEqual(restoreCrossCheck(4096, { outcome: 'restored', observedBytes: 4096, httpCode: 200, archiveBytes: 2048 }), { restoreBytesMatch: false });
+});
+
+test('a period-record write that fails fails the whole settlement, which then retries once and only once', async () => {
+  const { data, db } = ledger();
+  const registry = parseRegistry(registryDocument, 'registry');
+  const plans = new Map(planDocuments.map((row) => [row.key, parsePlan(row, row.key, registry)]));
+  const plan = plans.get('business')!;
+  const entitlements = { planKey: plan.key, planName: plan.name, capabilities: new ResolvedEntitlements(plan.entitlements),
+    meterLimits: plan.meterLimits, rateLimits: plan.rateLimits } as UserEntitlements;
+  const configuration = { get: async () => ({ registry, plans, rates: undefined }) } as unknown as ConfigurationStoreType;
+  // The same ledger, with one transaction whose period-record write fails after the live documents were already written.
+  let failPeriodWrites = 0;
+  const flaky = { ...(db as unknown as Record<string, unknown>), runTransaction: <T>(work: (tx: Transaction) => Promise<T>) =>
+    (db as unknown as { runTransaction<T>(work: (tx: unknown) => Promise<T>): Promise<T> }).runTransaction((tx) => work(new Proxy(tx as object, {
+      get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver);
+        if (property !== 'set') return value;
+        return (ref: { path: string }, ...rest: unknown[]) => {
+          if (ref.path.includes('/periods/') && failPeriodWrites > 0) { failPeriodWrites--; throw new Error('period record unavailable'); }
+          return (value as (...args: unknown[]) => unknown).call(target, ref, ...rest);
+        };
+      },
+    }) as Transaction)) } as unknown as Firestore;
+  const metering = new MeteringService(flaky, configuration);
+  const meterKey = registry.inputTokenMeterKey;
+  const hold = await db.runTransaction((tx: Transaction) => metering.reserveIn(tx, { uid: 'u', entitlements, meterKey, quantity: 100, operationId: 'op', now: march }));
+  const reservation = () => data.get(`users/u/reservations/${hold.id}`)!;
+  const live = () => data.get(`users/u/usage/${meterKey}`)!;
+  const period = () => data.get(`users/u/usage/${meterKey}/periods/2026-03-01`);
+  assert.deepEqual([reservation()['status'], live()['reserved'], live()['consumed'] ?? 0], ['OPEN', 100, 0]);
+
+  failPeriodWrites = 1;
+  await assert.rejects(metering.settle({ uid: 'u', reservationId: hold.id, actualQuantity: 60, recordOverrun: true, now: march }), /period record unavailable/);
+  // Nothing partial committed: the hold is still open and the live meter still carries it, so the caller's retry is safe.
+  assert.deepEqual([reservation()['status'], live()['reserved'], live()['consumed'] ?? 0, period()], ['OPEN', 100, 0, undefined]);
+
+  assert.equal(await metering.settle({ uid: 'u', reservationId: hold.id, actualQuantity: 60, recordOverrun: true, now: march }), true);
+  assert.deepEqual([reservation()['status'], reservation()['settledQuantity'], live()['reserved'], live()['consumed'], period()?.['settled']], ['SETTLED', 60, 0, 60, 60]);
+
+  // A duplicate retry after success charges nothing again and writes no second period increment.
+  assert.equal(await metering.settle({ uid: 'u', reservationId: hold.id, actualQuantity: 60, recordOverrun: true, now: march }), false);
+  assert.deepEqual([live()['consumed'], period()?.['settled']], [60, 60]);
+  // A release attempted after settlement is likewise a no-op: the hold cannot be returned twice.
+  assert.equal(await metering.release('u', hold.id), false);
+  assert.deepEqual([live()['reserved'], live()['consumed']], [0, 60]);
 });

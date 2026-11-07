@@ -160,6 +160,22 @@ export function rawUsageOf(usage: unknown): RawUsage | undefined {
   return Object.keys(raw).length > 0 ? raw : undefined;
 }
 
+const cacheCreationKeys = ['cacheCreation5m', 'cacheCreation1h', 'cacheCreation'] as const;
+
+/**
+ * Later usage events restate whole-message totals, so a reported category
+ * overwrites and never adds. Cache creation is one group: a restatement that
+ * reports it replaces the earlier split or total outright, so the undivided
+ * figure and its breakdown can never coexist and be counted twice.
+ */
+export function mergeRawUsage(previous: RawUsage | undefined, next: RawUsage | undefined): RawUsage | undefined {
+  if (next === undefined) return previous;
+  if (previous === undefined) return next;
+  const merged: { -readonly [K in keyof RawUsage]: RawUsage[K] } = { ...previous };
+  if (cacheCreationKeys.some((key) => next[key] !== undefined)) for (const key of cacheCreationKeys) delete merged[key];
+  return { ...merged, ...next };
+}
+
 /** A secondary failure that must stay visible without becoming the outcome. */
 export type ProblemReporter = (error: Error, what: string) => void;
 
@@ -188,6 +204,7 @@ function total(...counts: readonly (number | null | undefined)[]): number {
 class UsageAccumulator {
   #input: number | undefined;
   #output: number | undefined;
+  #raw: RawUsage | undefined;
 
   observe(event: MessageStreamEvent): void {
     if (event.type === 'message_start') {
@@ -196,10 +213,15 @@ class UsageAccumulator {
         event.message.usage.cache_read_input_tokens,
         event.message.usage.cache_creation_input_tokens,
       );
+      // `message_start` carries a provisional output count, never the figure
+      // billed; only its prompt categories are authoritative here.
+      const { output: _provisional, ...prompt } = rawUsageOf(event.message.usage) ?? {};
+      this.#raw = Object.keys(prompt).length > 0 ? prompt : undefined;
       return;
     }
     if (event.type === 'message_delta') {
       this.#output = event.usage.output_tokens;
+      this.#raw = mergeRawUsage(this.#raw, rawUsageOf(event.usage));
       // The input counters repeat here as cumulative whole-message totals and
       // are omitted when they do not apply, so they overwrite and never add.
       const restated = total(
@@ -214,7 +236,7 @@ class UsageAccumulator {
   }
 
   snapshot(): AuthoritativeUsage {
-    return { input: this.#input, output: this.#output };
+    return { input: this.#input, output: this.#output, ...(this.#raw === undefined ? {} : { raw: this.#raw }) };
   }
 
   /** False until the provider has reported any usage at all. */
@@ -786,6 +808,9 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
     // Exactly one charge per call, from whichever source is authoritative: the
     // final message when there is one, and otherwise whatever the provider had
     // already reported. There is no path that charges both.
+    // The final message is the authoritative statement of every category; the
+    // stream's figures stand in only if it carries none.
+    const finalRaw = message === undefined ? undefined : rawUsageOf(message.usage) ?? usage.snapshot().raw;
     const spend: AuthoritativeUsage =
       message === undefined
         ? providerDispatchStarted && (usage.observed || !rejectedBeforeDispatch(callError)) ? usage.snapshot() : { input: 0, output: 0 }
@@ -796,6 +821,7 @@ async function runModelLoop(input: ModelLoopInput): Promise<ModelLoopOutcome> {
               message.usage.cache_creation_input_tokens,
             ),
             output: message.usage.output_tokens,
+            ...(finalRaw === undefined ? {} : { raw: finalRaw }),
           };
 
     let chargeError: unknown;
