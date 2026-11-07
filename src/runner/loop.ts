@@ -18,7 +18,7 @@ import type { ConfigurationStore } from '../entitlements/store.ts';
 import type { DesktopHandoff, DesktopHandoffPort } from '../desktop/handoff.ts';
 import { AppError, safeErrorDiagnostic } from '../http/errors.ts';
 import type { MeteringService } from '../metering/service.ts';
-import type { ProjectPersistence, RestoreOutcome } from '../projects/persistence.ts';
+import { RestoreError, type ProjectPersistence, type RestoreOutcome, type RestoreResult } from '../projects/persistence.ts';
 import type { Project, ProjectRepository } from '../projects/repository.ts';
 import type { AcquiredSandbox, SandboxService } from '../sandboxes/service.ts';
 import type { RunningSandbox } from '../sandboxes/provider.ts';
@@ -45,14 +45,37 @@ export class RunSummary {
   readonly #emit: (fields: Record<string, unknown>) => void;
   #open: { sessionId: string; execution: number; startedAt: number } | undefined;
   constructor(records: TimingRecord[], emit: (fields: Record<string, unknown>) => void) { this.#records = records; this.#emit = emit; }
-  begin(sessionId: string, execution: number): void { this.#open = { sessionId, execution, startedAt: Date.now() }; }
+  #notes: Record<string, unknown> = {};
+  begin(sessionId: string, execution: number): void { this.#open = { sessionId, execution, startedAt: Date.now() }; this.#notes = {}; }
+  /** Facts about the run worth one line of log, merged into its summary. */
+  note(fields: Record<string, unknown>): void { Object.assign(this.#notes, fields); }
   end(outcome: 'completed' | 'stopped' | 'failed'): void {
     const open = this.#open; if (open === undefined) return; this.#open = undefined;
     try {
       const stages = summarizeTimings(this.#records.splice(0));
-      this.#emit({ sessionId: open.sessionId, execution: open.execution, timingTraceId: timingTraceId(), outcome, durationMs: Date.now() - open.startedAt, stages, environment: environmentSummary(stages) });
+      this.#emit({ sessionId: open.sessionId, execution: open.execution, timingTraceId: timingTraceId(), outcome, durationMs: Date.now() - open.startedAt, ...this.#notes, stages, environment: environmentSummary(stages) });
     } catch { /* Diagnostics never fail a run. */ }
   }
+}
+
+/** The restore evidence as summary fields; nothing the attempt did not report appears. */
+export function restoreEvidenceFields(evidence: { observedBytes?: number; httpCode?: number; archiveBytes?: number }): Record<string, number> {
+  return {
+    ...(evidence.observedBytes === undefined ? {} : { restoreObservedBytes: evidence.observedBytes }),
+    ...(evidence.httpCode === undefined ? {} : { restoreHttpCode: evidence.httpCode }),
+    ...(evidence.archiveBytes === undefined ? {} : { restoreArchiveBytes: evidence.archiveBytes }),
+  };
+}
+
+/**
+ * Whether the bytes the download reported, the bytes on disk and the project
+ * record agree. Decided only when the download reported a figure; `initialised`
+ * downloads nothing and is left undecided.
+ */
+export function restoreCrossCheck(expectedBytes: number, result: RestoreResult): { restoreBytesMatch?: boolean } {
+  if (result.outcome !== 'restored' || result.observedBytes === undefined) return {};
+  const onDisk = result.archiveBytes ?? result.observedBytes;
+  return { restoreBytesMatch: result.observedBytes === expectedBytes && onDisk === result.observedBytes };
 }
 
 /** What the run did with machines, read off its own stage records rather than tracked separately. */
@@ -624,8 +647,9 @@ export class SessionRunner {
         forget: (id: string) => sessions.forgetSpecialistReservation(session.id, authority, id),
       };
       persists = entitlements.capabilities.boolean('git.persistence');
-      const { registry } = await this.#deps.configuration.get();
+      const { registry, rates } = await this.#deps.configuration.get();
       sourceRegistry = registry;
+      summary?.note({ model: session.model });
       let executionRegistry = registry;
       if (isContinuation) {
         const policy = inFallback ? requireFallbackPolicy(registry, entitlements, session.fallback?.offer?.policyFingerprint) : undefined;
@@ -664,6 +688,7 @@ export class SessionRunner {
         inputMeterKey: executionRegistry.inputTokenMeterKey, outputMeterKey: executionRegistry.outputTokenMeterKey,
         ...(selectedOffer === undefined ? {} : { maxInputTokens: selectedOffer.maxInputTokens }),
         metering: this.#deps.metering, reservations: tokenReservations,
+        ...(rates === undefined ? {} : { rates }),
         authorize: async () => {
           await sessions.assertPersistenceLease(authority);
           const latest = await this.#deps.entitlements.forUser(session.ownerUid, new Date(), true);
@@ -738,7 +763,25 @@ export class SessionRunner {
             // Only a plan that pays for it gets its work back. For everyone else the
             // sandbox is genuinely disposable, which is the difference being sold.
             if (persists) {
-              restored = await this.#deps.persistence.restore(machine.running, machine.provider, project!);
+              const expectedBytes = project!.snapshotBytes ?? 0;
+              let restoreResult: RestoreResult;
+              try {
+                const restoreRaw: RestoreResult | RestoreOutcome = await this.#deps.persistence.restore(machine.running, machine.provider, project!);
+                restoreResult = typeof restoreRaw === 'string' ? { outcome: restoreRaw } : restoreRaw;
+              } catch (error) {
+                // Telemetry only: a failed or partial download still moved bytes
+                // that must be accounted for. The failure itself is unchanged.
+                summary?.note({ restoreOutcome: 'failed', restoreBytes: expectedBytes,
+                  ...(error instanceof RestoreError ? { restorePhase: error.phase, ...restoreEvidenceFields(error.evidence) } : {}) });
+                throw error;
+              }
+              restored = restoreResult.outcome;
+              const crossCheck = restoreCrossCheck(expectedBytes, restoreResult);
+              summary?.note({ restoreOutcome: restored, restoreBytes: expectedBytes, ...restoreEvidenceFields(restoreResult), ...crossCheck });
+              if (crossCheck.restoreBytesMatch === false) {
+                log.warn({ sessionId: session.id, projectId: project!.id, restoreBytes: expectedBytes, ...restoreEvidenceFields(restoreResult) },
+                  'restored archive size differs from the download or the project record');
+              }
               await publish('project.restored', { outcome: restored });
             }
             const source = project!.source;

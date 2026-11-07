@@ -3388,3 +3388,15 @@ test('unproductive reads and the step budget stop with an explicit unverified ou
   const limited=await turn({rawFinalReplies:true,specialists:[],limits:{...limits,maxSteps:1},script:[()=>say('Still working.')]});
   assert.equal(limited.run.stopReason,'max_steps');assert.match(limited.run.reply,/not verified/);
 });
+
+test('the categories the provider reports travel with the usage handed to admission, on both paths', async () => {
+  const settled: unknown[] = [];
+  const admission: Parameters<typeof runAgentTurn>[0]['admission'] = { begin: async ({ params, maxOutputTokens }) => ({ params, maxOutputTokens, settle: async (usage) => { settled.push(usage); } }) };
+  // Interrupted after message_start: the prompt categories as reported, the provisional output count not among them.
+  await assert.rejects(turn({ specialists: [], admission, script: [() => ({ ...say('never returned'), events: [messageStart(700, 300, 100), textDelta('partial')], abortAfterEvents: true })] }), /aborted/);
+  assert.deepEqual(settled, [{ input: 1100, output: undefined, raw: { input: 700, cacheRead: 300, cacheCreation: 100 } }]);
+  // Completed: the final message is authoritative for every category, including output.
+  settled.length = 0;
+  await turn({ specialists: [], admission, script: [() => say('done')] });
+  assert.deepEqual(settled.at(-1), { input: 10, output: 20, raw: { input: 10, output: 20 } });
+});

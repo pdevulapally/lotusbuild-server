@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import type { SandboxProvider } from '../src/entitlements/schema.ts';
 import type { UserEntitlements } from '../src/entitlements/service.ts';
 import { AppError } from '../src/http/errors.ts';
-import { ProjectPersistence, type SnapshotPublisher } from '../src/projects/persistence.ts';
+import { ProjectPersistence, type SnapshotPublisher, RestoreError, restoreEvidenceOf } from '../src/projects/persistence.ts';
 import type { Project } from '../src/projects/repository.ts';
 import type { CommandOutcome, RunningSandbox } from '../src/sandboxes/provider.ts';
 import type { SessionLease } from '../src/sessions/repository.ts';
@@ -153,7 +153,7 @@ test('a project that has never been saved starts a repository without reading st
     projectWith({ kind: 'none' }, 0),
   );
 
-  assert.equal(outcome, 'initialised');
+  assert.equal(outcome.outcome, 'initialised');
   assert.ok(initialisedRepository(sandbox));
   assert.deepEqual(snapshots.reads, []);
 });
@@ -168,7 +168,7 @@ test('a legacy snapshot that exists is restored', async () => {
     projectWith({ kind: 'legacy' }, 4096),
   );
 
-  assert.equal(outcome, 'restored');
+  assert.equal(outcome.outcome, 'restored');
   assert.equal(initialisedRepository(sandbox), false);
   assert.deepEqual(snapshots.reads, ['legacy']);
   // The archive is fetched from the URL the read handed over, in a file.
@@ -198,7 +198,7 @@ test('an immutable snapshot is restored at the exact recorded generation', async
     projectWith({ kind: 'immutable', objectName, generation: '7' }, 4096),
   );
 
-  assert.equal(outcome, 'restored');
+  assert.equal(outcome.outcome, 'restored');
   assert.equal(initialisedRepository(sandbox), false);
   assert.deepEqual(snapshots.reads, [`${objectName}#7`]);
 });
@@ -255,4 +255,82 @@ test('the failure tells the client nothing about where the snapshot lives', asyn
   });
   // The candidate object is named after the lease token that wrote it.
   assert.equal(JSON.stringify(error.details).includes(objectName), false);
+});
+
+test('a restore reports the bytes the download itself measured', async () => {
+  class EvidenceSandbox extends RecordingSandbox {
+    override async runCommand(command: string): Promise<CommandOutcome> {
+      await super.runCommand(command);
+      return { exitCode: 0, stdout: command.includes('restore_evidence') ? 'restore_evidence 4096 200\n' : '', stderr: '' };
+    }
+  }
+  const sandbox = new EvidenceSandbox();
+  const outcome = await persistence(new FakeSnapshotStorage(['legacy'])).restore(sandbox, provider, projectWith({ kind: 'legacy' }, 4096));
+  assert.deepEqual(outcome, { outcome: 'restored', observedBytes: 4096, httpCode: 200 });
+  assert.ok(sandbox.commands.some((command) => command.includes("-w 'restore_evidence %{size_download} %{http_code}")));
+});
+
+test('a download that fails still reports the bytes it moved, and the failure is unchanged', async () => {
+  class FailingDownload extends RecordingSandbox {
+    override async runCommand(command: string): Promise<CommandOutcome> {
+      await super.runCommand(command);
+      return command.includes('restore_evidence') ? { exitCode: 22, stdout: 'restore_evidence 512 403\n', stderr: 'curl: (22) The requested URL returned error: 403' } : { exitCode: 0, stdout: '', stderr: '' };
+    }
+  }
+  const sandbox = new FailingDownload();
+  await assert.rejects(persistence(new FakeSnapshotStorage(['legacy'])).restore(sandbox, provider, projectWith({ kind: 'legacy' }, 4096)), (error: unknown) => {
+    assert.ok(error instanceof RestoreError);
+    assert.equal(error.code, 'project/persistence-failed');
+    assert.equal(error.statusCode, 500);
+    assert.deepEqual(error.details, { exitCode: 22, stderr: 'curl: (22) The requested URL returned error: 403' });
+    assert.equal(error.phase, 'download');
+    assert.deepEqual(error.evidence, { observedBytes: 512, httpCode: 403 });
+    return true;
+  });
+  assert.ok(!initialisedRepository(sandbox), 'a failed restore never becomes an empty project');
+});
+
+test('a download that succeeds but cannot be unpacked is placed in the extract phase with the archive it had', async () => {
+  class FailingExtract extends RecordingSandbox {
+    override async runCommand(command: string): Promise<CommandOutcome> {
+      await super.runCommand(command);
+      return command.includes('restore_evidence') ? { exitCode: 2, stdout: 'restore_evidence 4096 200\nrestore_archive 4096\n', stderr: 'tar: Unexpected EOF' } : { exitCode: 0, stdout: '', stderr: '' };
+    }
+  }
+  await assert.rejects(persistence(new FakeSnapshotStorage(['legacy'])).restore(new FailingExtract(), provider, projectWith({ kind: 'legacy' }, 4096)), (error: unknown) => {
+    assert.ok(error instanceof RestoreError);
+    assert.equal(error.phase, 'extract');
+    assert.deepEqual(error.evidence, { observedBytes: 4096, httpCode: 200, archiveBytes: 4096 });
+    return true;
+  });
+});
+
+test('a restore that stopped before printing anything carries no evidence rather than zeros', async () => {
+  class SilentFailure extends RecordingSandbox {
+    override async runCommand(command: string): Promise<CommandOutcome> {
+      await super.runCommand(command);
+      return command.includes('restore_evidence') ? { exitCode: 1, stdout: '', stderr: 'cat: url: No such file' } : { exitCode: 0, stdout: '', stderr: '' };
+    }
+  }
+  await assert.rejects(persistence(new FakeSnapshotStorage(['legacy'])).restore(new SilentFailure(), provider, projectWith({ kind: 'legacy' }, 4096)), (error: unknown) => {
+    assert.ok(error instanceof RestoreError);
+    assert.deepEqual([error.phase, error.evidence], ['download', {}]);
+    return true;
+  });
+});
+
+test('a successful restore reports what the download measured and what landed on disk', async () => {
+  class EvidenceSandbox extends RecordingSandbox {
+    override async runCommand(command: string): Promise<CommandOutcome> {
+      await super.runCommand(command);
+      return { exitCode: 0, stdout: command.includes('restore_evidence') ? 'restore_evidence 4096 200\nrestore_archive 4096\n' : '', stderr: '' };
+    }
+  }
+  const sandbox = new EvidenceSandbox();
+  const outcome = await persistence(new FakeSnapshotStorage(['legacy'])).restore(sandbox, provider, projectWith({ kind: 'legacy' }, 4096));
+  assert.deepEqual(outcome, { outcome: 'restored', observedBytes: 4096, httpCode: 200, archiveBytes: 4096 });
+  const script = sandbox.commands.find((command) => command.includes('restore_evidence'))!;
+  // The archive is measured after the download and before it is unpacked, so an unpack failure still knows what arrived.
+  assert.ok(script.indexOf('restore_archive') > script.indexOf('restore_evidence') && script.indexOf('restore_archive') < script.indexOf('tar -xzf'));
+  assert.deepEqual(restoreEvidenceOf(''), {});
 });

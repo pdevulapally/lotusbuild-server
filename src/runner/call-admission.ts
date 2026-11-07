@@ -2,7 +2,8 @@ import { timed } from '../diagnostics/timing.ts';
 import { AppError } from '../http/errors.ts';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { MessageCountTokensParams } from '@anthropic-ai/sdk/resources/messages';
-import type { MeteringService } from '../metering/service.ts';
+import type { AiCallEvidence, MeteringService } from '../metering/service.ts';
+import { unifiedFor, type AiRateTable, type RawUsage } from '../entitlements/rates.ts';
 import type { AuthoritativeUsage, SpecialistReservations, ProblemReporter } from './agent.ts';
 import { modelOutputConfig, type ModelResolver } from '../models/catalog.ts';
 import type { TokenCount } from '../models/provider.ts';
@@ -19,6 +20,25 @@ export interface CallAdmission {
 }
 
 /** Admission is shared by primary and specialist calls, including every tool loop. */
+/**
+ * Shadow accounting only: the raw categories are always kept; the unified figure is added when a rate
+ * table knows the model and the conversion succeeds. A conversion failure is recorded as its absence,
+ * never allowed to fail the settlement of a real hold. The call is complete only when the provider's
+ * authoritative prompt and output figures both arrived: `message_start` states every prompt category
+ * at once (so `input` stands for the prompt side), the final message or `message_delta` states the
+ * output. An interrupted call lacks its output; an output-only or malformed payload lacks its prompt.
+ * Either way the figure is known usage, not the call's total.
+ */
+export function shadowEvidence(rates: AiRateTable | undefined, model: string, raw: RawUsage): AiCallEvidence {
+  const complete = raw.input !== undefined && raw.output !== undefined;
+  if (rates === undefined) return { model, raw, complete };
+  try {
+    return { model, raw, complete, ...(unifiedFor(rates, model, raw) ?? {}) };
+  } catch {
+    return { model, raw, complete };
+  }
+}
+
 export function createCallAdmission(deps: {
   readonly anthropic: Anthropic;
   /** Provider-specific input count; defaults to Anthropic's count_tokens. An estimate is still reserved in full and settled from authoritative usage. */
@@ -33,6 +53,8 @@ export function createCallAdmission(deps: {
   readonly reservations: SpecialistReservations;
   readonly authorize: () => Promise<void>;
   readonly onProblem: ProblemReporter;
+  /** Unified-token rate table for shadow accounting; absent until seeded. */
+  readonly rates?: AiRateTable;
 }): CallAdmission {
   return {
     async begin(input) {
@@ -77,8 +99,13 @@ export function createCallAdmission(deps: {
           }
           try {
             await deps.metering.recordObservedUsage(deps.uid, hold.id, actual);
+            // Shadow evidence travels with the input hold only, so a logical call is
+            // recorded exactly once however its output hold is shared.
+            const evidence = hold.kind === 'input' && usage.raw !== undefined
+              ? shadowEvidence(deps.rates, input.params.model, usage.raw)
+              : undefined;
             await deps.metering.settle({ uid: deps.uid, reservationId: hold.id,
-              actualQuantity: actual, recordOverrun: hold.kind === 'input', now: new Date() });
+              actualQuantity: actual, recordOverrun: hold.kind === 'input', now: new Date(), ...(evidence === undefined ? {} : { evidence }) });
             await deps.reservations.forget(hold.id);
           } catch (error) { failures.push(error); }
         }

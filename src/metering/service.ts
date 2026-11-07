@@ -1,3 +1,4 @@
+import type { RawUsage } from '../entitlements/rates.ts';
 import {
   type DocumentReference,
   type DocumentSnapshot,
@@ -75,6 +76,22 @@ interface CloseOutcome {
   readonly settledQuantity?: number;
   readonly overrunQuantity?: number;
 }
+
+/**
+ * Shadow unified-token evidence for one logical AI call, recorded once on the call's input hold.
+ * `complete` says whether the provider reported every billed category; a call interrupted before
+ * its authoritative output figure is `complete: false`, and its `unified` is the known usage only.
+ */
+export interface AiCallEvidence {
+  readonly model: string;
+  readonly raw: RawUsage;
+  readonly complete: boolean;
+  readonly rateVersion?: string;
+  readonly unified?: number;
+  readonly tier?: number;
+}
+
+export function periodRecordId(periodStart: Date): string { return periodStart.toISOString().slice(0, 10); }
 
 /**
  * Records what a user has spent against their plan's meters.
@@ -495,6 +512,7 @@ export class MeteringService {
       estimatedQuantity: input.quantity,
       status: 'OPEN',
       operationId: input.operationId,
+      openedPeriodStart: Timestamp.fromDate(periodStart),
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     });
@@ -673,6 +691,8 @@ export class MeteringService {
     /** Explicitly authorized for Anthropic token-count estimates, not capacity gauges. */
     readonly recordOverrun?: boolean;
     readonly now: Date;
+    /** Shadow accounting only: stored on the reservation and the period record, never used for amounts. */
+    readonly evidence?: AiCallEvidence;
   }): Promise<boolean> {
     return this.#close(
       input.uid,
@@ -682,8 +702,7 @@ export class MeteringService {
         if (meter.kind !== 'COUNTER') {
           throw new EntitlementConfigError(
             `Reservation ${input.reservationId} is on the ${meter.kind} meter "${meter.key}", ` +
-              'which is released rather than settled.',
-          );
+              'which is released rather than settled.');
         }
         if (
           !Number.isSafeInteger(input.actualQuantity) ||
@@ -708,6 +727,8 @@ export class MeteringService {
       },
       true,
       input.actualQuantity,
+    
+      input.evidence,
     );
   }
 
@@ -956,6 +977,7 @@ export class MeteringService {
     ) => CloseOutcome,
     allowInFlight = true,
     expectedObservedQuantity?: number,
+    evidence?: AiCallEvidence,
   ): Promise<boolean> {
     const reservationRef = this.#reservationRef(uid, reservationId);
     const { registry } = await this.#configuration.get();
@@ -1008,8 +1030,27 @@ export class MeteringService {
           ? {}
           : { settledQuantity: outcome.settledQuantity }),
         ...(outcome.overrunQuantity === undefined ? {} : { overrunQuantity: outcome.overrunQuantity }),
+        ...(evidence === undefined ? {} : { evidence }),
         updatedAt: FieldValue.serverTimestamp(),
       });
+      // Durable per-period history (additive; the live usage document above is
+      // unchanged). A hold opened in an earlier period is recorded as settled
+      // late against that period; live-meter attribution stays as it is until PR C.
+      if (outcome.status === 'SETTLED' && outcome.settledQuantity !== undefined && meter.kind === 'COUNTER') {
+        const opened = fields['openedPeriodStart'] instanceof Timestamp ? (fields['openedPeriodStart'] as Timestamp).toDate() : periodStart;
+        const late = opened.getTime() < periodStart.getTime();
+        const periodRef = this.#firestore.doc(`${usageRef.path}/periods/${periodRecordId(opened)}`);
+        transaction.set(periodRef, {
+          meterKey: meter.key,
+          periodStart: Timestamp.fromDate(opened),
+          [late ? 'settledLate' : 'settled']: FieldValue.increment(outcome.settledQuantity),
+          ...(outcome.overrunQuantity ? { overrunInfo: FieldValue.increment(outcome.overrunQuantity) } : {}),
+          // Only a complete call enters the definitive unified total; a partial figure is
+          // kept apart so the complete aggregate is never understated or overstated by it.
+          ...(evidence?.unified === undefined ? {} : { [evidence.complete ? 'unified' : 'unifiedPartial']: FieldValue.increment(evidence.unified) }),
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+      }
       return true;
     });
   }

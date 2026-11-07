@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { fixtureModels } from './support/models.ts';
 import test from 'node:test';
 import type Anthropic from '@anthropic-ai/sdk';
-import type { ContentBlock } from '@anthropic-ai/sdk/resources/messages';
+import type { ContentBlock, MessageStreamEvent } from '@anthropic-ai/sdk/resources/messages';
+import { aiRatesV1Document, parseAiRateTable, type AiRateTable } from '../src/entitlements/rates.ts';
 import { MeteringService, type Reservation } from '../src/metering/service.ts';
 import { createCallAdmission } from '../src/runner/call-admission.ts';
 import { runAgentTurn } from '../src/runner/agent.ts';
@@ -38,8 +39,9 @@ function harness(failSecond = false, rejectRecheck = false, models = fixtureMode
       markInFlight: async (_uid: string, ids: string[]) => { events.push(`dispatch:${ids.join(',')}`); },
       release: async (_uid: string, id: string) => { events.push(`release:${id}`); },
       recordObservedUsage: async (_uid: string, id: string, quantity: number) => { events.push(`journal:${id}:${quantity}`); },
-      settle: async (input: { reservationId: string; actualQuantity: number; recordOverrun: boolean }) => {
+      settle: async (input: { reservationId: string; actualQuantity: number; recordOverrun: boolean; evidence?: { model: string; raw: object } }) => {
         events.push(`settle:${input.reservationId}:${input.actualQuantity}:${input.recordOverrun}`);
+        if (input.evidence !== undefined) events.push(`evidence:${input.reservationId}:${input.evidence.model}`);
       },
     } as unknown as MeteringService,
   });
@@ -76,6 +78,15 @@ test('observed usage is journalled before settlement and input overruns are reco
   assert.deepEqual(h.events, ['hold:input:10', 'hold:output:20', 'dispatch:input,output',
     'journal:input:15', 'settle:input:15:true', 'forget:input', 'journal:output:7', 'settle:output:7:false', 'forget:output']);
 });
+test('shadow evidence is recorded exactly once per call, on the input hold only', async () => {
+  const h = harness();
+  await (await h.begin()).settle({ input: 15, output: 7, raw: { input: 15, output: 7 } });
+  assert.deepEqual(h.events.filter((event) => event.startsWith('evidence:')), ['evidence:input:test']);
+  // Without raw categories there is nothing to record, and nothing is invented.
+  const bare = harness();
+  await (await bare.begin()).settle({ input: 15, output: 7 });
+  assert.ok(!bare.events.some((event) => event.startsWith('evidence:')));
+});
 test('missing authoritative usage preserves dispatched holds', async () => {
   const h = harness();
   await (await h.begin()).settle({ input: undefined, output: undefined });
@@ -98,14 +109,21 @@ test('token counting receives cancellation and creates no holds after its aborte
 });
 
 /** Real admission, agent, fenced session reservations and metering; fake only the store and SDK. */
-async function modelFixture(models = fixtureModels) {
+/** What the fake provider streams and finally reports; the defaults are the bare figures the older tests expect. */
+interface ProviderScript {
+  readonly events?: readonly MessageStreamEvent[];
+  readonly finalUsage?: Record<string, unknown>;
+  readonly abortAfterEvents?: boolean;
+  readonly rates?: AiRateTable;
+}
+async function modelFixture(models = fixtureModels, provider: ProviderScript = {}) {
   const { db, data } = ledger();
   const registry = parseRegistry(registryDocument, 'registry');
   const plans = new Map(planDocuments.map((row) => [row.key, parsePlan(row, row.key, registry)]));
   const plan = plans.get('business')!;
   const entitlements = { planKey: plan.key, planName: plan.name, capabilities: new ResolvedEntitlements(plan.entitlements),
     meterLimits: plan.meterLimits, rateLimits: plan.rateLimits } as UserEntitlements;
-  const configuration = { get: async () => ({ registry, plans }) } as unknown as ConfigurationStore;
+  const configuration = { get: async () => ({ registry, plans, ...(provider.rates === undefined ? {} : { rates: provider.rates }) }) } as unknown as ConfigurationStore;
   const entitlementService = { forUser: async () => entitlements } as unknown as EntitlementService;
   const metering = new MeteringService(db, configuration);
   const projects = new ProjectRepository(db, {} as UserRepository, entitlementService);
@@ -126,9 +144,18 @@ async function modelFixture(models = fixtureModels) {
       requests.push(params);
 
       calls++;
-      return { on: () => {}, finalMessage: async (): Promise<{ content: ContentBlock[]; usage: { input_tokens: number; output_tokens: number }; stop_reason: string }> => ({
-        content: [{ type: 'text', text: 'Done', citations: null }, ...(params?.tools?.some(tool => tool.name === 'finish_task') ? [{ type: 'tool_use' as const, id: 'finish', name: 'finish_task', input: { outcome: 'answered', summary: 'Done', evidence: [] }, caller: { type: 'direct' as const } }] : [])], usage: { input_tokens: 7, output_tokens: 3 }, stop_reason: params?.tools?.some(tool => tool.name === 'finish_task') ? 'tool_use' : 'end_turn',
-      }) };
+      const listeners: ((event: MessageStreamEvent) => void)[] = [];
+      return {
+        on: (event: string, listener: (event: MessageStreamEvent) => void) => { if (event === 'streamEvent') listeners.push(listener); },
+        finalMessage: async (): Promise<{ content: ContentBlock[]; usage: Record<string, unknown>; stop_reason: string }> => {
+          // Delivered while the response streams in, exactly as the SDK emits them.
+          for (const event of provider.events ?? []) for (const listener of listeners) listener(event);
+          if (provider.abortAfterEvents === true) throw new Error('Request was aborted.');
+          return {
+            content: [{ type: 'text', text: 'Done', citations: null }, ...(params?.tools?.some(tool => tool.name === 'finish_task') ? [{ type: 'tool_use' as const, id: 'finish', name: 'finish_task', input: { outcome: 'answered', summary: 'Done', evidence: [] }, caller: { type: 'direct' as const } }] : [])], usage: provider.finalUsage ?? { input_tokens: 7, output_tokens: 3 }, stop_reason: params?.tools?.some(tool => tool.name === 'finish_task') ? 'tool_use' : 'end_turn',
+          };
+        },
+      };
     },
   };
   const anthropic = { messages: sdk } as unknown as Anthropic;
@@ -140,7 +167,7 @@ async function modelFixture(models = fixtureModels) {
   };
   const admission = createCallAdmission({ models, anthropic, uid: 'u', sessionId: 's',
     inputMeterKey: registry.inputTokenMeterKey, outputMeterKey: registry.outputTokenMeterKey, metering, reservations,
-    authorize: () => sessions.assertPersistenceLease(authority), onProblem });
+    authorize: () => sessions.assertPersistenceLease(authority), onProblem, ...(provider.rates === undefined ? {} : { rates: provider.rates }) });
   const begin = () => admission.begin({ effort: 'low', params: { model: session.model, messages: [] }, maxOutputTokens: 20, signal: controller.signal });
   const run = async () => runAgentTurn({ admission, anthropic, session, project: await projects.readOwned('u', 'p'),
     provider: registry.sandboxProviders.get('web')!, sandbox: { readFile: async () => 'Fixture file' } as unknown as RunningSandbox, withValidationSandbox: undefined,
@@ -404,3 +431,57 @@ for (const failure of ['first mark', 'later mark', 'synchronous dispatch'] as co
     }
   });
 }
+
+/** The usage block a real `message_start` carries: prompt categories, and a provisional output count that is never billed. */
+function providerMessageStart(usage: Record<string, unknown>): MessageStreamEvent {
+  return { type: 'message_start', message: { id: 'msg-1', type: 'message', role: 'assistant', model: 'claude-haiku-4-5', content: [], stop_reason: null, stop_sequence: null, container: null, stop_details: null,
+    usage: { input_tokens: 0, output_tokens: 1, cache_read_input_tokens: null, cache_creation_input_tokens: null, cache_creation: null, server_tool_use: null, service_tier: null, inference_geo: null, output_tokens_details: null, ...usage } } } as unknown as MessageStreamEvent;
+}
+function providerMessageDelta(output: number): MessageStreamEvent {
+  return { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null, container: null, stop_details: null },
+    usage: { output_tokens: output, input_tokens: null, cache_read_input_tokens: null, cache_creation_input_tokens: null, output_tokens_details: null, server_tool_use: null } } as unknown as MessageStreamEvent;
+}
+const v1 = parseAiRateTable(aiRatesV1Document, 'config/aiRates');
+const promptUsage = { input_tokens: 7, cache_read_input_tokens: 40, cache_creation_input_tokens: 16, cache_creation: { ephemeral_5m_input_tokens: 16, ephemeral_1h_input_tokens: 0 } };
+
+test('a real streamed call settles the same quantities as before and records its raw categories and unified figure once', async () => {
+  const h = await modelFixture(fixtureModels, { rates: v1,
+    events: [providerMessageStart(promptUsage), providerMessageDelta(3)],
+    finalUsage: { ...promptUsage, output_tokens: 3 } });
+  await h.run();
+  const byMeter = (key: string) => h.records().filter((record) => record.fields['meterKey'] === key);
+  const input = byMeter(h.registry.inputTokenMeterKey), output = byMeter(h.registry.outputTokenMeterKey);
+  // Today's meters: the input total still sums input + cache read + cache writes; output is the reported figure.
+  assert.deepEqual(input.map((record) => [record.fields['status'], record.fields['settledQuantity']]), [['SETTLED', 63]]);
+  assert.deepEqual(output.map((record) => [record.fields['status'], record.fields['settledQuantity']]), [['SETTLED', 3]]);
+  // Shadow evidence: once, on the input hold, with exactly the categories the provider reported.
+  const evidence = input[0]!.fields['evidence'] as { model: string; raw: unknown; complete: boolean; unified?: number; rateVersion?: string; tier?: number };
+  assert.equal(evidence.model, 'claude-haiku-4-5');
+  assert.equal(evidence.complete, true);
+  assert.deepEqual(evidence.raw, { input: 7, cacheRead: 40, cacheCreation5m: 16, cacheCreation1h: 0, output: 3 });
+  // Haiku 4.5 at Sonnet-input parity: 7/2 + 40/20 + 16*5/8 + 0 + 3*5/2 = 23 exactly.
+  assert.deepEqual([evidence.unified, evidence.rateVersion, evidence.tier], [23, 'v1', 0]);
+  assert.equal(output[0]!.fields['evidence'], undefined);
+  assert.equal(h.records().filter((record) => record.fields['evidence'] !== undefined).length, 1);
+  assert.equal((h.usage(h.registry.inputTokenMeterKey) as Record<string, unknown>)['consumed'], 63);
+  assert.equal(h.data.get(`users/u/usage/${h.registry.inputTokenMeterKey}/periods/${new Date().toISOString().slice(0, 7)}-01`)?.['unified'], 23);
+});
+
+test('a call interrupted after message_start settles the prompt it reported, with its categories and no invented output', async () => {
+  const h = await modelFixture(fixtureModels, { rates: v1,
+    events: [providerMessageStart({ input_tokens: 7, cache_read_input_tokens: 40, cache_creation_input_tokens: 16 })], abortAfterEvents: true });
+  await assert.rejects(h.run(), /aborted/);
+  const input = h.records().filter((record) => record.fields['meterKey'] === h.registry.inputTokenMeterKey);
+  assert.deepEqual(input.map((record) => [record.fields['status'], record.fields['settledQuantity']]), [['SETTLED', 63]]);
+  const evidence = input[0]!.fields['evidence'] as { raw: unknown; complete: boolean; unified?: number };
+  // No TTL breakdown was reported, so the total stays one undivided category; the provisional output count is not evidence.
+  assert.deepEqual(evidence.raw, { input: 7, cacheRead: 40, cacheCreation: 16 });
+  // Known usage only: the output was never reported, so the figure is partial and stays out of the definitive total.
+  assert.deepEqual([evidence.unified, evidence.complete], [16, false]); // ceil(3.5 + 2 + 10)
+  const period = h.data.get(`users/u/usage/${h.registry.inputTokenMeterKey}/periods/${new Date().toISOString().slice(0, 7)}-01`);
+  assert.deepEqual([period?.['unified'], period?.['unifiedPartial']], [undefined, 16]);
+  const output = h.records().filter((record) => record.fields['meterKey'] === h.registry.outputTokenMeterKey);
+  assert.equal(output.length, 1);
+  assert.equal(output[0]!.fields['evidence'], undefined);
+  assert.notEqual(output[0]!.fields['status'], 'SETTLED', 'no authoritative output figure arrived, so the output hold is not settled');
+});
