@@ -132,6 +132,18 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
   registerErrorHandler(app);
   registerAuth(app, firebaseAuth);
 
+  void app.register(cors, {
+    origin: config.CORS_ALLOWED_ORIGINS.map((url) => url.origin),
+    // Identity travels in the Authorization header, never a cookie, so the
+    // browser never needs to attach credentials to a cross-origin request.
+    credentials: false,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+    allowedHeaders: ['Authorization', 'Content-Type', 'Last-Event-ID', 'Idempotency-Key'],
+    // Without this a cross-origin caller cannot read the retry hint off a 429,
+    // because Retry-After is not one of the headers browsers reveal by default.
+    exposedHeaders: exposedResponseHeaders,
+  });
+
   void app.register(rateLimit, {
     // Applied per route through enforceRateLimit, so that the counter can be
     // keyed by an already-verified uid rather than by an IP.
@@ -140,6 +152,10 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     max: config.HTTP_MAX_REQUESTS_PER_MINUTE,
     timeWindow: 60_000,
     keyGenerator: (request) => `ip:${request.ip}`,
+    // OPTIONS preflights do no work and carry no Authorization header; limiting
+    // them here would 429 the preflight before CORS headers attach, which the
+    // browser reports as a CORS failure that hides the real 429.
+    allowList: (request) => request.method === 'OPTIONS',
     redis,
     nameSpace: redisKeyPrefixes.rateLimit,
     // A rate limiter that lets everything through when its store is unreachable
@@ -155,18 +171,6 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
     contentSecurityPolicy: false,
     // The browser client is on a different origin by design.
     crossOriginResourcePolicy: { policy: 'cross-origin' },
-  });
-
-  void app.register(cors, {
-    origin: config.CORS_ALLOWED_ORIGINS.map((url) => url.origin),
-    // Identity travels in the Authorization header, never a cookie, so the
-    // browser never needs to attach credentials to a cross-origin request.
-    credentials: false,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-    allowedHeaders: ['Authorization', 'Content-Type', 'Last-Event-ID', 'Idempotency-Key'],
-    // Without this a cross-origin caller cannot read the retry hint off a 429,
-    // because Retry-After is not one of the headers browsers reveal by default.
-    exposedHeaders: exposedResponseHeaders,
   });
 
   // Every route is declared inside this plugin, and that is load-bearing.
