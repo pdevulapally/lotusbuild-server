@@ -246,6 +246,10 @@ async function beginUnified(deps: AdmissionDeps, unified: UnifiedAdmission,
         deps.onProblem(new Error(`Unified hold ${id} carries no usable rate version/model (${String(storedVersion)}, ${String(storedModel)}); it remains open.`), 'model usage reconciliation required');
         return;
       }
+      // The provider's complete figures are durable before anything that can fail
+      // below: if the table is unavailable, recovery converts these under the
+      // persisted version rather than settling at the estimate.
+      await deps.metering.recordCompleteRawUsage(deps.uid, id, { model, rateVersion: storedVersion, raw });
       let table: AiRateTable;
       try { table = await unified.ratesByVersion(storedVersion); }
       catch (error) {

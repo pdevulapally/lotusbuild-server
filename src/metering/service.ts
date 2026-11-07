@@ -1,4 +1,4 @@
-import type { RawUsage } from '../entitlements/rates.ts';
+import { unifiedFor, type RawUsage } from '../entitlements/rates.ts';
 import { unlimitedPresentation } from '../entitlements/schema.ts';
 import {
   type DocumentReference,
@@ -124,10 +124,13 @@ function isAiCallEvidence(value: unknown): value is AiCallEvidence {
 export class MeteringService {
   readonly #firestore: Firestore;
   readonly #configuration: ConfigurationStore;
+  /** The cache TTL the runtime's requests ask for; how an undivided cache figure is read when converting persisted usage. */
+  readonly #promptCacheTtl: '5m' | '1h';
 
-  constructor(firestore: Firestore, configuration: ConfigurationStore) {
+  constructor(firestore: Firestore, configuration: ConfigurationStore, promptCacheTtl: '5m' | '1h' = '5m') {
     this.#firestore = firestore;
     this.#configuration = configuration;
+    this.#promptCacheTtl = promptCacheTtl;
   }
 
   #usageRef(uid: string, meterKey: string): DocumentReference {
@@ -981,12 +984,57 @@ export class MeteringService {
     if (fields['sandboxExternalId'] !== undefined || !await this.#isTokenHold(fields)) {
       throw new Error(`Reservation ${id} is not a model-token hold and cannot settle at its estimate.`);
     }
+    if (fields['completeRawUsage'] !== undefined) {
+      // The provider did report this call in full; only its conversion is pending.
+      // Charging the estimate would discard authoritative figures.
+      throw new Error(`Reservation ${id} carries complete provider usage awaiting its rate table and cannot settle at its estimate.`);
+    }
     const estimated = integerField(fields, 'estimatedQuantity', `reservation ${id}`, { min: 1 });
     // Partial figures the call reported before it was cut off stay with the hold as
     // evidence marked incomplete; the estimate is what is charged, never the partial.
     const kept = evidence ?? (isAiCallEvidence(fields['partialEvidence']) ? fields['partialEvidence'] : undefined);
     await this.recordObservedUsage(uid, id, estimated, 'provider-usage-unavailable');
     return this.settle({ uid, reservationId: id, actualQuantity: estimated, now, ...(kept === undefined ? {} : { evidence: kept }) });
+  }
+
+  /**
+   * Keeps the provider's complete raw figures for a call whose conversion could
+   * not run (the rate table it was admitted under is unavailable). Distinct from
+   * `observedQuantity` — nothing is converted here — so the hold is still unknown
+   * to the ledger, but recovery must convert these figures under the persisted
+   * version rather than settle at the estimate. Refused on a closed hold.
+   */
+  async recordCompleteRawUsage(uid: string, id: string, usage: { readonly model: string; readonly rateVersion: string; readonly raw: RawUsage }): Promise<void> {
+    if (usage.raw.input === undefined || usage.raw.output === undefined) throw new Error('Complete raw usage requires authoritative input and output.');
+    const ref = this.#reservationRef(uid, id);
+    await this.#firestore.runTransaction(async (tx) => {
+      const snapshot = await tx.get(ref);
+      if (!snapshot.exists) throw new Error('Reservation is missing.');
+      if (snapshot.data()?.['status'] !== 'OPEN') return;
+      tx.update(ref, { completeRawUsage: usage, updatedAt: FieldValue.serverTimestamp() });
+    });
+  }
+
+  /**
+   * Settles a unified hold from its persisted complete raw usage under the rate
+   * version persisted with it: the one place such a hold may be settled once its
+   * table is available again. Returns false if the hold is already closed or
+   * carries no complete usage; throws (hold untouched) if the version is still
+   * unavailable, if the model is unpriced in it, or if the figures disagree with
+   * what is already journalled. Never the current table, never the estimate.
+   */
+  async settleFromCompleteRawUsage(uid: string, id: string, now: Date = new Date()): Promise<boolean> {
+    const fields = await this.reservationRecord(uid, id);
+    if (fields['status'] !== 'OPEN') return false;
+    const kept = fields['completeRawUsage'] as { model?: unknown; rateVersion?: unknown; raw?: unknown } | undefined;
+    if (kept === undefined || typeof kept.model !== 'string' || typeof kept.rateVersion !== 'string' || typeof kept.raw !== 'object' || kept.raw === null) return false;
+    const table = await this.#configuration.ratesByVersion(kept.rateVersion);
+    if (table.version !== kept.rateVersion) throw new Error(`Rate table ${table.version} is not the ${kept.rateVersion} reservation ${id} was admitted under.`);
+    const conversion = unifiedFor(table, kept.model, kept.raw as RawUsage, { undividedCacheWrite: this.#promptCacheTtl });
+    if (conversion === undefined) throw new EntitlementConfigError(`Model "${kept.model}" is absent from rate table ${table.version}; reservation ${id} remains open.`);
+    await this.recordObservedUsage(uid, id, conversion.unified);
+    return this.settle({ uid, reservationId: id, actualQuantity: conversion.unified, recordOverrun: true, now,
+      evidence: { model: kept.model, raw: kept.raw as RawUsage, complete: true, ...conversion } });
   }
 
   /**
@@ -1027,6 +1075,11 @@ export class MeteringService {
   async reconcile(uid: string, id: string, now: Date = new Date(), options: { readonly unreportable?: boolean } = {}): Promise<boolean> {
     const fields = await this.reservationRecord(uid, id);
     if (fields['status'] !== 'OPEN') return false;
+    if (fields['completeRawUsage'] !== undefined && typeof fields['observedQuantity'] !== 'number') {
+      // Known in full, unconverted: settle under the persisted version or wait for it.
+      // Dead-worker proof changes nothing here — the figures are not in doubt.
+      return this.settleFromCompleteRawUsage(uid, id, now);
+    }
     if (options.unreportable === true && fields['inFlight'] === true && typeof fields['observedQuantity'] !== 'number'
       && fields['sandboxExternalId'] === undefined && await this.#isTokenHold(fields)) {
       return this.settleUnobserved(uid, id, now);

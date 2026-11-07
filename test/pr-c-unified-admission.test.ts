@@ -67,7 +67,9 @@ async function unifiedFixture(provider: ProviderScript = {}) {
   const rates = provider.rates ?? v1;
   const configuration = {
     get: async () => ({ registry, plans, rates }),
-    ratesByVersion: async (version: string) => { const table = provider.archive?.get(version) ?? (version === rates.version ? rates : undefined); if (table === undefined) throw new Error(`no archived table ${version}`); return table; },
+    // With an explicit archive, it alone says which versions are available (the real store also answers from the
+    // current table when its version matches; a "v1 unavailable" scenario therefore means the current table moved on too).
+    ratesByVersion: async (version: string) => { const table = provider.archive !== undefined ? provider.archive.get(version) : (version === rates.version ? rates : undefined); if (table === undefined) throw new Error(`no archived table ${version}`); return table; },
   } as unknown as ConfigurationStore;
   const entitlementService = { forUser: async () => entitlements } as unknown as EntitlementService;
   const metering = new MeteringService(db, configuration);
@@ -653,6 +655,63 @@ test('C19e: a ratesByVersion that answers with a differently versioned table is 
   await admitted.settle({ input: 7, output: 3, raw: { input: 7, output: 3 } });
   assert.equal(h.records()[0]!.fields['status'], 'OPEN');
   assert.ok(h.problems.some((problem) => /not the v1 this hold was admitted under/.test(problem.error.message)));
+});
+
+test('C19f: complete raw usage survives an unavailable rate version and is settled once, under that version, when it returns — never at the estimate', async () => {
+  const archive = new Map<string, AiRateTable>([['v1', v1]]);
+  const h = await unifiedFixtureWithRatesByVersion(archive, v1);
+  const admitted = await h.begin();
+  const id = h.records()[0]!.id;
+  // v1 becomes unavailable between dispatch and settlement.
+  archive.delete('v1');
+  await admitted.settle({ input: 7, cacheRead: 40, output: 3, raw: { input: 7, cacheRead: 40, cacheCreation5m: 16, cacheCreation1h: 0, output: 3 } } as never);
+  let hold = h.records()[0]!.fields;
+  assert.equal(hold['status'], 'OPEN');
+  assert.equal(hold['observedQuantity'], undefined, 'nothing converted, so nothing journalled as the call\'s usage');
+  assert.deepEqual(hold['completeRawUsage'], { model: haiku, rateVersion: 'v1', raw: { input: 7, cacheRead: 40, cacheCreation5m: 16, cacheCreation1h: 0, output: 3 } });
+  assert.ok(h.problems.some((problem) => problem.what === 'model usage reconciliation required'));
+  // Worker recovery while v1 is still unavailable: refuses the estimate, leaves the hold open, nothing charged.
+  await assert.rejects(h.metering.reconcile('u', id, new Date(), { unreportable: true }), /no archived table v1/);
+  await assert.rejects(h.metering.settleUnobserved('u', id), /complete provider usage/);
+  hold = h.records()[0]!.fields;
+  assert.equal(hold['status'], 'OPEN');
+  assert.equal(h.usage(unifiedMeterKey)?.['consumed'], 0);
+  assert.equal(h.usage(unifiedMeterKey)?.['reserved'], expectedEstimate);
+  // The current table moves to v2 (doubled weights): still not used for this hold.
+  const v2 = parseAiRateTable({ ...aiRatesV1Document, version: 'v2', models: { ...aiRatesV1Document.models,
+    'claude-haiku-4-5': { tiers: [{ maxInputTokens: null, input: { num: 1, den: 1 }, output: { num: 5, den: 1 }, cacheWrite5m: { num: 5, den: 4 }, cacheWrite1h: { num: 2, den: 1 }, cacheRead: { num: 1, den: 10 } }] } } }, 'test');
+  archive.set('v2', v2);
+  await assert.rejects(h.metering.reconcile('u', id, new Date(), { unreportable: true }), /no archived table v1/);
+  // v1 is archived again: recovery converts the persisted figures under v1 and settles exactly once.
+  archive.set('v1', v1);
+  assert.equal(await h.metering.reconcile('u', id, new Date(), { unreportable: true }), true);
+  hold = h.records()[0]!.fields;
+  assert.equal(hold['status'], 'SETTLED');
+  assert.equal(hold['settledQuantity'], 23, 'v1 Haiku: 3.5 + 2 + 10 + 0 + 7.5 = 23 (v2 would be 46)');
+  assert.equal(hold['observedQuantity'], 23);
+  assert.deepEqual(hold['evidence'], { model: haiku, raw: { input: 7, cacheRead: 40, cacheCreation5m: 16, cacheCreation1h: 0, output: 3 }, complete: true, unified: 23, tier: 0, rateVersion: 'v1' });
+  assert.equal(h.usage(unifiedMeterKey)?.['consumed'], 23);
+  assert.equal(h.usage(unifiedMeterKey)?.['reserved'], 0);
+  assert.equal(h.period(unifiedMeterKey, new Date().toISOString().slice(0, 7) + '-01')?.['unified'], 23);
+  // Idempotent: a second recovery pass, a repeated live settlement, and a direct re-settle all change nothing.
+  assert.equal(await h.metering.reconcile('u', id, new Date(), { unreportable: true }), false);
+  assert.equal(await h.metering.settleFromCompleteRawUsage('u', id), false);
+  await admitted.settle({ input: 7, output: 3, raw: { input: 7, cacheRead: 40, cacheCreation5m: 16, cacheCreation1h: 0, output: 3 } });
+  assert.equal(h.usage(unifiedMeterKey)?.['consumed'], 23);
+  assert.equal(h.records().length, 1);
+});
+
+test('C19g: complete raw usage is refused without both authoritative figures and is not written onto a closed hold', async () => {
+  const h = await unifiedFixture();
+  const admitted = await h.begin();
+  const id = h.records()[0]!.id;
+  await assert.rejects(h.metering.recordCompleteRawUsage('u', id, { model: haiku, rateVersion: 'v1', raw: { input: 7 } }), /authoritative input and output/);
+  await admitted.settle({ input: 7, output: 3, raw: { input: 7, output: 3 } });
+  // The live path persisted the figures before converting them; a settled hold keeps them and is never rewritten.
+  assert.deepEqual(h.records()[0]!.fields['completeRawUsage'], { model: haiku, rateVersion: 'v1', raw: { input: 7, output: 3 } });
+  await h.metering.recordCompleteRawUsage('u', id, { model: haiku, rateVersion: 'v1', raw: { input: 1, output: 1 } });
+  assert.deepEqual(h.records()[0]!.fields['completeRawUsage'], { model: haiku, rateVersion: 'v1', raw: { input: 7, output: 3 } }, 'a settled hold is not rewritten');
+  assert.equal(h.records()[0]!.fields['settledQuantity'], 11);
 });
 
 // 20. Inactive mode preserves existing behaviour.
