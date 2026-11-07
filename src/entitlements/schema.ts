@@ -185,6 +185,15 @@ export interface MeterLimit {
   readonly overageEnabled: boolean;
 }
 
+/**
+ * How a meter that is counted but never capped is presented to customers:
+ * `hardLimit: 0` is the existing client convention for "no limit" (the usage
+ * view shows the count used and no progress bar). Builds are such a meter.
+ */
+export function unlimitedPresentation(meterKey: string): MeterLimit {
+  return { meterKey, includedAllowance: 0, hardLimit: 0, overageEnabled: false };
+}
+
 export interface RateLimit {
   readonly routeClass: RateLimitClass;
   readonly maxRequests: number;

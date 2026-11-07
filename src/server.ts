@@ -1,4 +1,5 @@
 import { installHttpTimings, observeMethods } from './diagnostics/timing.ts';
+import { unlimitedPresentation, type MeterLimit } from './entitlements/schema.ts';
 import cors from '@fastify/cors';
 import { RedisBudgetCounter, UploadBudgetGuard } from './attachments/budget.ts';
 import { registerAttachmentRoutes } from './attachments/routes.ts';
@@ -50,6 +51,12 @@ import { registerVoiceRoutes, type VoiceRelay } from './voice/relay.ts';
 import { registerPrivacyRoutes, type PrivacyRequests } from './privacy/requests.ts';
 import { registerFamilyRoutes } from './family/routes.ts';
 import type { FamilyService } from './family/service.ts';
+
+
+/** Plan limits as customers see them: builds are counted, never capped, whatever row a plan document carries. */
+export function presentedLimits(resolved: { readonly meterLimits: ReadonlyMap<string, MeterLimit> }, buildMeterKey: string): readonly MeterLimit[] {
+  return [...resolved.meterLimits.values()].map((limit) => limit.meterKey === buildMeterKey ? unlimitedPresentation(buildMeterKey) : limit);
+}
 
 export interface Dependencies {
   readonly voice?: VoiceRelay;
@@ -203,7 +210,7 @@ export function buildServer(config: Config, dependencies: Dependencies): Fastify
         subscriptionStatus: resolved.subscriptionStatus,
         capabilities: resolved.capabilities.entries(),
         models: await allowedModelCatalog(redis, resolved),
-        limits: [...resolved.meterLimits.values()].map((limit) => ({
+        limits: presentedLimits(resolved, (await dependencies.configuration.get()).registry.buildMeterKey).map((limit) => ({
           meterKey: limit.meterKey,
           includedAllowance: limit.includedAllowance,
           hardLimit: limit.hardLimit,

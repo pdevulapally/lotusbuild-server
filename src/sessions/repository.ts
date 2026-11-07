@@ -47,6 +47,9 @@ import {
   timestampField,
 } from '../support/documents.ts';
 
+/** Queued-but-unstarted messages a session may hold when its plan declares no build limit row. */
+const defaultQueueDepth = 25;
+
 export const sessionsCollectionPath = 'sessions';
 export const messagesCollectionName = 'messages';
 export const queuedMessagesCollectionName = 'queued_messages';
@@ -504,13 +507,9 @@ export class SessionRepository {
       assertBuildAllowed(entitlements, currentProject.platform, input.model);
       const effort = resolveAiEffort(entitlements, input.effort);
 
-      if (!voice) await this.#metering.consumeIn(transaction, {
-        uid,
-        entitlements,
-        meterKey: registry.buildMeterKey,
-        quantity: 1,
-        now,
-      });
+      // Builds are counted, not admitted: what bounds a build is the AI, sandbox
+      // and storage it goes on to consume, each admitted where it is reserved.
+      if (!voice) await this.#metering.recordIn(transaction, { uid, meterKey: registry.buildMeterKey, quantity: 1, now });
 
       transaction.create(ref, {
         ...(voice ? { entrypoint: 'voice' } : {}),
@@ -770,7 +769,7 @@ export class SessionRepository {
         transaction.update(ref, { updatedAt: FieldValue.serverTimestamp() });
         return { kind: 'queued', message: { id: queuedRef.id, sessionId, prompt, attachments, createdAt: now } };
       }
-      await this.#metering.consumeIn(transaction, { uid, entitlements, meterKey: registry.buildMeterKey, quantity: 1, now });
+      await this.#metering.recordIn(transaction, { uid, meterKey: registry.buildMeterKey, quantity: 1, now });
       if (current.fallback?.checkpointId !== undefined) transaction.delete(ref.collection('continuations').doc('active'));
       let content = prompt;
       if (pendingInput !== undefined) {
@@ -790,19 +789,20 @@ export class SessionRepository {
 
   }
 
-  // There is no reason to stage more builds than the plan permits in a whole
-  // billing window. Reuse that configured bound rather than invent a new plan rule.
   #queuedMessages(ref: DocumentReference, session: BuildSession) {
     const collection = ref.collection(queuedMessagesCollectionName);
     return session.discardQueuedBefore === undefined ? collection
       : collection.where('createdAt', '>', Timestamp.fromDate(session.discardQueuedBefore));
   }
 
+  /**
+   * Builds are unlimited by count, so the queue depth is abuse protection, not an
+   * allowance: a plan that still declares a build limit row keeps that bound for
+   * its queue; one that declares none gets the default depth.
+   */
   async #queueLimit(entitlements: UserEntitlements): Promise<number> {
     const { registry } = await this.#configuration.get();
-    const limit = entitlements.meterLimits.get(registry.buildMeterKey);
-    if (limit === undefined) throw new Error('The build meter limit is missing.');
-    return limit.hardLimit;
+    return entitlements.meterLimits.get(registry.buildMeterKey)?.hardLimit ?? defaultQueueDepth;
   }
 
   async listQueuedMessages(uid: string, sessionId: string, limit = 100, after?: string): Promise<readonly QueuedMessage[]> {
@@ -861,14 +861,8 @@ export class SessionRepository {
       const project = await this.#projects.readOwnedInTransaction(transaction, session.ownerUid, session.projectId);
       assertBuildAllowed(entitlements, project.platform, session.model);
 
-      // Deduct build meter for this turn
-      await this.#metering.consumeIn(transaction, {
-        uid: session.ownerUid,
-        entitlements,
-        meterKey: registry.buildMeterKey,
-        quantity: 1,
-        now,
-      });
+      // Count the build for this turn (never a limit).
+      await this.#metering.recordIn(transaction, { uid: session.ownerUid, meterKey: registry.buildMeterKey, quantity: 1, now });
 
       const seq = session.messageCount;
       signal?.throwIfAborted();
@@ -957,8 +951,7 @@ export class SessionRepository {
       if (session.pendingSteer === undefined) {
         if (next === undefined) throw new Error('Pending message disappeared inside the transaction.');
         const { registry } = await this.#configuration.get();
-        await this.#metering.consumeIn(transaction, { uid: session.ownerUid, entitlements,
-          meterKey: registry.buildMeterKey, quantity: 1, now: new Date() });
+        await this.#metering.recordIn(transaction, { uid: session.ownerUid, meterKey: registry.buildMeterKey, quantity: 1, now: new Date() });
         transaction.delete(next.ref);
       }
       signal?.throwIfAborted();
@@ -1317,8 +1310,6 @@ export class SessionRepository {
       try {
         await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: inputMeterKey, quantity: inputQuantity, now });
         await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: outputMeterKey, quantity: outputQuantity, now });
-        // Continuations reuse the already-admitted build; they neither refund nor charge a second build.
-        await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: registry.buildMeterKey, quantity: 0, now });
         await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: registry.storageMeterKey, quantity: 0, now });
         await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: registry.sandboxTimeMeterKey, quantity: provider.timeoutSeconds, now });
         await this.#metering.assertAvailableIn(transaction, { uid, entitlements, meterKey: provider.concurrencyMeterKey, quantity: 1, now });

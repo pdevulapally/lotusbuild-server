@@ -431,7 +431,7 @@ test('unrecoverable prompt admission rejects before any metering, scheduling or 
 });
 
 for (const recovery of [undefined, 'COMPLETED'] as const) {
-  test(`runnable FAILED prompt admission accepts ${recovery ?? 'absent'} recovery state and enforces quota`, async (t) => {
+  test(`runnable FAILED prompt admission accepts ${recovery ?? 'absent'} recovery state and counts the build without a quota`, async (t) => {
     const h = fixture(t); h.record()['status'] = 'FAILED'; delete h.record()['claimableAt'];
     h.data.get('projects/p')!['activeSessionId'] = null;
     if (recovery !== undefined) h.record()['workspaceRecovery'] = { status: recovery, sandboxId: 'vm' };
@@ -441,11 +441,12 @@ for (const recovery of [undefined, 'COMPLETED'] as const) {
     assert.equal(h.data.get(`users/u/usage/${registry.buildMeterKey}`)?.['consumed'], 1);
     assert.equal(h.data.get('sessions/s/messages/000001')?.['content'], 'Continue');
     h.record()['status'] = 'FAILED'; delete h.record()['claimableAt']; h.data.get('projects/p')!['activeSessionId'] = null;
-    await h.metering.consume({ uid: 'u', entitlements: h.entitlements, meterKey: registry.buildMeterKey,
-      quantity: h.entitlements.meterLimits.get(registry.buildMeterKey)!.hardLimit - 1, now: new Date() });
-    const before = JSON.stringify([...h.data]);
-    await assert.rejects(h.sessions.appendPrompt('u', 's', 'Over quota'), { code: 'usage/limit-reached' });
-    assert.equal(JSON.stringify([...h.data]), before);
+    // Builds are unlimited by count: past what the plan document still calls the hard limit, the prompt is admitted and counted.
+    const hardLimit = h.entitlements.meterLimits.get(registry.buildMeterKey)!.hardLimit;
+    h.data.get(`users/u/usage/${registry.buildMeterKey}`)!['consumed'] = hardLimit;
+    await h.sessions.appendPrompt('u', 's', 'Past the old quota');
+    assert.equal(h.record()['status'], 'QUEUED');
+    assert.equal(h.data.get(`users/u/usage/${registry.buildMeterKey}`)?.['consumed'], hardLimit + 1);
   });
 }
 
