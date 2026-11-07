@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import { Timestamp, type Firestore } from 'firebase-admin/firestore';
@@ -262,3 +263,16 @@ test('the query itself is bounded: Firestore never hands back more than the limi
 // reflects the session's current state rather than being permanently stuck
 // on its first `limit` messages, which the tests above already prove for the
 // identical call shape the route makes.
+
+test('the descending document-id order listMessages relies on has its index declared', () => {
+  // The fake above cannot know Firestore's index rules, so this is the guard. Ordering a
+  // subcollection by document id, descending, needs its own index; without it the query
+  // fails with FAILED_PRECONDITION, which for a runner means every build dies reading its own
+  // messages, and for the API means GET /sessions/:id/messages is a 500. That happened in
+  // production, and the index had to be created by hand.
+  const declared = JSON.parse(readFileSync(new URL('../firestore.indexes.json', import.meta.url), 'utf8')) as {
+    indexes: { collectionGroup: string; queryScope: string; fields: { fieldPath: string; order: string }[] }[];
+  };
+  assert.ok(declared.indexes.some((index) => index.collectionGroup === 'messages' && index.queryScope === 'COLLECTION'
+    && index.fields.length === 1 && index.fields[0]?.fieldPath === '__name__' && index.fields[0]?.order === 'DESCENDING'));
+});
