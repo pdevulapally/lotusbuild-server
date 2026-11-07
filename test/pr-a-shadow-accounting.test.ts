@@ -260,3 +260,23 @@ test('an interrupted call is recorded as partial: its known usage stays on the h
   // Today's meters are unaffected either way.
   assert.equal(f.record(`users/u/usage/${f.meterKey}`)?.['consumed'], 123);
 });
+
+test('output-only or promptless evidence is partial too: only a call with both authoritative figures enters the definitive total', async () => {
+  const f = meteringFixture();
+  const outputOnly = shadowEvidence(v1, 'claude-sonnet-5', { output: 9 });
+  assert.deepEqual(outputOnly, { model: 'claude-sonnet-5', raw: { output: 9 }, complete: false, unified: 45, tier: 0, rateVersion: 'v1' });
+  // Cache categories without the provider's input figure are not a complete prompt either.
+  assert.equal(shadowEvidence(v1, 'claude-sonnet-5', { cacheRead: 100, output: 9 }).complete, false);
+  // A zero input figure is still a reported figure; absence is what makes a call partial.
+  assert.equal(shadowEvidence(v1, 'claude-sonnet-5', { input: 0, cacheRead: 100, output: 9 }).complete, true);
+  const complete = shadowEvidence(v1, 'claude-sonnet-5', { input: 60, output: 9 });
+  assert.deepEqual([complete.complete, complete.unified], [true, 105]);
+
+  const first = await f.reserve(march);
+  const second = await f.reserve(march);
+  assert.equal(await f.metering.settle({ uid: 'u', reservationId: first.id, actualQuantity: 60, recordOverrun: true, now: march, evidence: complete }), true);
+  assert.equal(await f.metering.settle({ uid: 'u', reservationId: second.id, actualQuantity: 1, recordOverrun: true, now: march, evidence: outputOnly }), true);
+  assert.deepEqual(f.record(`users/u/reservations/${second.id}`)?.['evidence'], outputOnly);
+  const period = f.record(`users/u/usage/${f.meterKey}/periods/2026-03-01`);
+  assert.deepEqual([period?.['unified'], period?.['unifiedPartial']], [105, 45]);
+});
